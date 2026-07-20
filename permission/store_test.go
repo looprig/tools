@@ -208,29 +208,68 @@ func TestWriteRulesRejectsInvalidCandidates(t *testing.T) {
 	}
 }
 
-// TestWriteRulesFamilyAndWildcardCandidates proves the Bash(...) display
-// syntax converts to structured records, never raw prefixes.
-func TestWriteRulesFamilyAndWildcardCandidates(t *testing.T) {
+// TestWriteRulesFamilyCandidates proves the Bash(...) display syntax
+// converts to structured records, never raw prefixes.
+func TestWriteRulesFamilyCandidates(t *testing.T) {
 	ctx := context.Background()
 	path := testPath(t)
 	store := mustWorkspaceStore(t, Config{Path: path})
 	batch := []tool.RuleCandidate{
 		{Kind: CapabilityCommandExecute, Match: "Bash(git log:*)", Description: "d", GrantClass: GrantClassCommandStart, GrantTarget: "git log -n 3"},
-		{Kind: CapabilityCommandExecute, Match: "Bash(*)", Description: "d", GrantClass: GrantClassCommandStart, GrantTarget: "true"},
 	}
 	if err := store.WriteRules(ctx, batch); err != nil {
 		t.Fatalf("WriteRules: %v", err)
 	}
 	rules := loadFileRules(t, path)
-	if len(rules) != 2 {
-		t.Fatalf("got %d rules, want 2", len(rules))
+	if len(rules) != 1 {
+		t.Fatalf("got %d rules, want 1", len(rules))
 	}
-	family, wildcard := rules[0], rules[1]
+	family := rules[0]
 	if family.Class != ClassCommandInvokeFamily || family.Tokens[0] != "git" || family.Tokens[1] != "log" || !family.TrailingArguments {
 		t.Fatalf("family candidate stored wrong: %#v", family)
 	}
-	if wildcard.Class != ClassCommandInvokeWildcard {
-		t.Fatalf("wildcard candidate stored wrong: %#v", wildcard)
+}
+
+// TestWriteRulesRefusesRuleSyntaxCollisions proves a literal command whose
+// text lives in the Bash(...) display-rule namespace can never be persisted
+// through the candidate path as a wildcard, family, or anything else. Without
+// this, approving the harmless-looking literal command `Bash(*)` (a shell
+// syntax error when run) durably allowed EVERY future command.
+func TestWriteRulesRefusesRuleSyntaxCollisions(t *testing.T) {
+	ctx := context.Background()
+	commands := map[string]string{
+		"literal bare wildcard":   "Bash(*)",
+		"literal family":          "Bash(rm:*)",
+		"literal catalog family":  "Bash(git log:*)",
+		"literal spaced wildcard": "Bash( * )",
+	}
+	for name, command := range commands {
+		path := testPath(t)
+		store := mustWorkspaceStore(t, Config{Path: path})
+		if err := store.WriteRules(ctx, []tool.RuleCandidate{commandCandidate(command)}); err == nil {
+			t.Errorf("%s: WriteRules(%q) succeeded, want refusal", name, command)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s: refused candidate persisted a file: %v", name, err)
+		}
+		for _, probe := range []string{"rm -rf /", "rm x", "git log --oneline", command} {
+			requirement := tool.Requirement{Kind: CapabilityCommandExecute, Match: probe, Description: "d", GrantClass: GrantClassCommandStart, GrantTarget: probe}
+			matched, err := store.MatchesAllow(ctx, requirement)
+			if err != nil {
+				t.Fatalf("%s: MatchesAllow(%q): %v", name, probe, err)
+			}
+			if matched {
+				t.Errorf("%s: candidate for literal command %q durably allowed %q", name, command, probe)
+			}
+		}
+	}
+	// The bare wildcard is file-only syntax: it is never a displayed
+	// candidate, so the candidate path refuses it regardless of grant target.
+	path := testPath(t)
+	store := mustWorkspaceStore(t, Config{Path: path})
+	crafted := tool.RuleCandidate{Kind: CapabilityCommandExecute, Match: "Bash(*)", Description: "d", GrantClass: GrantClassCommandStart, GrantTarget: "true"}
+	if err := store.WriteRules(ctx, []tool.RuleCandidate{crafted}); err == nil {
+		t.Error("WriteRules accepted a bare-wildcard candidate")
 	}
 }
 

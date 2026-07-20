@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // FuzzBashRule fuzzes the shell segmenter/tokenizer and the family matcher:
@@ -24,6 +26,12 @@ func FuzzBashRule(f *testing.F) {
 		{"`x`; ~/bin/x; * ; #x", "x"},
 		{"a && ", "a"},
 		{"rm", "rm"},
+		// Display-syntax collisions: literal commands living in the Bash(...)
+		// rule namespace must never round-trip into a wildcard or family.
+		{"Bash(*)", "git log"},
+		{"Bash(rm:*)", "rm"},
+		{"Bash(git log:*)", "git log"},
+		{"Bash( * )", "git log"},
 	}
 	for _, seed := range seeds {
 		f.Add(seed.command, seed.family)
@@ -100,11 +108,32 @@ func FuzzBashRule(f *testing.F) {
 
 		eligible := func(candidate []string) bool { return reflect.DeepEqual(candidate, tokens) }
 		proposed := ProposeCommandCandidate(command, eligible)
+		candidateRuleFor := func(match string) (Rule, error) {
+			candidate := tool.RuleCandidate{Kind: CapabilityCommandExecute, Match: match, GrantClass: GrantClassCommandStart, GrantTarget: command}
+			return commandCandidateRule(0, Rule{Effect: EffectAllow, Capability: CapabilityCommandExecute}, candidate)
+		}
 		if proposed == "Bash(*)" {
 			t.Fatalf("bare wildcard proposed for %q", command)
 		}
-		if proposed != command {
-			proposedRule, err := commandCandidateRule(0, Rule{Effect: EffectAllow, Capability: CapabilityCommandExecute}, proposed)
+		switch {
+		case proposed == command:
+			if collidesWithBashRuleSyntax(command) {
+				t.Fatalf("exact candidate proposed for colliding command %q", command)
+			}
+			// An exact fallback that the store accepts must stay an exact
+			// rule; it can never be re-read as a wildcard or family.
+			if exactRule, err := candidateRuleFor(proposed); err == nil && exactRule.Class != ClassCommandInvoke {
+				t.Fatalf("exact candidate %q persisted as class %q", proposed, exactRule.Class)
+			}
+		case proposed == "":
+			// A candidate is withheld exactly when the exact fallback would
+			// collide with the Bash(...) rule-syntax namespace. (An empty
+			// command is caught by the proposed == command case above.)
+			if !collidesWithBashRuleSyntax(command) {
+				t.Fatalf("candidate withheld for non-colliding command %q", command)
+			}
+		default:
+			proposedRule, err := candidateRuleFor(proposed)
 			if err != nil {
 				t.Fatalf("proposal %q for %q does not parse: %v", proposed, command, err)
 			}

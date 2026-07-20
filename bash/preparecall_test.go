@@ -105,6 +105,13 @@ func TestBashPrepareCallCandidates(t *testing.T) {
 		{name: "ineligible exact fallback", options: []BashOption{WithFamilyCatalog(catalog)}, command: "rm -rf build", wantMatch: "rm -rf build"},
 		{name: "no catalog exact fallback", command: "git log --oneline", wantMatch: "git log --oneline"},
 		{name: "multi segment exact fallback", options: []BashOption{WithFamilyCatalog(catalog)}, command: "git log && rm x", wantMatch: "git log && rm x"},
+		// A literal command living in the Bash(...) display-rule namespace
+		// gets NO reusable candidate (wantMatch ""): its exact fallback would
+		// be re-read by the store as a wildcard or family rule. Once-only
+		// approval still works through the requirement itself.
+		{name: "rule-syntax wildcard command", options: []BashOption{WithFamilyCatalog(catalog)}, command: "Bash(*)", wantMatch: ""},
+		{name: "rule-syntax family command", options: []BashOption{WithFamilyCatalog(catalog)}, command: "Bash(rm:*)", wantMatch: ""},
+		{name: "rule-syntax catalog command", options: []BashOption{WithFamilyCatalog(catalog)}, command: "Bash(git log:*)", wantMatch: ""},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -116,7 +123,17 @@ func TestBashPrepareCallCandidates(t *testing.T) {
 				t.Fatal(err)
 			}
 			req, _ := prepareBash(t, b, string(args))
-			candidates := req.Requirements[0].Candidates
+			requirement := req.Requirements[0]
+			if requirement.Match != tt.command || requirement.GrantTarget != tt.command {
+				t.Errorf("requirement match/target = %q/%q, want the exact command %q", requirement.Match, requirement.GrantTarget, tt.command)
+			}
+			candidates := requirement.Candidates
+			if tt.wantMatch == "" {
+				if len(candidates) != 0 {
+					t.Fatalf("candidates = %+v, want none for a rule-syntax-colliding command", candidates)
+				}
+				return
+			}
 			if len(candidates) != 1 {
 				t.Fatalf("candidates = %d, want 1", len(candidates))
 			}
@@ -128,6 +145,44 @@ func TestBashPrepareCallCandidates(t *testing.T) {
 				t.Errorf("candidate = %+v, want command.execute with the exact-command grant pair", c)
 			}
 		})
+	}
+}
+
+// TestBashRuleSyntaxCommandCannotPersistWildcard is the end-to-end repro of
+// the display-syntax collision: preparing the literal command `Bash(*)` and
+// writing whatever candidates preparation emitted must never leave a durable
+// rule that allows an unrelated command.
+func TestBashRuleSyntaxCommandCannotPersistWildcard(t *testing.T) {
+	t.Parallel()
+	catalog := func(tokens []string) bool { return len(tokens) == 2 && tokens[0] == "git" && tokens[1] == "log" }
+	for _, command := range []string{"Bash(*)", "Bash(rm:*)", "Bash(git log:*)"} {
+		b := NewBash(t.TempDir(), WithFamilyCatalog(catalog))
+		args, err := json.Marshal(map[string]any{"command": command})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, _ := prepareBash(t, b, string(args))
+		store, _, err := permission.NewWorkspaceStore(permission.Config{Path: filepath.Join(t.TempDir(), "permissions.json")})
+		if err != nil {
+			t.Fatalf("NewWorkspaceStore() error = %v", err)
+		}
+		var candidates []tool.RuleCandidate
+		for _, requirement := range req.Requirements {
+			candidates = append(candidates, requirement.Candidates...)
+		}
+		if err := store.WriteRules(context.Background(), candidates); err != nil {
+			t.Fatalf("WriteRules(%q candidates) error = %v", command, err)
+		}
+		for _, probe := range []string{"rm -rf /", "rm x", "git log --oneline"} {
+			requirement := tool.Requirement{Kind: permission.CapabilityCommandExecute, Match: probe, Description: "d", GrantClass: permission.GrantClassCommandStart, GrantTarget: probe}
+			matched, err := store.MatchesAllow(context.Background(), requirement)
+			if err != nil {
+				t.Fatalf("MatchesAllow(%q): %v", probe, err)
+			}
+			if matched {
+				t.Errorf("preparing literal command %q durably allowed %q", command, probe)
+			}
+		}
 	}
 }
 

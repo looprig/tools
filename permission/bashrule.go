@@ -404,6 +404,16 @@ func commandRules(rules []Rule, effect Effect) []Rule {
 	return applicable
 }
 
+// collidesWithBashRuleSyntax reports whether a literal command string lives
+// in the Bash(...) display-rule namespace that commandCandidateRule parses.
+// The predicate is the exact namespace the store interprets — the two must
+// stay in lockstep. Such a command must never be offered or accepted as a
+// reusable exact candidate: the store would re-read it as a wildcard or
+// family rule (or reject the batch), never as the exact command it is.
+func collidesWithBashRuleSyntax(command string) bool {
+	return strings.HasPrefix(command, "Bash(")
+}
+
 // ProposeCommandCandidate returns the reusable command-candidate match
 // string Bash preparation should display for one normalized command: a
 // family candidate "Bash(tokens:*)" when the command is a single supported
@@ -412,13 +422,30 @@ func commandRules(rules []Rule, effect Effect) []Rule {
 // prefixes, shells, interpreters, execution wrappers, multi-segment
 // commands, and unsupported syntax all fall back to the exact command
 // because the positive catalog decides; bare Bash(*) is never proposed.
+//
+// A command whose own text collides with the Bash(...) rule-syntax namespace
+// (see collidesWithBashRuleSyntax) gets NO reusable candidate — the empty
+// string. An exact fallback for such a command would be re-read by the store
+// as a wildcard or family rule, so a malicious literal command `Bash(*)`
+// (a mere shell syntax error when run) could otherwise be laundered into a
+// durable allow-everything record via `Approve always`. Refusal is chosen
+// over an escaped encoding because the candidate Match doubles as the exact
+// display text; once-only approval is unaffected, and a user who truly wants
+// a durable exact rule for such a command can author the structured
+// command.invoke.v1 file record, which is unambiguous.
 func ProposeCommandCandidate(command string, eligible FamilyEligibility) string {
-	if eligible == nil {
+	exact := func() string {
+		if collidesWithBashRuleSyntax(command) {
+			return ""
+		}
 		return command
+	}
+	if eligible == nil {
+		return exact()
 	}
 	segments, ok := splitShellCommand(command)
 	if !ok || len(segments) != 1 || !segments[0].Supported {
-		return command
+		return exact()
 	}
 	tokens := segments[0].Tokens
 	bare := 0
@@ -437,7 +464,7 @@ func ProposeCommandCandidate(command string, eligible FamilyEligibility) string 
 			return "Bash(" + strings.Join(prefix, " ") + ":*)"
 		}
 	}
-	return command
+	return exact()
 }
 
 // parseFamilyCandidateTokens parses the body of a Bash(tokens:*) candidate

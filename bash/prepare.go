@@ -152,23 +152,29 @@ func normalizeBashCommand(raw string) (string, error) {
 // its single reusable candidate: a token-prefix family through the injected
 // eligibility catalog when the command qualifies, the exact normalized command
 // otherwise. The candidate's grant pair mirrors the requirement's — issuance
-// after any match remains exact-command command.start.v1.
+// after any match remains exact-command command.start.v1. A command whose own
+// text collides with the Bash(...) rule-syntax namespace gets no reusable
+// candidate at all (ProposeCommandCandidate returns ""): once-only approval
+// through the requirement still works, but no durable rule is offered,
+// because the store would re-read the exact fallback as rule syntax.
 func commandRequirement(command string, eligible permission.FamilyEligibility) tool.Requirement {
-	candidateMatch := permission.ProposeCommandCandidate(command, eligible)
-	return tool.Requirement{
+	requirement := tool.Requirement{
 		Kind:        tool.CapabilityCommandExecute,
 		Match:       command,
 		Description: "execute `" + command + "`",
 		GrantClass:  tool.GrantClassCommandStart,
 		GrantTarget: command,
-		Candidates: []tool.RuleCandidate{{
+	}
+	if candidateMatch := permission.ProposeCommandCandidate(command, eligible); candidateMatch != "" {
+		requirement.Candidates = []tool.RuleCandidate{{
 			Kind:        tool.CapabilityCommandExecute,
 			Match:       candidateMatch,
 			Description: "allow `" + candidateMatch + "`",
 			GrantClass:  tool.GrantClassCommandStart,
 			GrantTarget: command,
-		}},
+		}}
 	}
+	return requirement
 }
 
 // declaredDeltas converts the structured declaration into command-backed

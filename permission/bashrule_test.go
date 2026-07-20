@@ -256,6 +256,15 @@ func TestProposeCommandCandidate(t *testing.T) {
 		"glob command":              {"*", catalog, "*"},
 		"longest prefix wins":       {"git log -n 1", catalogOf("git", "git log"), "Bash(git log:*)"},
 		"shorter prefix still hits": {"git fetch --all", catalogOf("git"), "Bash(git:*)"},
+		// A literal command colliding with the Bash(...) display-rule
+		// namespace gets NO reusable candidate: an exact fallback would be
+		// re-read by the store as a wildcard or family rule.
+		"rule-syntax wildcard":            {"Bash(*)", catalog, ""},
+		"rule-syntax family":              {"Bash(rm:*)", catalog, ""},
+		"rule-syntax catalog family":      {"Bash(git log:*)", catalog, ""},
+		"rule-syntax spaced":              {"Bash( * )", catalog, ""},
+		"rule-syntax prefix only":         {"Bash(anything", catalog, ""},
+		"rule-syntax wildcard no catalog": {"Bash(*)", nil, ""},
 	}
 	for name, tc := range cases {
 		if got := ProposeCommandCandidate(tc.command, tc.eligible); got != tc.want {

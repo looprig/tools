@@ -485,7 +485,7 @@ func candidateRule(index int, candidate tool.RuleCandidate) (Rule, error) {
 		if candidate.GrantClass != GrantClassCommandStart {
 			return Rule{}, &RuleError{Index: index, Reason: "command candidate requires grant class " + GrantClassCommandStart}
 		}
-		return commandCandidateRule(index, rule, candidate.Match)
+		return commandCandidateRule(index, rule, candidate)
 	case CapabilityNetwork:
 		switch candidate.GrantClass {
 		case "", GrantClassNetworkProxyTarget:
@@ -515,13 +515,27 @@ func candidateRule(index int, candidate tool.RuleCandidate) (Rule, error) {
 }
 
 // commandCandidateRule parses the command candidate display syntax:
-// Bash(*), Bash(tokens:*), or an exact normalized command. The stored
-// canonical representation is structured; a raw string prefix is never
-// stored.
-func commandCandidateRule(index int, rule Rule, match string) (Rule, error) {
+// Bash(tokens:*) or an exact normalized command. The stored canonical
+// representation is structured; a raw string prefix is never stored.
+//
+// Two refusals keep the display-string channel unambiguous (spec, "Bare
+// Bash(*) ... is never proposed automatically"): a candidate whose grant
+// target — the exact normalized command the approval was FOR — itself lives
+// in the Bash(...) rule-syntax namespace is refused outright, so a literal
+// command such as `Bash(*)` or `Bash(rm:*)` can never be laundered into a
+// wildcard or family record (ProposeCommandCandidate withholds the candidate
+// for such commands; this is the store-side backstop). And the bare wildcard
+// is file-only syntax no tool ever displays, so it is never accepted here;
+// hand authoring uses the structured file records, which name the class
+// explicitly and are therefore never ambiguous.
+func commandCandidateRule(index int, rule Rule, candidate tool.RuleCandidate) (Rule, error) {
+	match := candidate.Match
+	if collidesWithBashRuleSyntax(candidate.GrantTarget) {
+		return Rule{}, &RuleError{Index: index, Reason: "command collides with the Bash(...) rule syntax and has no reusable candidate"}
+	}
 	switch {
 	case match == "Bash(*)":
-		rule.Class = ClassCommandInvokeWildcard
+		return Rule{}, &RuleError{Index: index, Reason: "bare wildcard Bash(*) is never a displayed candidate; author a structured wildcard record instead"}
 	case strings.HasPrefix(match, "Bash(") && strings.HasSuffix(match, ":*)"):
 		body := strings.TrimSuffix(strings.TrimPrefix(match, "Bash("), ":*)")
 		tokens, err := parseFamilyCandidateTokens(body)
