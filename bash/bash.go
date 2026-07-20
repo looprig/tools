@@ -9,9 +9,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/internal/definition"
 	"github.com/looprig/tools/internal/workspace"
+	"github.com/looprig/tools/permission"
 )
 
 // bash.go implements the Bash tool: it runs a single shell command via `sh -c`
@@ -21,11 +23,13 @@ import (
 // DELIBERATE, DOCUMENTED EXCEPTION to CLAUDE.md's "never pass user input to
 // exec.Command as a shell string" rule: a coding agent genuinely needs shell
 // features (pipes, globs, &&, redirects) that an argv list cannot express, so the
-// command is handed to `sh -c`. The boundary is NOT this argv shape and NOT the
-// advisory DeniedBashPrefixes (trivially bypassable) — it is the PERMISSION GATE:
-// Bash defaults to Ask, so a human approves each command before it runs. OS-level
-// sandboxing (the real boundary) is out of scope and is the prerequisite for ever
-// auto-approving Bash broadly. This exception is recorded in CLAUDE.md.
+// command is handed to `sh -c`. The boundary is NOT this argv shape — it is the
+// PERMISSION GATE plus the injected confined runner: PrepareCall (prepare.go)
+// emits the typed command-backed access request the gate decides, and the
+// resulting single-spawn grant tokens travel through the PreparedCall to the
+// runner (e.g. the sandbox Executor), which MAC-verifies and enforces them.
+// Direct `sh -c` execution remains the bare-harness default for consumers that
+// accept unconfined execution. This exception is recorded in CLAUDE.md.
 //
 // Failure model: a non-zero EXIT CODE is a NORMAL tool result (the model reads
 // stderr + the code), NOT a Go error. A timeout is a tool-result "error: command
@@ -66,23 +70,29 @@ const bashSchema = `{
     "command": {"type": "string", "description": "The shell command to run via 'sh -c'. May use pipes, globs, redirects, and '&&'."},
     "workdir": {"type": "string", "description": "Workspace-relative working directory for the command (optional; defaults to the workspace root)."},
     "timeout": {"type": "integer", "minimum": 1, "maximum": 120, "description": "Maximum runtime in seconds (optional; default 30, hard cap 120)."},
-    "grants": {"type": "array", "items": {"type": "string"}, "description": "Escalation grant tokens received in a PRIOR denial result for this exact command. Attach them verbatim to retry; NEVER invent, guess, or modify a token."}
+    "access": {
+      "type": "object",
+      "description": "Optional structured access declaration for this command. It REQUESTS authority (each declared delta joins the same approval as the command); it never grants it. An omitted gated delta stays OS-blocked; after such a block, retry with a new call that declares the needed capability.",
+      "properties": {
+        "network": {"type": "array", "items": {"type": "object", "properties": {"transport": {"type": "string", "enum": ["tcp"], "description": "Transport (optional; tcp is the only supported value)."}, "host": {"type": "string", "description": "Exact destination hostname or IP. Omit to request a truthfully broad, exact-command-bound egress delta for the port."}, "port": {"type": "integer", "minimum": 1, "maximum": 65535}}, "required": ["port"]}},
+        "read": {"type": "array", "items": {"type": "object", "properties": {"scope": {"type": "string", "enum": ["path", "tree", "host"]}, "path": {"type": "string", "description": "Path or tree root (relative paths resolve against the command's working directory). Not allowed for scope 'host', which is explicitly broad."}}, "required": ["scope"]}},
+        "write": {"type": "array", "items": {"type": "object", "properties": {"scope": {"type": "string", "enum": ["path", "tree", "host"]}, "path": {"type": "string"}}, "required": ["scope"]}}
+      }
+    }
   },
   "required": ["command"]
 }`
 
 const bashDesc = "Run a single shell command via 'sh -c' inside the workspace. Supports pipes, globs, redirects, and '&&'. Combined stdout+stderr is captured (capped at 32 KiB) and the exit code is reported. The working directory is confined to the workspace; runtime is bounded (default 30s, max 120s). Requires approval before each command."
 
-// bashArgs is the typed decode of Bash's untrusted argsJSON.
+// bashArgs is the typed decode of Bash's untrusted argsJSON. Grant tokens are
+// deliberately NOT a model-facing argument: they travel only in the
+// tool.PreparedCall the runner binds to the call after the gate decision.
 type bashArgs struct {
-	Command string `json:"command"`
-	Workdir string `json:"workdir"`
-	Timeout int    `json:"timeout"`
-	// Grants are opaque escalation tokens the model re-attaches from a prior
-	// denial result for THIS command. They are OPAQUE to harness — it never
-	// mints or verifies them (the sandbox does); it only carries them to a
-	// GrantedRunner. Absent means no grants.
-	Grants []string `json:"grants,omitempty"`
+	Command string      `json:"command"`
+	Workdir string      `json:"workdir"`
+	Timeout int         `json:"timeout"`
+	Access  *accessDecl `json:"access,omitempty"`
 }
 
 // BashTool runs a single shell command in a workspace-contained directory. It
@@ -91,11 +101,12 @@ type bashArgs struct {
 // means direct `sh -c` execution (the bare-harness default), while an invalid
 // option or typed-nil runner fails closed through a model-safe error.
 type BashTool struct {
-	root    string
-	runner  tool.CommandRunner
-	coord   tool.WorkspaceCoordinator
-	obs     tool.WorkspaceObservations
-	initErr error
+	root           string
+	runner         tool.CommandRunner
+	coord          tool.WorkspaceCoordinator
+	obs            tool.WorkspaceObservations
+	familyEligible permission.FamilyEligibility
+	initErr        error
 }
 
 // BashOption configures a BashTool at construction (functional-options pattern).
@@ -120,6 +131,15 @@ func WithWorkspaceCoordinator(coord tool.WorkspaceCoordinator) BashOption {
 	}
 }
 
+// WithFamilyCatalog injects the consumer's explicit eligible-prefix catalog for
+// AUTOMATIC family candidate proposal (spec: unknown prefixes fail closed to an
+// exact proposal). The catalog affects only which reusable candidate is
+// DISPLAYED; it never widens the requirement or the issued exact-command grant.
+// Nil (the default) proposes exact candidates only.
+func WithFamilyCatalog(eligible permission.FamilyEligibility) BashOption {
+	return func(b *BashTool) { b.familyEligible = eligible }
+}
+
 // WithObservations binds the loop's shared file-observation set so a command run
 // invalidates it wholesale afterward (the changed paths are unknowable). A nil or
 // typed-nil set is ignored (no invalidation).
@@ -142,9 +162,10 @@ func NewBash(root string, opts ...BashOption) *BashTool {
 }
 
 type bashConfig struct {
-	runner tool.CommandRunner
-	coord  tool.WorkspaceCoordinator
-	obs    tool.WorkspaceObservations
+	runner         tool.CommandRunner
+	coord          tool.WorkspaceCoordinator
+	obs            tool.WorkspaceObservations
+	familyEligible permission.FamilyEligibility
 }
 
 // Factory is an immutable Bash construction blueprint. It resolves options once
@@ -180,11 +201,11 @@ func resolveBashOptions(opts []BashOption) (bashConfig, error) {
 	if resolved.runner != nil && workspace.IsNil(resolved.runner) {
 		return bashConfig{}, &definition.BuildError{Definition: bashToolName, Dependency: "runner"}
 	}
-	return bashConfig{runner: resolved.runner, coord: resolved.coord, obs: resolved.obs}, nil
+	return bashConfig{runner: resolved.runner, coord: resolved.coord, obs: resolved.obs, familyEligible: resolved.familyEligible}, nil
 }
 
 func newBash(root string, config bashConfig) *BashTool {
-	return &BashTool{root: root, runner: config.runner, coord: config.coord, obs: config.obs}
+	return &BashTool{root: root, runner: config.runner, coord: config.coord, obs: config.obs, familyEligible: config.familyEligible}
 }
 
 // Info returns Bash's self-description. Name MUST equal "Bash".
@@ -208,33 +229,13 @@ func (b *BashTool) AuditSummary(argsJSON string) string {
 	return "Bash: " + a.Command
 }
 
-// Interim (replaced in Task 3.4): the legacy BuildRequest/PermissionPrompter
-// prompt seam and its planGrants display-grant planner were removed with the
-// old harness gate. Until Task 3.4 adds PrepareCall emitting command.execute
-// (grant class command.start.v1) plus the explicitly declared filesystem and
-// network deltas, Bash is an unprepared effectful tool and the harness runner
-// fails closed: the call is never evaluated or executed.
-
-// resolveDir resolves a workspace-relative workdir to the confined absolute directory
-// a command runs in. It delegates to the package-level resolveSpawnDir so InvokableRun
-// (which maps its error to a tool-result string), planGrants (which plans no grants on
-// error), AND the PermissionChecker's grant re-mint seam all derive the spawn dir
-// identically — "grants are planned/minted for the same dir InvokableRun runs in" is a
-// structural guarantee, not a copy-paste coincidence.
-func (b *BashTool) resolveDir(workdir string) (string, error) {
-	return resolveSpawnDir(b.root, workdir)
-}
-
 // resolveSpawnDir maps a workspace-relative workdir to the confined absolute directory
 // a Bash command runs in: the root VERBATIM when workdir is empty, else
-// workspace.ContainedPath(root, workdir) (which rejects any escape). It is the SINGLE definition
-// of "the spawn dir", shared by Bash.resolveDir (the run/plan dir) and the
-// PermissionChecker's grant re-mint seam (grant_remint.go), which MUST plan/mint grants
-// for the SAME dir the spawn uses — the executor binds each token to
-// hashCommand(dir, command) and re-verifies it against the actual spawn dir. Because
-// both callers pass the same workspace root string — a composition-root invariant: the
-// checker's WorkspaceRoot IS the Bash tool's root (the same invariant workspaceRelPath
-// already relies on) — dir-consistency is structural, not a coincidence.
+// workspace.ContainedPath(root, workdir) (which rejects any escape). It is the SINGLE
+// definition of "the spawn dir", shared by PrepareCall (which binds the request's
+// WorkingDirectory — the dir every grant is minted for) and InvokableRun (which
+// re-resolves and compares so a resolution change between approval and execution
+// refuses the run fail-closed).
 func resolveSpawnDir(root, workdir string) (string, error) {
 	if workdir == "" {
 		return root, nil
@@ -242,27 +243,34 @@ func resolveSpawnDir(root, workdir string) (string, error) {
 	return workspace.ContainedPath(root, workdir)
 }
 
-// InvokableRun runs the command and returns its combined output + exit code as a
-// tool result. A non-zero exit is a normal result; a timeout, an escaping
-// workdir, or an unparseable args document is a tool-result error string. It
+// InvokableRun executes the PREPARED artifact bound to this call — the raw
+// argsJSON is never reparsed, so mutating it after preparation changes nothing;
+// without its artifact the tool fails closed. The command runs through the
+// bound runner with the PreparedCall's issued grant tokens (the runner MAC
+// verifies them; Bash only carries the opaque strings). A non-zero exit is a
+// normal result; a timeout or start failure is a tool-result error string. It
 // never returns a Go error.
-func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+func (b *BashTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
 	if b.initErr != nil {
 		return tool.TextResult("error: Bash is unavailable: " + b.initErr.Error()), nil
 	}
-	var a bashArgs
-	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
+	call, ok := loop.PreparedCallFromContext(ctx)
+	if !ok {
+		return tool.TextResult("error: permission denied: Bash requires its prepared call artifact"), nil
 	}
-	if a.Command == "" {
-		return tool.TextResult("error: a non-empty 'command' is required"), nil
+	art, ok := call.Artifact.(*bashArtifact)
+	if !ok || art == nil {
+		return tool.TextResult("error: permission denied: Bash requires its prepared call artifact"), nil
 	}
 
-	// Resolve the working directory under the workspace root (default: the root).
-	// An escape is rejected (defense in depth; the gate also contains the workdir).
-	dir, err := b.resolveDir(a.Workdir)
+	// Enforce the APPROVED spawn directory: a resolution changed between
+	// prepare and run (a symlink swap) refuses the run fail-closed.
+	dir, err := resolveSpawnDir(b.root, art.workdirRel)
 	if err != nil {
-		return tool.TextResult("error: workdir is outside the workspace: " + a.Workdir), nil
+		return tool.TextResult("error: workdir is outside the workspace: " + art.workdirRel), nil
+	}
+	if dir != art.dirAbs {
+		return tool.TextResult("error: workdir resolution changed since approval: " + art.workdirRel), nil
 	}
 
 	// Take the EXCLUSIVE whole-workspace mutation permit for the run: Bash may change
@@ -282,15 +290,12 @@ func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 	// once the command has been attempted (after a successful acquire).
 	defer b.invalidateObservations()
 
-	// Interim (replaced in Task 3.4): the ambient grant context was removed
-	// with the old harness gate — post-decision grants now travel only in the
-	// prepared execution path. Until Task 3.4 wires that path, only the
-	// model-supplied opaque retry tokens are carried; the runner still MAC
-	// verifies every token before applying it.
-	merged := mergeGrants(a.Grants, nil)
+	// Post-decision grants travel ONLY in the PreparedCall the runner bound to
+	// this ctx — never in an ambient grant context or a model-facing argument.
+	grants := call.Grants
 
-	// Bound the command's runtime: clamp the caller timeout into (0, 120s].
-	timeout := clampBashTimeout(a.Timeout)
+	// Bound the command's runtime with the timeout validated at preparation.
+	timeout := art.timeout
 	ctx2, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -300,23 +305,23 @@ func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 		timedOut bool
 		runErr   error
 	)
-	// Grant-aware dispatch: when grants are present AND the injected runner supports
-	// them, run via RunCommandWithGrants; otherwise the exact Task-15 behavior
-	// (RunCommand if a runner is set, else direct sh -c). Grants present but no
-	// GrantedRunner (nil runner, or a RunCommand-only runner) falls through — the
-	// tokens are ignored at the exec layer (the gate already saw them).
-	if gr, ok := b.runner.(tool.GrantedRunner); ok && len(merged) > 0 {
+	// Grant-aware dispatch: when issued grants are present AND the injected
+	// runner supports them, run via RunCommandWithGrants; otherwise RunCommand
+	// if a runner is set, else direct sh -c. Grants present but no GrantedRunner
+	// (nil runner, or a RunCommand-only runner) falls through — the tokens are
+	// ignored at the exec layer (the gate already resolved the decision).
+	if gr, ok := b.runner.(tool.GrantedRunner); ok && len(grants) > 0 {
 		// Confined + escalated path: the injected runner (e.g. the sandbox Executor)
 		// folds a timeout/cancel into err (it returns ctx.Err()); adapt its byte
 		// output + error into the (output, exitCode, timedOut, startErr) shape.
-		outBytes, ec, err := gr.RunCommandWithGrants(ctx2, dir, a.Command, merged)
+		outBytes, ec, err := gr.RunCommandWithGrants(ctx2, dir, art.command, grants)
 		out, exitCode, timedOut, runErr = adaptRunnerResult(ctx2, outBytes, ec, err)
 	} else if b.runner != nil {
 		// Confined path: same adaptation as the grants path, without the tokens.
-		outBytes, ec, err := b.runner.RunCommand(ctx2, dir, a.Command)
+		outBytes, ec, err := b.runner.RunCommand(ctx2, dir, art.command)
 		out, exitCode, timedOut, runErr = adaptRunnerResult(ctx2, outBytes, ec, err)
 	} else {
-		out, exitCode, timedOut, runErr = runShellCommand(ctx2, dir, a.Command)
+		out, exitCode, timedOut, runErr = runShellCommand(ctx2, dir, art.command)
 	}
 	if timedOut {
 		return tool.TextResult("error: command timed out after " + timeout.String()), nil
@@ -378,35 +383,6 @@ func adaptRunnerResult(ctx context.Context, outBytes []byte, exitCode int, err e
 		startErr = err
 	}
 	return out, code, timedOut, startErr
-}
-
-// mergeGrants unions the tool's own grant args with any grants the runner placed
-// on the ctx (a pre-ask approval): de-duplicated and order-stable — args first (in
-// order, first occurrence wins), then ctx-only tokens not already present. Grant
-// tokens are OPAQUE — harness never inspects or mints them; this only carries and
-// de-dupes the strings. No grants from either source → nil (so len==0 selects the
-// non-escalated path).
-func mergeGrants(argsGrants, ctxGrants []string) []string {
-	if len(argsGrants) == 0 && len(ctxGrants) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(argsGrants)+len(ctxGrants))
-	merged := make([]string, 0, len(argsGrants)+len(ctxGrants))
-	add := func(tokens []string) {
-		for _, g := range tokens {
-			if _, dup := seen[g]; dup {
-				continue
-			}
-			seen[g] = struct{}{}
-			merged = append(merged, g)
-		}
-	}
-	add(argsGrants)
-	add(ctxGrants)
-	if len(merged) == 0 {
-		return nil
-	}
-	return merged
 }
 
 // runShellCommand runs `sh -c command` in dir, capturing COMBINED stdout+stderr

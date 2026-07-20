@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -32,22 +31,11 @@ func (f *fakeCommandRunner) RunCommand(_ context.Context, dir, command string) (
 // interfaces (so the sandbox Executor satisfies them structurally too).
 var _ tool.CommandRunner = (*fakeCommandRunner)(nil)
 
-// bashRunnerText runs Bash with the given command and returns the single text
-// block; it fails the test on a Go error (Bash returns tool-result strings).
+// bashRunnerText runs Bash (prepared flow, no grants) with the given command
+// and returns the single text block.
 func bashRunnerText(t *testing.T, b *BashTool, command string) string {
 	t.Helper()
-	res, err := b.InvokableRun(context.Background(), `{"command":`+strconvQuote(command)+`}`)
-	if err != nil {
-		t.Fatalf("InvokableRun returned a Go error %v; Bash returns tool-result strings", err)
-	}
-	if res == nil || len(res.Content) != 1 {
-		t.Fatalf("result = %v, want exactly 1 block", res)
-	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	return tb.Text
+	return runPrepared(t, b, `{"command":`+strconvQuote(command)+`}`, nil)
 }
 
 // strconvQuote is a tiny JSON-string quoter for the test args.

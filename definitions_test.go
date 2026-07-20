@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/bash"
+	"github.com/looprig/tools/websearch"
 )
 
 type fakeReadGuard struct{ maxBytes int64 }
@@ -174,12 +175,23 @@ func blueprintBindings() tool.Bindings {
 
 var _ loop.ReadGuard = (*fakeReadGuard)(nil)
 
-// TestDefinitionToolsArePrepared proves every file/context/utility tool built
-// from the public definitions implements the mandatory preparation capability
-// (tool.CallPreparer) — an effectful tool without it fails closed in the
-// runner and a pure tool without it would be unusable. Bash, Fetch, and
-// WebSearch gain preparation in their own network-preparation change and are
-// deliberately not asserted here.
+// definitionProvider is a minimal SearchProvider (with declared endpoints) for
+// building the WebSearch definition.
+type definitionProvider struct{}
+
+func (*definitionProvider) Search(context.Context, string, int) ([]websearch.SearchResult, error) {
+	return nil, nil
+}
+
+func (*definitionProvider) Endpoints() []websearch.Endpoint {
+	return []websearch.Endpoint{{Host: "search.example.test", Port: 443}}
+}
+
+// TestDefinitionToolsArePrepared proves EVERY tool built from the public
+// definitions — including the network tools Bash, Fetch, and WebSearch —
+// implements the mandatory preparation capability (tool.CallPreparer): an
+// effectful tool without it fails closed in the runner and a pure tool without
+// it would be unusable.
 func TestDefinitionToolsArePrepared(t *testing.T) {
 	t.Parallel()
 	guard := &fakeReadGuard{maxBytes: 1024}
@@ -191,6 +203,9 @@ func TestDefinitionToolsArePrepared(t *testing.T) {
 		GrepDefinition(guard),
 		TodoDefinition(),
 		AskUserDefinition(),
+		Bash(bash.WithRunner(&definitionRunner{})),
+		FetchDefinition(http.DefaultClient),
+		WebSearchDefinition(&definitionProvider{}),
 	}
 	for _, definition := range definitions {
 		built, err := definition.Build(context.Background(), blueprintBindings())

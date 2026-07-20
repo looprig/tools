@@ -124,11 +124,7 @@ func TestFetchInvokableRun(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			res, err := f.InvokableRun(context.Background(), tt.argsJSON)
-			if err != nil {
-				t.Fatalf("InvokableRun() unexpected Go error = %v", err)
-			}
-			got := textOf(t, res)
+			got := runPreparedFetch(t, f, tt.argsJSON)
 			for _, want := range tt.wantContain {
 				if !strings.Contains(got, want) {
 					t.Errorf("result %q does not contain %q", got, want)
@@ -157,11 +153,7 @@ func TestFetchTimeout(t *testing.T) {
 
 	f := NewFetch(slow.Client())
 	// timeout 1s against a 3s server → bounded ctx fires → error result.
-	res, err := f.InvokableRun(context.Background(), `{"url":"`+slow.URL+`","method":"GET","timeout":1}`)
-	if err != nil {
-		t.Fatalf("InvokableRun() unexpected Go error = %v", err)
-	}
-	got := textOf(t, res)
+	got := runPreparedFetch(t, f, `{"url":"`+slow.URL+`","method":"GET","timeout":1}`)
 	if !strings.Contains(got, "error") {
 		t.Errorf("expected an error result on timeout, got %q", got)
 	}

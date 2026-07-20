@@ -2,19 +2,17 @@ package bash
 
 import (
 	"context"
-	"encoding/json"
 	"slices"
 	"strings"
 	"testing"
 
-	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/tool"
 )
 
 // fakeGrantedRunner implements BOTH tool.CommandRunner and tool.GrantedRunner. It
 // records which method the Bash tool dispatched to and the grant tokens it was
-// handed, so a test can assert the grant-aware routing (grants present + supported
-// → RunCommandWithGrants; otherwise RunCommand).
+// handed, so a test can assert the grant-aware routing (PreparedCall grants
+// present + supported → RunCommandWithGrants; otherwise RunCommand).
 type fakeGrantedRunner struct {
 	ranPlain   bool
 	ranGrants  bool
@@ -48,60 +46,19 @@ var (
 	_ tool.GrantedRunner = (*fakeGrantedRunner)(nil)
 )
 
-// runBashCtx invokes Bash with an explicit ctx + args map and returns the single
-// text block; it fails on a Go error (Bash returns tool-result strings).
-func runBashCtx(t *testing.T, ctx context.Context, b *BashTool, args map[string]any) string {
-	t.Helper()
-	raw, err := json.Marshal(args)
-	if err != nil {
-		t.Fatalf("marshal args: %v", err)
-	}
-	res, err := b.InvokableRun(ctx, string(raw))
-	if err != nil {
-		t.Fatalf("InvokableRun returned a Go error %v; Bash returns tool-result strings", err)
-	}
-	if res == nil || len(res.Content) != 1 {
-		t.Fatalf("result = %v, want exactly 1 block", res)
-	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	return tb.Text
-}
-
-// TestBashGrantDispatch exercises the args-grant + GrantedRunner routing. The
-// ambient ctx-grant seam was removed with the old harness gate; Task 3.4 moves
-// post-decision grants onto the prepared execution path.
+// TestBashGrantDispatch exercises the PreparedCall-grant + GrantedRunner
+// routing: issued tokens travel ONLY on the prepared execution path (there is
+// no model-facing grants argument and no ambient grant context).
 func TestBashGrantDispatch(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name        string
-		argsGrants  []string // nil => omit the "grants" arg entirely
-		wantGranted bool     // expect RunCommandWithGrants (not RunCommand)
-		wantGrants  []string // tokens the grants method should receive
+		grants      []string
+		wantGranted bool
 	}{
-		{
-			name:        "args grants route to the grants method",
-			argsGrants:  []string{"tok-a"},
-			wantGranted: true,
-			wantGrants:  []string{"tok-a"},
-		},
-		{
-			name:        "duplicate args grants are de-duplicated",
-			argsGrants:  []string{"tok-a", "tok-a"},
-			wantGranted: true,
-			wantGrants:  []string{"tok-a"},
-		},
-		{
-			name:        "no grants uses the plain RunCommand path",
-			wantGranted: false,
-		},
-		{
-			name:        "empty args grants slice uses the plain path",
-			argsGrants:  []string{},
-			wantGranted: false,
-		},
+		{name: "prepared grants route to the grants method", grants: []string{"tok-a", "tok-b"}, wantGranted: true},
+		{name: "no grants uses the plain RunCommand path", wantGranted: false},
+		{name: "empty grants slice uses the plain path", grants: []string{}, wantGranted: false},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -111,13 +68,7 @@ func TestBashGrantDispatch(t *testing.T) {
 			fake := &fakeGrantedRunner{out: []byte("ROUTED\n"), exit: 0}
 			b := NewBash(root, WithRunner(fake))
 
-			ctx := context.Background()
-			args := map[string]any{"command": "echo hi"}
-			if tt.argsGrants != nil {
-				args["grants"] = tt.argsGrants
-			}
-
-			out := runBashCtx(t, ctx, b, args)
+			out := runPrepared(t, b, `{"command":"echo hi"}`, tt.grants)
 
 			if fake.ranGrants != tt.wantGranted {
 				t.Fatalf("ranGrants = %v, want %v", fake.ranGrants, tt.wantGranted)
@@ -125,8 +76,8 @@ func TestBashGrantDispatch(t *testing.T) {
 			if fake.ranPlain != !tt.wantGranted {
 				t.Fatalf("ranPlain = %v, want %v", fake.ranPlain, !tt.wantGranted)
 			}
-			if tt.wantGranted && !slices.Equal(fake.gotGrants, tt.wantGrants) {
-				t.Errorf("grants handed to runner = %#v, want %#v", fake.gotGrants, tt.wantGrants)
+			if tt.wantGranted && !slices.Equal(fake.gotGrants, tt.grants) {
+				t.Errorf("grants handed to runner = %#v, want %#v", fake.gotGrants, tt.grants)
 			}
 			if fake.gotCommand != "echo hi" {
 				t.Errorf("runner saw command %q, want %q", fake.gotCommand, "echo hi")
@@ -141,20 +92,17 @@ func TestBashGrantDispatch(t *testing.T) {
 	}
 }
 
-// TestBashGrantsCommandRunnerOnlyFallsBack asserts that when grants are present but
-// the injected runner implements ONLY tool.CommandRunner (no GrantedRunner), Bash
-// falls back to RunCommand without panicking. The grants are simply ignored at the
-// exec layer (the gate still saw them) — the correct 17a behavior.
+// TestBashGrantsCommandRunnerOnlyFallsBack asserts that when grants are present
+// but the injected runner implements ONLY tool.CommandRunner (no GrantedRunner),
+// Bash falls back to RunCommand without panicking. The tokens are simply ignored
+// at the exec layer (the gate already resolved the decision).
 func TestBashGrantsCommandRunnerOnlyFallsBack(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	fake := &fakeCommandRunner{out: []byte("PLAIN\n"), exit: 0}
 	b := NewBash(root, WithRunner(fake))
 
-	out := runBashCtx(t, context.Background(), b, map[string]any{
-		"command": "echo hi",
-		"grants":  []string{"tok-a"},
-	})
+	out := runPrepared(t, b, `{"command":"echo hi"}`, []string{"tok-a"})
 
 	if fake.calls != 1 {
 		t.Fatalf("RunCommand calls = %d, want 1 (grants present but runner is CommandRunner-only → fall back)", fake.calls)
@@ -167,51 +115,15 @@ func TestBashGrantsCommandRunnerOnlyFallsBack(t *testing.T) {
 	}
 }
 
-// TestBashGrantsNilRunnerDirectExec asserts grants present with NO injected runner
-// (the bare-harness default) still direct-execs via sh -c without panicking; the
-// grants are ignored at the exec layer.
+// TestBashGrantsNilRunnerDirectExec asserts grants present with NO injected
+// runner (the bare-harness default) still direct-execs via sh -c without
+// panicking; the grants are ignored at the exec layer.
 func TestBashGrantsNilRunnerDirectExec(t *testing.T) {
 	t.Parallel()
 	requireSh(t)
 	b := NewBash(t.TempDir()) // nil runner
-	out := runBashCtx(t, context.Background(), b, map[string]any{
-		"command": "echo hello",
-		"grants":  []string{"tok-a"},
-	})
+	out := runPrepared(t, b, `{"command":"echo hello"}`, []string{"tok-a"})
 	if !strings.Contains(out, "hello") || !strings.Contains(out, "[exit code: 0]") {
 		t.Errorf("nil-runner Bash with grants did not direct-exec; got %q", out)
-	}
-}
-
-// TestBashSchemaHasGrants asserts the JSON schema advertises the optional "grants"
-// array-of-strings property (so the model can attach tokens) and that "grants" is
-// NOT in the required set.
-func TestBashSchemaHasGrants(t *testing.T) {
-	t.Parallel()
-	info, err := NewBash(t.TempDir()).Info(context.Background())
-	if err != nil {
-		t.Fatalf("Info() error = %v", err)
-	}
-	var schema struct {
-		Properties map[string]struct {
-			Type  string `json:"type"`
-			Items struct {
-				Type string `json:"type"`
-			} `json:"items"`
-		} `json:"properties"`
-		Required []string `json:"required"`
-	}
-	if err := json.Unmarshal(info.Schema, &schema); err != nil {
-		t.Fatalf("Schema is not the expected JSON object: %v", err)
-	}
-	g, ok := schema.Properties["grants"]
-	if !ok {
-		t.Fatal("schema is missing the 'grants' property")
-	}
-	if g.Type != "array" || g.Items.Type != "string" {
-		t.Errorf("grants property = {type:%q items.type:%q}, want array of string", g.Type, g.Items.Type)
-	}
-	if slices.Contains(schema.Required, "grants") {
-		t.Error("'grants' must be optional (not in required)")
 	}
 }

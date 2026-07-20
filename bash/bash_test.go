@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -40,14 +41,29 @@ func requireSh(t *testing.T) {
 	}
 }
 
-// runBash invokes Bash and extracts the single text block.
+// runBash prepares AND invokes Bash and extracts the single text block. A
+// preparation failure is returned as an "error: ..." string so rejection rows
+// share the helper (invalid input now fails at PrepareCall, before execution).
 func runBash(t *testing.T, root string, args map[string]any) string {
 	t.Helper()
-	b, err := json.Marshal(args)
+	raw, err := json.Marshal(args)
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
 	}
-	res, err := NewBash(root).InvokableRun(context.Background(), string(b))
+	return runPrepared(t, NewBash(root), string(raw), nil)
+}
+
+// runPrepared drives the full prepared flow for one Bash call: PrepareCall,
+// bind the PreparedCall (with optional grant tokens) to the ctx, InvokableRun.
+func runPrepared(t *testing.T, b *BashTool, argsJSON string, grants []string) string {
+	t.Helper()
+	id := mustUUID(t)
+	req, art, err := b.PrepareCall(context.Background(), id, argsJSON)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art, Grants: grants})
+	res, err := b.InvokableRun(ctx, argsJSON)
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; Bash returns tool-result strings", err)
 	}

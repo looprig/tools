@@ -3,7 +3,9 @@ package fetch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -11,7 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/prepared"
+	"github.com/looprig/tools/permission"
 )
 
 // fetch.go implements the Fetch tool: it performs a single bounded HTTP GET or
@@ -143,46 +148,112 @@ func (f *Fetch) AuditSummary(argsJSON string) string {
 	return method + " " + host
 }
 
-// Interim (replaced in Task 3.4): the legacy BuildRequest/PermissionPrompter
-// prompt seam was removed with the old harness gate. Until Task 3.4 adds
-// PrepareCall emitting the shared network requirement, Fetch is an unprepared
-// effectful tool and the harness runner fails closed: the call is never
-// evaluated or executed.
+// fetchArtifact binds the ONE-TIME normalized preparation output to a call:
+// the validated method, the normalized URL, its enforced (scheme, host, port)
+// target, and the request headers/body/timeout. Execution consumes it verbatim
+// — the raw args are never reparsed.
+type fetchArtifact struct {
+	tool.TokenArtifact
+	method  string
+	url     string
+	scheme  string
+	host    string
+	port    int
+	headers map[string]string
+	body    string
+	timeout time.Duration
+}
 
-// InvokableRun performs the request and returns status + header summary + capped
-// body as a tool result. Every failure mode (parse, validation, transport,
-// timeout) maps to a tool-result error STRING; it never returns a Go error and
-// never leaks the path/query/headers/body into an error.
-func (f *Fetch) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+// PrepareCall decodes, validates, and normalizes one Fetch call — method,
+// scheme, host, and port are normalized ONCE here — and emits the ONE shared
+// `network` capability requirement for the target. The grant pair is EMPTY:
+// Fetch is a direct tool and enforces the approved target itself, including
+// refusing any redirect off it at run time. Durable v1 network rules are
+// host/port-scoped (network.target.v1); HTTP method/path precision needs the
+// Fetch-specific enforcement class the spec defers, so no narrower claim is
+// encoded here.
+func (f *Fetch) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
 	a, method, parsedURL, err := parseFetchArgs(argsJSON)
 	if err != nil {
-		return tool.TextResult("error: " + err.Error()), nil
+		return tool.Request{}, nil, err
+	}
+	scheme, host, port, err := normalizeURLTarget(parsedURL)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	normalized := *parsedURL
+	normalized.Scheme = scheme
+	normalized.Host = canonicalHostPort(scheme, host, port)
+
+	match := permission.NetworkTargetMatch("tcp", host, port)
+	description := method + " " + host + ":" + strconv.Itoa(port)
+	request := tool.Request{
+		ToolName:    fetchToolName,
+		ExecutionID: executionID.String(),
+		Requirements: []tool.Requirement{{
+			Kind:        permission.CapabilityNetwork,
+			Match:       match,
+			Description: description,
+			Candidates: []tool.RuleCandidate{{
+				Kind:        permission.CapabilityNetwork,
+				Match:       match,
+				Description: "network egress to " + host + ":" + strconv.Itoa(port),
+			}},
+		}},
+	}
+	artifact := &fetchArtifact{
+		method:  method,
+		url:     normalized.String(),
+		scheme:  scheme,
+		host:    host,
+		port:    port,
+		headers: a.Headers,
+		body:    a.Body,
+		timeout: clampFetchTimeout(a.Timeout),
+	}
+	return request, artifact, nil
+}
+
+// InvokableRun executes the PREPARED artifact bound to this call — the raw
+// argsJSON is never reparsed; without its artifact the tool fails closed. It
+// performs the normalized request and returns status + header summary + capped
+// body as a tool result. A redirect to any target not covered by the approved
+// requirement (same scheme, host, AND port) is refused, never silently
+// followed. Every failure maps to a tool-result error STRING; it never returns
+// a Go error and never leaks the path/query/headers/body into an error.
+func (f *Fetch) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	art, ok := prepared.FromContext[*fetchArtifact](ctx)
+	if !ok || art == nil {
+		return tool.TextResult("error: permission denied: Fetch requires its prepared call artifact"), nil
 	}
 
-	// Bound the request runtime: clamp the caller timeout into (0, 60s].
-	timeout := clampFetchTimeout(a.Timeout)
-	ctx2, cancel := context.WithTimeout(ctx, timeout)
+	// Bound the request runtime with the timeout validated at preparation.
+	ctx2, cancel := context.WithTimeout(ctx, art.timeout)
 	defer cancel()
 
 	var bodyReader io.Reader
-	if method == methodPOST && a.Body != "" {
-		bodyReader = strings.NewReader(a.Body)
+	if art.method == methodPOST && art.body != "" {
+		bodyReader = strings.NewReader(art.body)
 	}
 
-	req, err := http.NewRequestWithContext(ctx2, method, parsedURL.String(), bodyReader)
+	req, err := http.NewRequestWithContext(ctx2, art.method, art.url, bodyReader)
 	if err != nil {
 		// Do not echo the raw url (it may carry a query secret) — host only.
-		return tool.TextResult("error: could not build request for " + method + " " + parsedURL.Hostname()), nil
+		return tool.TextResult("error: could not build request for " + art.method + " " + art.host), nil
 	}
-	for k, v := range a.Headers {
+	for k, v := range art.headers {
 		req.Header.Set(k, v)
 	}
 
-	resp, err := f.client.Do(req)
+	resp, err := f.confinedClient(art).Do(req)
 	if err != nil {
+		var blocked *redirectBlockedError
+		if errors.As(err, &blocked) {
+			return tool.TextResult("error: redirect blocked: " + art.method + " " + art.host + " redirected to unapproved target " + blocked.host), nil
+		}
 		// Redact: report method + host only, never the full url or the transport
 		// error string (which can embed the full url with its query).
-		return tool.TextResult("error: request failed: " + method + " " + parsedURL.Hostname()), nil
+		return tool.TextResult("error: request failed: " + art.method + " " + art.host), nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -190,9 +261,89 @@ func (f *Fetch) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRe
 	return tool.TextResult(formatFetchResult(resp, body, truncated)), nil
 }
 
+// confinedClient shallow-copies the injected client (sharing its Transport,
+// TLS floor, and Timeout) and pins its redirect policy to the APPROVED target:
+// any redirect whose normalized (scheme, host, port) differs from the prepared
+// one fails closed.
+func (f *Fetch) confinedClient(art *fetchArtifact) *http.Client {
+	guarded := *f.client
+	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxFetchRedirects {
+			return &redirectBlockedError{host: "(too many redirects)"}
+		}
+		scheme, host, port, err := normalizeURLTarget(req.URL)
+		if err != nil || scheme != art.scheme || host != art.host || port != art.port {
+			return &redirectBlockedError{host: hostForDisplay(req.URL)}
+		}
+		return nil
+	}
+	return &guarded
+}
+
+// maxFetchRedirects bounds same-target redirect chains (mirrors net/http's own
+// default limit).
+const maxFetchRedirects = 10
+
+// redirectBlockedError marks a refused off-target redirect. It carries ONLY the
+// redirect host for display — never the path or query.
+type redirectBlockedError struct{ host string }
+
+func (e *redirectBlockedError) Error() string {
+	return "fetch: redirect to unapproved target " + e.host
+}
+
+// hostForDisplay renders a redirect destination host safely for an error string.
+func hostForDisplay(u *url.URL) string {
+	if u == nil || u.Hostname() == "" {
+		return "(no host)"
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+// normalizeURLTarget normalizes a parsed URL to its enforced network target:
+// lowercased scheme (http/https only), lowercased host with any trailing dot
+// stripped, and the explicit or scheme-default port.
+func normalizeURLTarget(u *url.URL) (scheme, host string, port int, err error) {
+	scheme = strings.ToLower(u.Scheme)
+	if scheme != schemeHTTP && scheme != schemeHTTPS {
+		return "", "", 0, &fetchError{reason: "url scheme must be http or https"}
+	}
+	host = strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" {
+		return "", "", 0, &fetchError{reason: "url must have a host"}
+	}
+	if strings.ContainsFunc(host, func(r rune) bool { return r < 0x20 || r == 0x7f || r == ' ' }) {
+		return "", "", 0, &fetchError{reason: "url host contains invalid bytes"}
+	}
+	switch portText := u.Port(); portText {
+	case "":
+		port = 80
+		if scheme == schemeHTTPS {
+			port = 443
+		}
+	default:
+		port, err = strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			return "", "", 0, &fetchError{reason: "url port must be in 1..65535"}
+		}
+	}
+	return scheme, host, port, nil
+}
+
+// canonicalHostPort rebuilds the URL host component from the normalized host
+// and port, omitting a scheme-default port.
+func canonicalHostPort(scheme, host string, port int) string {
+	if (scheme == schemeHTTP && port == 80) || (scheme == schemeHTTPS && port == 443) {
+		if strings.Contains(host, ":") {
+			return "[" + host + "]" // IPv6 literal
+		}
+		return host
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 // parseFetchArgs decodes + validates the args into (args, normalized method,
-// parsed URL). It is shared by BuildRequest, InvokableRun, and (indirectly) the
-// audit summary so validation is identical everywhere. Returns a typed
+// parsed URL). It is the single decode step behind PrepareCall. Returns a typed
 // *fetchError on any failure; the error message carries the host only (never the
 // path/query) so it is safe to surface.
 func parseFetchArgs(argsJSON string) (fetchArgs, string, *url.URL, error) {
@@ -317,9 +468,8 @@ func headerSummary(h http.Header) string {
 
 // fetchError is the typed failure for Fetch arg parsing/validation. Its message
 // carries only a non-secret reason (and, where relevant, the HOST — never the
-// path, query, headers, or body). InvokableRun maps every failure to a
-// tool-result string; BuildRequest returns it so the runner treats the call as
-// invalid.
+// path, query, headers, or body). PrepareCall returns it so the runner treats
+// the call as invalid; it never reaches the gate.
 type fetchError struct {
 	reason string
 	cause  error
@@ -329,9 +479,11 @@ func (e *fetchError) Error() string { return e.reason }
 
 func (e *fetchError) Unwrap() error { return e.cause }
 
-// compile-time assertions: Fetch is an InvokableTool and Auditable. It is NOT a
-// WriteTarget (it is a network tool, not a path-write tool).
+// compile-time assertions: Fetch is an InvokableTool, a CallPreparer, and
+// Auditable. It is NOT a WriteTarget (it is a network tool, not a path-write
+// tool).
 var (
 	_ tool.InvokableTool = (*Fetch)(nil)
+	_ tool.CallPreparer  = (*Fetch)(nil)
 	_ tool.Auditable     = (*Fetch)(nil)
 )

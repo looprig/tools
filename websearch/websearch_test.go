@@ -5,18 +5,26 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // fakeSearchProvider is a canned SearchProvider for unit-testing the WebSearch
-// tool in isolation (no network). It records the max it was called with and
-// returns either preset results (capped to max) or a preset error.
+// tool in isolation (no network). It records the query/max it was called with
+// and returns either preset results (capped to max) or a preset error.
 type fakeSearchProvider struct {
-	results []SearchResult
-	err     error
-	gotMax  int
+	results   []SearchResult
+	err       error
+	endpoints []Endpoint
+	gotQuery  string
+	gotMax    int
+	calls     int
 }
 
-func (f *fakeSearchProvider) Search(_ context.Context, _ string, max int) ([]SearchResult, error) {
+func (f *fakeSearchProvider) Search(_ context.Context, query string, max int) ([]SearchResult, error) {
+	f.calls++
+	f.gotQuery = query
 	f.gotMax = max
 	if f.err != nil {
 		return nil, f.err
@@ -25,6 +33,32 @@ func (f *fakeSearchProvider) Search(_ context.Context, _ string, max int) ([]Sea
 		return f.results[:max], nil
 	}
 	return f.results, nil
+}
+
+// Endpoints returns the fake's declared endpoints, defaulting to one valid
+// test endpoint so happy-path tests prepare cleanly.
+func (f *fakeSearchProvider) Endpoints() []Endpoint {
+	if f.endpoints == nil {
+		return []Endpoint{{Host: "search.example.test", Port: 443}}
+	}
+	return f.endpoints
+}
+
+// runWebSearch drives the full prepared flow; a preparation failure is
+// returned as an "error: ..." string so rejection rows share the helper.
+func runWebSearch(t *testing.T, ws *WebSearch, argsJSON string) string {
+	t.Helper()
+	id := mustUUID(t)
+	req, art, err := ws.PrepareCall(context.Background(), id, argsJSON)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+	res, err := ws.InvokableRun(ctx, argsJSON)
+	if err != nil {
+		t.Fatalf("InvokableRun() unexpected Go error = %v", err)
+	}
+	return textOf(t, res)
 }
 
 func TestWebSearchInfo(t *testing.T) {
@@ -93,11 +127,7 @@ func TestWebSearchInvokableRun(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			ws := NewWebSearch(tt.provider)
-			res, err := ws.InvokableRun(context.Background(), tt.argsJSON)
-			if err != nil {
-				t.Fatalf("InvokableRun() unexpected Go error = %v", err)
-			}
-			got := textOf(t, res)
+			got := runWebSearch(t, ws, tt.argsJSON)
 			for _, want := range tt.wantContain {
 				if !strings.Contains(got, want) {
 					t.Errorf("result %q does not contain %q", got, want)
@@ -132,9 +162,7 @@ func TestWebSearchResultsCap(t *testing.T) {
 			t.Parallel()
 			fp := &fakeSearchProvider{}
 			ws := NewWebSearch(fp)
-			if _, err := ws.InvokableRun(context.Background(), tt.argsJSON); err != nil {
-				t.Fatalf("InvokableRun() unexpected Go error = %v", err)
-			}
+			runWebSearch(t, ws, tt.argsJSON)
 			if fp.gotMax != tt.wantMax {
 				t.Errorf("provider called with max = %d, want %d", fp.gotMax, tt.wantMax)
 			}

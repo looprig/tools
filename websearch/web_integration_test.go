@@ -11,8 +11,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/fetch"
 )
+
+// runIntegrationFetch drives the prepared Fetch flow (prepare → bind → run); a
+// preparation failure is returned as an "error: ..." string.
+func runIntegrationFetch(t *testing.T, f *fetch.Fetch, argsJSON string) string {
+	t.Helper()
+	id := mustUUID(t)
+	req, art, err := f.PrepareCall(context.Background(), id, argsJSON)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+	res, err := f.InvokableRun(ctx, argsJSON)
+	if err != nil {
+		t.Fatalf("InvokableRun() unexpected Go error = %v", err)
+	}
+	return textOf(t, res)
+}
 
 // web_integration_test.go exercises the two WEB tools against REAL endpoints and
 // proves the CLIENT-side TLS 1.2 floor (which the manifest wires and the tools
@@ -60,11 +79,7 @@ func TestFetchTLS12FloorRejectsTLS11(t *testing.T) {
 	tr.TLSClientConfig.RootCAs = pool
 
 	f := fetch.NewFetch(client)
-	res, err := f.InvokableRun(context.Background(), `{"url":"`+srv.URL+`","method":"GET"}`)
-	if err != nil {
-		t.Fatalf("InvokableRun() unexpected Go error = %v", err)
-	}
-	got := textOf(t, res)
+	got := runIntegrationFetch(t, f, `{"url":"`+srv.URL+`","method":"GET"}`)
 	if !strings.Contains(got, "error") {
 		t.Errorf("expected a TLS handshake error result, got %q", got)
 	}
@@ -87,11 +102,7 @@ func TestFetchTLS12FloorAcceptsTLS12(t *testing.T) {
 	tr.TLSClientConfig.RootCAs = srv.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
 
 	f := fetch.NewFetch(client)
-	res, err := f.InvokableRun(context.Background(), `{"url":"`+srv.URL+`","method":"GET"}`)
-	if err != nil {
-		t.Fatalf("InvokableRun() unexpected Go error = %v", err)
-	}
-	got := textOf(t, res)
+	got := runIntegrationFetch(t, f, `{"url":"`+srv.URL+`","method":"GET"}`)
 	if !strings.Contains(got, "200") {
 		t.Errorf("expected a 200 over TLS 1.2, got %q", got)
 	}
@@ -131,11 +142,10 @@ func TestDuckDuckGoProviderLiveScrape(t *testing.T) {
 func TestWebSearchLiveEndToEnd(t *testing.T) {
 	ws := NewWebSearch(NewDuckDuckGoProvider(tls12Client()))
 
-	res, err := ws.InvokableRun(context.Background(), `{"query":"golang","results":3}`)
-	if err != nil {
-		t.Fatalf("InvokableRun() unexpected Go error = %v", err)
+	got := runWebSearch(t, ws, `{"query":"golang","results":3}`)
+	if strings.HasPrefix(got, "error:") && !strings.Contains(got, "web search failed") {
+		t.Fatalf("unexpected preparation/run error: %q", got)
 	}
-	got := textOf(t, res)
 	if strings.Contains(got, "error: web search failed") {
 		t.Skipf("live web search unavailable: %q", got)
 	}

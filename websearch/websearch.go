@@ -6,7 +6,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/prepared"
+	"github.com/looprig/tools/permission"
 )
 
 // websearch.go implements the WebSearch tool and its provider seam: the
@@ -61,14 +64,29 @@ type SearchResult struct {
 	Snippet string
 }
 
+// Endpoint is one HTTPS network endpoint a SearchProvider talks to: the
+// normalized hostname (lowercase, no trailing dot) and TCP port. Preparation
+// turns every declared endpoint into a shared `network` capability
+// requirement; at run time the provider must fail closed on any secondary
+// target (a redirect or auxiliary service) outside this declaration.
+type Endpoint struct {
+	Host string
+	Port int
+}
+
 // SearchProvider is the seam between the WebSearch tool and a concrete search
 // backend (DuckDuckGo today; pluggable tomorrow). Search runs under ctx (the
 // implementation MUST honor its deadline/cancellation), takes the query and a
 // caller-validated max (already clamped to (0, maxWebSearchResults]), and returns
 // up to max results or a typed error. An implementation must never panic on a
 // malformed upstream response — it returns what it could parse.
+//
+// Endpoints declares every network endpoint Search may contact. It must be
+// stable and non-empty; a provider that cannot honestly enumerate its
+// endpoints cannot be prepared and fails closed.
 type SearchProvider interface {
 	Search(ctx context.Context, query string, max int) ([]SearchResult, error)
+	Endpoints() []Endpoint
 }
 
 // webSearchArgs is the typed decode of WebSearch's untrusted argsJSON.
@@ -108,23 +126,89 @@ func (w *WebSearch) AuditSummary(argsJSON string) string {
 	return "WebSearch: " + a.Query
 }
 
-// Interim (replaced in Task 3.4): the legacy BuildRequest/PermissionPrompter
-// prompt seam was removed with the old harness gate. Until Task 3.4 adds
-// PrepareCall emitting each provider's endpoint network requirements,
-// WebSearch is an unprepared effectful tool and the harness runner fails
-// closed: the call is never evaluated or executed.
+// webSearchArtifact binds the validated query and clamped result count to one
+// call. Execution consumes it verbatim — the raw args are never reparsed.
+type webSearchArtifact struct {
+	tool.TokenArtifact
+	query string
+	max   int
+}
 
-// InvokableRun validates the args, clamps the result count, calls the provider
-// under ctx, and formats the results. A parse error, empty query, or provider
-// error is a tool-result error STRING; it never returns a Go error.
-func (w *WebSearch) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+// PrepareCall decodes and validates one WebSearch call and emits the shared
+// `network` capability requirement for EVERY endpoint the bound provider
+// declares. The grant pair is empty: WebSearch is a direct tool and its
+// provider confines its own requests to the declared endpoints (secondary
+// targets fail closed at run time).
+func (w *WebSearch) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
 	a, err := parseWebSearchArgs(argsJSON)
 	if err != nil {
-		return tool.TextResult("error: " + err.Error()), nil
+		return tool.Request{}, nil, err
 	}
-	max := clampWebSearchResults(a.Results)
+	endpoints, err := normalizedEndpoints(w.provider.Endpoints())
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	requirements := make([]tool.Requirement, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		match := permission.NetworkTargetMatch("tcp", endpoint.Host, endpoint.Port)
+		description := "network egress to " + endpoint.Host + ":" + strconv.Itoa(endpoint.Port)
+		requirements = append(requirements, tool.Requirement{
+			Kind:        permission.CapabilityNetwork,
+			Match:       match,
+			Description: description,
+			Candidates: []tool.RuleCandidate{{
+				Kind:        permission.CapabilityNetwork,
+				Match:       match,
+				Description: description,
+			}},
+		})
+	}
+	request := tool.Request{
+		ToolName:     webSearchToolName,
+		ExecutionID:  executionID.String(),
+		Requirements: requirements,
+	}
+	return request, &webSearchArtifact{query: a.Query, max: clampWebSearchResults(a.Results)}, nil
+}
 
-	results, err := w.provider.Search(ctx, a.Query, max)
+// normalizedEndpoints validates and normalizes a provider's declared endpoints,
+// deduplicating exact repeats. Zero declared or any invalid endpoint fails the
+// preparation — a network tool without an honest declaration cannot run.
+func normalizedEndpoints(declared []Endpoint) ([]Endpoint, error) {
+	if len(declared) == 0 {
+		return nil, &webSearchError{reason: "search provider declares no network endpoints"}
+	}
+	seen := make(map[Endpoint]struct{}, len(declared))
+	out := make([]Endpoint, 0, len(declared))
+	for _, endpoint := range declared {
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(endpoint.Host), "."))
+		if host == "" || strings.ContainsFunc(host, func(r rune) bool { return r <= 0x20 || r == 0x7f }) {
+			return nil, &webSearchError{reason: "search provider declared an invalid endpoint host"}
+		}
+		if endpoint.Port < 1 || endpoint.Port > 65535 {
+			return nil, &webSearchError{reason: "search provider declared an invalid endpoint port"}
+		}
+		normalized := Endpoint{Host: host, Port: endpoint.Port}
+		if _, dup := seen[normalized]; dup {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out, nil
+}
+
+// InvokableRun executes the PREPARED artifact bound to this call — the raw
+// argsJSON is never reparsed; without its artifact the tool fails closed. It
+// calls the provider under ctx and formats the results. A provider error is a
+// tool-result error STRING; it never returns a Go error.
+func (w *WebSearch) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	art, ok := prepared.FromContext[*webSearchArtifact](ctx)
+	if !ok || art == nil {
+		return tool.TextResult("error: permission denied: WebSearch requires its prepared call artifact"), nil
+	}
+
+	results, err := w.provider.Search(ctx, art.query, art.max)
 	if err != nil {
 		// Surface a generic provider failure — never echo upstream internals that
 		// might embed request details.
@@ -183,8 +267,8 @@ func formatSearchResults(results []SearchResult) string {
 }
 
 // webSearchError is the typed failure for WebSearch arg parsing/validation. It
-// carries a non-secret reason; InvokableRun maps every failure to a tool-result
-// string, BuildRequest returns it so the runner treats the call as invalid.
+// carries a non-secret reason; PrepareCall returns it so the runner treats the
+// call as invalid, and InvokableRun maps run failures to tool-result strings.
 type webSearchError struct {
 	reason string
 	cause  error
@@ -194,9 +278,10 @@ func (e *webSearchError) Error() string { return e.reason }
 
 func (e *webSearchError) Unwrap() error { return e.cause }
 
-// compile-time assertions: WebSearch is an InvokableTool and Auditable. It is
-// NOT a WriteTarget.
+// compile-time assertions: WebSearch is an InvokableTool, a CallPreparer, and
+// Auditable. It is NOT a WriteTarget.
 var (
 	_ tool.InvokableTool = (*WebSearch)(nil)
+	_ tool.CallPreparer  = (*WebSearch)(nil)
 	_ tool.Auditable     = (*WebSearch)(nil)
 )

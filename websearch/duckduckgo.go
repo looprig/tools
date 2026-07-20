@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -54,6 +55,47 @@ func NewDuckDuckGoProvider(client *http.Client) *DuckDuckGoProvider {
 	return &DuckDuckGoProvider{client: client}
 }
 
+// Endpoints declares the ONLY network endpoint this provider contacts:
+// https://html.duckduckgo.com:443 (the scrape target ddgHTMLEndpoint). The
+// WebSearch tool turns it into the prepared network requirement; Search
+// confines its client to it so a redirect to any secondary target fails
+// closed.
+func (p *DuckDuckGoProvider) Endpoints() []Endpoint {
+	return []Endpoint{{Host: "html.duckduckgo.com", Port: 443}}
+}
+
+// confinedClient shallow-copies base (sharing its Transport, TLS floor, and
+// Timeout) and pins its redirect policy to the declared endpoints: a redirect
+// to any (host, port) outside allowed fails closed. Default HTTP(S) ports are
+// applied when the redirect URL carries none.
+func confinedClient(base *http.Client, allowed []Endpoint) *http.Client {
+	guarded := *base
+	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return &searchProviderError{reason: "search redirect chain too long"}
+		}
+		host := strings.ToLower(strings.TrimSuffix(req.URL.Hostname(), "."))
+		port := 80
+		if strings.ToLower(req.URL.Scheme) == "https" {
+			port = 443
+		}
+		if text := req.URL.Port(); text != "" {
+			parsed, err := strconv.Atoi(text)
+			if err != nil {
+				return &searchProviderError{reason: "search redirected to an invalid target"}
+			}
+			port = parsed
+		}
+		for _, endpoint := range allowed {
+			if host == endpoint.Host && port == endpoint.Port {
+				return nil
+			}
+		}
+		return &searchProviderError{reason: "search redirected to an undeclared target"}
+	}
+	return &guarded
+}
+
 // Search GETs the DuckDuckGo HTML results page for query under ctx and parses up
 // to max results. A request-build, transport, or non-2xx-status failure is a
 // typed *searchProviderError; a successful response is parsed defensively (a
@@ -68,7 +110,7 @@ func (p *DuckDuckGoProvider) Search(ctx context.Context, query string, max int) 
 	// User-Agent. Set a simple, non-deceptive one (no secrets).
 	req.Header.Set("User-Agent", "looprig-websearch/1.0")
 
-	resp, err := p.client.Do(req)
+	resp, err := confinedClient(p.client, p.Endpoints()).Do(req)
 	if err != nil {
 		return nil, &searchProviderError{reason: "search request failed", cause: err}
 	}

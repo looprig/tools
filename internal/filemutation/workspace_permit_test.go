@@ -246,7 +246,7 @@ func TestBashWholePermitAndInvalidation(t *testing.T) {
 			}
 			coord := &recordingCoordinator{}
 			b := bash.NewBash(root, bash.WithWorkspaceCoordinator(coord), bash.WithObservations(obs))
-			if _, err := b.InvokableRun(context.Background(), mustJSON(t, map[string]string{"command": tt.command})); err != nil {
+			if _, err := invokePrepared(context.Background(), t, b, mustJSON(t, map[string]string{"command": tt.command})); err != nil {
 				t.Fatalf("InvokableRun() error = %v", err)
 			}
 			if observed(obs, key) {
@@ -273,7 +273,7 @@ func TestBashCanceledCtxDoesNotRunOrInvalidate(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	res, err := b.InvokableRun(ctx, mustJSON(t, map[string]string{"command": "true"}))
+	res, err := invokePrepared(ctx, t, b, mustJSON(t, map[string]string{"command": "true"}))
 	if err != nil {
 		t.Fatalf("InvokableRun() error = %v", err)
 	}
@@ -310,7 +310,7 @@ func TestFileToolsAndBashShareObservations(t *testing.T) {
 		t.Fatalf("ReadFile error = %v", err)
 	}
 	// Bash runs and (sharing the same observation set) invalidates that observation.
-	if _, err := bashTool.InvokableRun(context.Background(), mustJSON(t, map[string]string{"command": "true"})); err != nil {
+	if _, err := invokePrepared(context.Background(), t, bashTool, mustJSON(t, map[string]string{"command": "true"})); err != nil {
 		t.Fatalf("Bash error = %v", err)
 	}
 	// The overwrite is now refused as stale (the shared observation was cleared by Bash).
