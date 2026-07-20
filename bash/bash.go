@@ -1,3 +1,10 @@
+// Package bash implements the Bash tool: single-command shell execution inside
+// a workspace-contained working directory, with a bounded timeout and a capped
+// combined-output capture. Preparation (prepare.go) owns the whole argument
+// boundary and emits one typed, command-backed access request — the exact
+// normalized command plus one requirement per explicitly declared
+// filesystem/network delta (a request for authority, never a grant). Execution
+// runs directly via `sh -c` or through an optional injected confined runner.
 package bash
 
 import (
@@ -36,8 +43,8 @@ import (
 // timed out". Only a structural surprise (impossible to start sh) is reported as a
 // tool-result error; the tool never returns a Go error.
 
-// bashToolName is the EXACT tool name classifyTool keys on for the bash class —
-// it MUST equal "Bash" (check.go's toolBash).
+// bashToolName is the EXACT tool name carried by every prepared request
+// (tool.Request.ToolName) and shown at the gate — it MUST stay "Bash".
 const bashToolName = "Bash"
 
 // maxBashTimeout is the hard ceiling on a Bash command's wall-clock runtime. A
@@ -62,8 +69,8 @@ const (
 )
 
 // bashSchema is the JSON Schema for Bash's argument object. The field names
-// (command/workdir/timeout) are the boundary-extraction contract shared with
-// check.go (which parses "command" and "workdir").
+// (command/workdir/timeout/access) are the model-facing contract PrepareCall
+// decodes; nothing else ever parses these arguments.
 const bashSchema = `{
   "type": "object",
   "properties": {
@@ -97,7 +104,8 @@ type bashArgs struct {
 
 // BashTool runs a single shell command in a workspace-contained directory. It
 // depends on the workspace root and an optional confined-execution runner;
-// advisory command policy remains the PermissionChecker's concern. A nil runner
+// command policy is decided by the harness gate over the prepared request,
+// against rules stored in the permission package's workspace store. A nil runner
 // means direct `sh -c` execution (the bare-harness default), while an invalid
 // option or typed-nil runner fails closed through a model-safe error.
 type BashTool struct {

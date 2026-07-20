@@ -82,7 +82,8 @@ type writeFileArgs struct {
 
 // WriteFile writes a workspace-contained file atomically under the loop's
 // optimistic-concurrency policy. It depends only on the workspace root (least
-// privilege — the hard-deny gate is the runner's concern), the loop's shared
+// privilege — deny rules are evaluated by the gate over the prepared
+// filesystem.write requirement), the loop's shared
 // observation map, and an OPTIONAL session workspace coordinator: overwriting an
 // EXISTING file requires a complete prior read of this path whose hash still equals
 // the file's current on-disk hash; a genuinely ABSENT path may be created without any

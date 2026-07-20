@@ -89,6 +89,7 @@ func TestDefinitionDependencyValidation(t *testing.T) {
 	t.Parallel()
 	var typedNilGuard *fakeReadGuard
 	var typedNilRunner *definitionRunner
+	var typedNilProvider *definitionProvider
 	tests := []struct {
 		name       string
 		definition tool.Definition
@@ -98,6 +99,8 @@ func TestDefinitionDependencyValidation(t *testing.T) {
 		{name: "typed nil read guard", definition: ReadFileDefinition(typedNilGuard), dependency: "read_guard"},
 		{name: "nil bash option", definition: Bash(nil), dependency: "option"},
 		{name: "typed nil runner", definition: Bash(bash.WithRunner(typedNilRunner)), dependency: "runner"},
+		{name: "nil search provider", definition: WebSearchDefinition(nil), dependency: "provider"},
+		{name: "typed nil search provider", definition: WebSearchDefinition(typedNilProvider), dependency: "provider"},
 	}
 	for _, test := range tests {
 		test := test

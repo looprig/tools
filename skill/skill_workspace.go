@@ -20,7 +20,7 @@ const maxSkillNameLen = 64
 // workspaceSkillsDir is the fixed subdirectory under the workspace root that holds
 // untrusted, project-local skills as <dir>/<name>/SKILL.md (design §7a). The
 // leading dot keeps it distinct from the trusted compiled-in "skills/" embed and
-// matches a product policy's `.skills/**` hard-deny for generic file tools.
+// matches a product policy's `.skills/**` deny rule for generic file tools.
 const workspaceSkillsDir = ".skills"
 
 // skillFileName is the fixed document name within a skill directory.

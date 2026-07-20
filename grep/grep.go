@@ -1,3 +1,8 @@
+// Package grep implements the Grep tool: a workspace-contained content search
+// that prefers ripgrep and falls back to a stdlib scan, with two-layer
+// denied-path enforcement. Preparation emits one direct filesystem.read
+// requirement for the canonical walked root using the tree match encoding, so
+// a durable tree rule covers it.
 package grep
 
 import (
@@ -360,7 +365,7 @@ func buildRgArgs(pattern, path string, opts grepOptions, denyGlobs []string) []s
 // loop.ReadGuard exposes only DeniedRead/MaxReadBytes (no glob list), so the
 // authoritative DeniedRead filter (applied to every emitted path) is the real
 // boundary; this list is a perf optimization. When the guard also implements the
-// optional deniedGlobLister seam (the concrete PermissionChecker may), its globs
+// optional deniedGlobLister seam (a consumer's richer guard may), its globs
 // are added so rg never even opens them.
 func (g *Grep) rgDenyGlobs() []string {
 	globs := make([]string, 0, len(grepNoiseDirs))

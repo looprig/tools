@@ -1,3 +1,8 @@
+// Package filemutation implements the shared mechanics of the two direct
+// mutation tools, WriteFile and EditFile: single-step preparation and
+// canonicalization, workspace containment, atomic publication, optimistic
+// file-freshness concurrency, and permit-scoped cross-loop serialization. The
+// public writefile and editfile packages are thin facades over this package.
 package filemutation
 
 // prepare.go holds the preparation seam shared by WriteFile and EditFile (the

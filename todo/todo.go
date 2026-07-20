@@ -251,8 +251,9 @@ func (td *Todo) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, t
 	return tool.Request{ToolName: todoToolName}, nil, nil
 }
 
-// compile-time assertions: Todo is an InvokableTool and Auditable. It is
-// deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
+// compile-time assertions: Todo is an InvokableTool, a CallPreparer (its
+// prepared request is deliberately EMPTY, so the gate never prompts), and
+// Auditable. It is deliberately NOT a WriteTarget.
 var (
 	_ tool.InvokableTool = (*Todo)(nil)
 	_ tool.CallPreparer  = (*Todo)(nil)

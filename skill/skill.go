@@ -1,3 +1,8 @@
+// Package skill implements the Skill tool: an on-demand reader of curated
+// embedded (and optionally untrusted workspace) SKILL.md bodies, scoped to the
+// one agent the tool is bound to. Preparation validates the name once, takes a
+// TOCTOU-safe workspace snapshot when applicable, and emits a typed
+// context.load requirement scoped to the skill identity.
 package skill
 
 import (

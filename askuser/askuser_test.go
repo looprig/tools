@@ -64,10 +64,10 @@ func TestAskUserAuditSummary(t *testing.T) {
 	}
 }
 
-// TestAskUserNotPermissionPrompter asserts AskUser is AutoApprove: it must NOT
-// implement PermissionPrompter (a Prompter would route it through the Ask gate).
-// It MAY implement Auditable, which it does.
-func TestAskUserNotPermissionPrompter(t *testing.T) {
+// TestAskUserCapabilities asserts AskUser implements Auditable. Its prepared
+// request is empty (no requirements), so the gate allows it without a prompt —
+// asking the user is itself the interaction.
+func TestAskUserCapabilities(t *testing.T) {
 	t.Parallel()
 	var ti tool.InvokableTool = NewAskUser()
 	if _, ok := ti.(tool.Auditable); !ok {

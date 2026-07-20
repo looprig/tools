@@ -1,6 +1,6 @@
-// Package tools holds the agent's tool implementations and the shared,
-// security-sensitive path primitives they depend on (glob matching and
-// workspace containment).
+// Package workspace holds the shared, security-sensitive primitives the
+// standard tools depend on: `**`-aware glob matching, workspace path
+// containment, and typed-nil detection for injected dependencies.
 package workspace
 
 import (

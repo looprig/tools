@@ -1,3 +1,8 @@
+// Package fetch implements the Fetch tool: one bounded HTTP GET or POST via an
+// injected *http.Client, with no filesystem access. Preparation validates the
+// URL once and emits one shared `network` capability requirement for the
+// resolved endpoint — the same capability kind Bash network deltas and
+// WebSearch use, so one saved workspace rule covers all three.
 package fetch
 
 import (
@@ -27,8 +32,8 @@ import (
 // LEAST PRIVILEGE: Fetch takes only an *http.Client — NO filesystem access at
 // all. A web tool literally cannot reach the workspace root.
 //
-// The injected client is the manifest's responsibility and carries the security
-// posture mandated by CLAUDE.md: an explicit Timeout and a Transport whose
+// The injected client is the composition root's responsibility and carries the
+// configuration mandated by CLAUDE.md: an explicit Timeout and a Transport whose
 // TLSClientConfig.MinVersion is TLS 1.2 with InsecureSkipVerify never set. This
 // tool MUST NOT construct a client and MUST NOT set InsecureSkipVerify; it only
 // USES the client it is handed. Enforcement of the TLS floor is verified in the
@@ -48,8 +53,8 @@ import (
 // or a timeout is a tool-result error STRING — InvokableRun never returns a Go
 // error. A non-2xx HTTP status is a NORMAL result (the model reads the status).
 
-// fetchToolName is the EXACT tool name classifyTool keys on for the network
-// class — it MUST equal "Fetch" (check.go's toolFetch).
+// fetchToolName is the EXACT tool name carried by every prepared request
+// (tool.Request.ToolName) and shown at the gate — it MUST stay "Fetch".
 const fetchToolName = "Fetch"
 
 // maxFetchBodyBytes caps the response body read so a large or infinite response

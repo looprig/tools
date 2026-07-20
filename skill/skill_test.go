@@ -38,8 +38,8 @@ func skillToolAllow() map[identity.AgentName]map[string]struct{} {
 	}
 }
 
-// TestSkillInfo pins the tool name (it MUST be "Skill" — the name the wiring lists
-// in HardApprove so the tool auto-approves) and a non-empty description + schema.
+// TestSkillInfo pins the tool name (it MUST be "Skill" — the name carried by
+// every prepared request) and a non-empty description + schema.
 func TestSkillInfo(t *testing.T) {
 	t.Parallel()
 

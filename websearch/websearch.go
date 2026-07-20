@@ -1,3 +1,8 @@
+// Package websearch implements the WebSearch tool and its SearchProvider seam,
+// with no filesystem access. Preparation turns every HTTPS endpoint the bound
+// provider declares into one shared `network` capability requirement (the same
+// capability kind Bash network deltas and Fetch use); at run time the provider
+// must fail closed on any target outside its declaration.
 package websearch
 
 import (
@@ -32,8 +37,8 @@ import (
 // Failure model: a parse error, an empty query, or a provider error is a
 // tool-result error STRING — InvokableRun never returns a Go error.
 
-// webSearchToolName is the EXACT tool name classifyTool keys on for the network
-// class — it MUST equal "WebSearch" (check.go's toolWebSearch).
+// webSearchToolName is the EXACT tool name carried by every prepared request
+// (tool.Request.ToolName) and shown at the gate — it MUST stay "WebSearch".
 const webSearchToolName = "WebSearch"
 
 // defaultWebSearchResults is the result count used when the caller omits (or

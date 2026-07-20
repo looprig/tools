@@ -15,7 +15,7 @@ import (
 // fakeReadGuard is a configurable test double for loop.ReadGuard. denied holds
 // the set of ABSOLUTE paths DeniedRead reports true for; maxBytes is returned by
 // MaxReadBytes. It exercises the read tools' two checks (denied-path filtering
-// and the read cap) without depending on the concrete PermissionChecker.
+// and the read cap) without depending on any concrete guard implementation.
 type fakeReadGuard struct {
 	denied   map[string]bool
 	maxBytes int64

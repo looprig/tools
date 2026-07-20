@@ -1,3 +1,7 @@
+// Package glob implements the Glob tool: a workspace-contained,
+// denied-path-excluding filename search over WalkDir-discovered entries.
+// Preparation emits one direct filesystem.read requirement for the canonical
+// walked root using the tree match encoding, so a durable tree rule covers it.
 package glob
 
 import (

@@ -9,9 +9,9 @@
 //   - atomic, interprocess-safe persistence of the exact displayed allow
 //     candidates after "Approve always for this workspace".
 //
-// It does not parse tool arguments, decide Deny/Gated/Allow, discover HOME,
-// keep session rules, or apply postures. The harness gate evaluator consumes
-// the Store structurally as its RuleMatcher and RuleWriter.
+// It does not parse tool arguments, decide Deny/Gated/Allow, or discover
+// HOME. The harness gate evaluator consumes the Store structurally as its
+// RuleMatcher and RuleWriter.
 package permission
 
 import (

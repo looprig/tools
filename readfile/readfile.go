@@ -1,3 +1,8 @@
+// Package readfile implements the ReadFile tool: a workspace-contained,
+// denied-path-aware, symlink-rejecting file reader returning line-numbered
+// text capped by the injected ReadGuard. Preparation emits the direct
+// filesystem.read requirement for the canonical resolved path; the tool
+// enforces the approved resolved resource itself at run time.
 package readfile
 
 import (

@@ -227,8 +227,9 @@ func TestReadFileAuditSummary(t *testing.T) {
 	}
 }
 
-// compile-time: ReadFile must NOT implement PermissionPrompter (it is
-// AutoApprove). It MUST implement Auditable.
+// TestReadFileCapabilities asserts ReadFile implements Auditable. Its access
+// is decided from the prepared filesystem.read requirement, never a prompt of
+// its own.
 func TestReadFileCapabilities(t *testing.T) {
 	t.Parallel()
 	var it tool.InvokableTool = NewReadFile(t.TempDir(), newFakeReadGuard(1<<20), tool.NewWorkspaceObservations())

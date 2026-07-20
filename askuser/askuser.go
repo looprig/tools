@@ -20,9 +20,9 @@ import (
 // emit/ToolExecutionID/gateReg the runner injected into ctx (gate.go). The tool never
 // touches the gate plumbing directly.
 //
-// AUTO-APPROVE: AskUser is AutoApprove — it deliberately does NOT implement
-// tool.PermissionPrompter (asking the user is itself the interaction; gating it
-// behind a second approval prompt would be absurd). It DOES implement
+// AUTO-APPROVE: AskUser prepares an EMPTY request (no requirements), so the
+// gate allows it without a prompt (asking the user is itself the interaction;
+// gating it behind a second approval prompt would be absurd). It DOES implement
 // tool.Auditable: the question is shown to the user anyway, so it is not a secret
 // and is the right one-line summary.
 //
@@ -172,8 +172,9 @@ func (a *AskUser) PrepareCall(context.Context, uuid.UUID, string) (tool.Request,
 	return tool.Request{ToolName: askUserToolName}, nil, nil
 }
 
-// compile-time assertions: AskUser is an InvokableTool and Auditable. It is
-// deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
+// compile-time assertions: AskUser is an InvokableTool, a CallPreparer (its
+// prepared request is deliberately EMPTY, so the gate never prompts), and
+// Auditable. It is deliberately NOT a WriteTarget.
 var (
 	_ tool.InvokableTool = (*AskUser)(nil)
 	_ tool.CallPreparer  = (*AskUser)(nil)

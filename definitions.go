@@ -57,6 +57,9 @@ func AskUserDefinition() tool.Definition {
 
 func WebSearchDefinition(provider websearch.SearchProvider) tool.Definition {
 	return tool.NewDefinition("WebSearch", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		if workspace.IsNil(provider) {
+			return nil, &DefinitionBuildError{Definition: "WebSearch", Dependency: "provider"}
+		}
 		return []tool.InvokableTool{websearch.NewWebSearch(provider)}, nil
 	})
 }

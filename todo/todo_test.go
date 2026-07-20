@@ -59,9 +59,9 @@ func TestTodoAuditSummary(t *testing.T) {
 	}
 }
 
-// TestTodoNotPermissionPrompter asserts Todo is AutoApprove: it must NOT
-// implement PermissionPrompter. It MAY (and does) implement Auditable.
-func TestTodoNotPermissionPrompter(t *testing.T) {
+// TestTodoCapabilities asserts Todo implements Auditable. Its prepared request
+// is empty (no requirements), so the gate allows it without a prompt.
+func TestTodoCapabilities(t *testing.T) {
 	t.Parallel()
 	var ti tool.InvokableTool = NewTodo()
 	if _, ok := ti.(tool.Auditable); !ok {

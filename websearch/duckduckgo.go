@@ -17,7 +17,7 @@ import (
 // APPROVED golang.org/x/net/html tokenizer (stdlib has no HTML parser).
 //
 // LEAST PRIVILEGE: the provider takes only an *http.Client (the same TLS-1.2+,
-// timeout-bearing client posture as Fetch) — NO filesystem access.
+// timeout-bearing client configuration as Fetch) — NO filesystem access.
 //
 // DEFENSIVE PARSING: DuckDuckGo's HTML is an untrusted, scraped structure that
 // can change or be malformed. parseDuckDuckGoHTML walks the token stream with a
