@@ -533,11 +533,18 @@ func commandCandidateRule(index int, rule Rule, candidate tool.RuleCandidate) (R
 	if collidesWithBashRuleSyntax(candidate.GrantTarget) {
 		return Rule{}, &RuleError{Index: index, Reason: "command collides with the Bash(...) rule syntax and has no reusable candidate"}
 	}
+	// The predicate IS the discriminator: its complement is the exact-command
+	// arm, so display syntax is only ever parsed inside the guarded branches
+	// and a new namespace must extend collidesWithBashRuleSyntax before any
+	// parser arm can read it — an unguarded prefix cannot be laundered
+	// through an exact candidate.
 	switch {
-	case match == "Bash(*)":
+	case !collidesWithBashRuleSyntax(match):
+		rule.Class, rule.Command = ClassCommandInvoke, match
+	case match == bashRuleSyntaxPrefix+"*)":
 		return Rule{}, &RuleError{Index: index, Reason: "bare wildcard Bash(*) is never a displayed candidate; author a structured wildcard record instead"}
-	case strings.HasPrefix(match, "Bash(") && strings.HasSuffix(match, ":*)"):
-		body := strings.TrimSuffix(strings.TrimPrefix(match, "Bash("), ":*)")
+	case strings.HasSuffix(match, ":*)"):
+		body := strings.TrimSuffix(strings.TrimPrefix(match, bashRuleSyntaxPrefix), ":*)")
 		tokens, err := parseFamilyCandidateTokens(body)
 		if err != nil {
 			var ruleErr *RuleError
@@ -547,10 +554,8 @@ func commandCandidateRule(index int, rule Rule, candidate tool.RuleCandidate) (R
 			return Rule{}, err
 		}
 		rule.Class, rule.Tokens, rule.TrailingArguments = ClassCommandInvokeFamily, tokens, true
-	case strings.HasPrefix(match, "Bash("):
-		return Rule{}, &RuleError{Index: index, Reason: "unsupported Bash(...) candidate syntax"}
 	default:
-		rule.Class, rule.Command = ClassCommandInvoke, match
+		return Rule{}, &RuleError{Index: index, Reason: "unsupported Bash(...) candidate syntax"}
 	}
 	if err := rule.validate(index); err != nil {
 		return Rule{}, err

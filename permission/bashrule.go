@@ -404,14 +404,23 @@ func commandRules(rules []Rule, effect Effect) []Rule {
 	return applicable
 }
 
+// bashRuleSyntaxPrefix is the single source of truth for the Bash(...)
+// display-rule namespace. Every parser arm that interprets display syntax
+// (commandCandidateRule) and every guard that refuses commands colliding
+// with it (collidesWithBashRuleSyntax) MUST derive from this constant. A
+// new display syntax must extend the predicate before any parser learns to
+// read it; commandCandidateRule treats the predicate's complement as the
+// exact-command arm by construction, so an unguarded new namespace cannot
+// be laundered through an exact candidate.
+const bashRuleSyntaxPrefix = "Bash("
+
 // collidesWithBashRuleSyntax reports whether a literal command string lives
-// in the Bash(...) display-rule namespace that commandCandidateRule parses.
-// The predicate is the exact namespace the store interprets — the two must
-// stay in lockstep. Such a command must never be offered or accepted as a
-// reusable exact candidate: the store would re-read it as a wildcard or
-// family rule (or reject the batch), never as the exact command it is.
+// in the display-rule namespace that commandCandidateRule parses. Such a
+// command must never be offered or accepted as a reusable exact candidate:
+// the store would re-read it as a wildcard or family rule (or reject the
+// batch), never as the exact command it is.
 func collidesWithBashRuleSyntax(command string) bool {
-	return strings.HasPrefix(command, "Bash(")
+	return strings.HasPrefix(command, bashRuleSyntaxPrefix)
 }
 
 // ProposeCommandCandidate returns the reusable command-candidate match
