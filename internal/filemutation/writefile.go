@@ -126,17 +126,11 @@ func (w *WriteFile) AuditSummary(argsJSON string) string {
 	return "WriteFile " + a.Path + " (" + strconv.Itoa(len(a.Content)) + " bytes)"
 }
 
-// BuildRequest derives the approval prompt from the (untrusted) args. The prompt
-// carries only the resolved write path (never the content). An unparseable args
-// document or a path that escapes the workspace is a typed error so the runner
-// treats the call as invalid (and never prompts for an out-of-bounds write).
-func (w *WriteFile) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
-	abs, err := w.resolveWritePath(argsJSON)
-	if err != nil {
-		return nil, err
-	}
-	return tool.FileWriteRequest{Path: abs}, nil
-}
+// Interim (replaced in Task 3.3): the legacy BuildRequest/PermissionPrompter
+// prompt seam was removed with the old harness gate. Until Task 3.3 adds
+// PrepareCall emitting the filesystem.write requirement for the resolved
+// canonical path, WriteFile is an unprepared effectful tool and the harness
+// runner fails closed: the call is never evaluated or executed.
 
 // WriteTarget returns the resolved write path as the serialization key so the
 // runner groups concurrent writes to the same on-disk file. ok is true for every
@@ -442,11 +436,10 @@ func (e *writeFileError) Error() string { return e.reason }
 
 func (e *writeFileError) Unwrap() error { return e.cause }
 
-// compile-time assertions: WriteFile is an InvokableTool, a PermissionPrompter
-// (Ask), Auditable, and a WriteTarget.
+// compile-time assertions: WriteFile is an InvokableTool, Auditable, and a
+// WriteTarget.
 var (
-	_ tool.InvokableTool      = (*WriteFile)(nil)
-	_ tool.PermissionPrompter = (*WriteFile)(nil)
-	_ tool.Auditable          = (*WriteFile)(nil)
-	_ tool.WriteTarget        = (*WriteFile)(nil)
+	_ tool.InvokableTool = (*WriteFile)(nil)
+	_ tool.Auditable     = (*WriteFile)(nil)
+	_ tool.WriteTarget   = (*WriteFile)(nil)
 )

@@ -208,86 +208,12 @@ func (b *BashTool) AuditSummary(argsJSON string) string {
 	return "Bash: " + a.Command
 }
 
-// BuildRequest derives the approval prompt: the command string (which doubles as
-// the persisted exact-command Match) plus any MAC-verified escalation grants the
-// call would apply (SPEC §9.3). An unparseable args document or an empty command is
-// a typed error so the runner treats the call as invalid; a planned grant token that
-// fails MAC verification also fails the build so it never reaches a prompt.
-//
-// Two distinct notions of "grants" meet here and MUST NOT be conflated: the display
-// grants attached below come from planGrants (executor-AUTHORIZED tokens the operator
-// approves) — NOT from a.Grants, which are the model's OPAQUE retry tokens carried
-// verbatim and consumed separately at InvokableRun. BuildRequest never puts a.Grants
-// on the prompt (a model-supplied token is not executor-verified, so it must not be
-// shown as an authorized grant).
-func (b *BashTool) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
-	if b.initErr != nil {
-		return nil, &bashError{reason: "Bash is unavailable", cause: b.initErr}
-	}
-	var a bashArgs
-	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return nil, &bashError{reason: "invalid arguments: not a JSON object", cause: err}
-	}
-	if a.Command == "" {
-		return nil, &bashError{reason: "a non-empty 'command' is required"}
-	}
-	grants, err := b.planGrants(a.Workdir, a.Command)
-	if err != nil {
-		return nil, err
-	}
-	return tool.BashRequest{Command: a.Command, Grants: grants}, nil
-}
-
-// planGrants asks the injected runner — when it is a sandbox escalation planner —
-// for the MAC-verified grant descriptions to show in the permission prompt. It
-// probes b.runner STRUCTURALLY (harness never imports sandbox, §10.1): a runner that
-// implements BOTH PlanGrants (mint candidate escalation tokens for dir+command) and
-// DescribeGrant (MAC-verify a token → its bound description) is a planner; anything
-// else (nil, or a plain CommandRunner) plans no grants and the prompt is unchanged.
-//
-// For each candidate token DescribeGrant must return ok==true (the token is
-// executor-minted and MAC-intact); a token that fails verification is fabricated or
-// tampered and MUST NOT reach the prompt, so the whole build fails (SPEC §10.7). The
-// dir is derived via the shared resolveDir (same as InvokableRun), so grants are
-// planned for the call's real working directory; an escaping workdir has no confined
-// dir to plan for (the run would reject it anyway), so it plans no grants rather than
-// failing.
-//
-// It deliberately does NOT read bashArgs.Grants: those are the model's opaque retry
-// tokens (unverified; consumed at InvokableRun), whereas these display grants are the
-// executor's own PlanGrants→DescribeGrant output. Wiring a.Grants in here would put an
-// unverified model-supplied token on the prompt as if it were authorized — exactly the
-// fail-secure violation this seam exists to prevent.
-func (b *BashTool) planGrants(workdir, command string) ([]tool.GrantDisplay, error) {
-	pg, okPlan := b.runner.(interface {
-		PlanGrants(dir, command string) []string
-	})
-	dg, okDescribe := b.runner.(interface {
-		DescribeGrant(token string) (string, bool)
-	})
-	if !okPlan || !okDescribe {
-		return nil, nil
-	}
-
-	dir, err := b.resolveDir(workdir)
-	if err != nil {
-		return nil, nil
-	}
-
-	tokens := pg.PlanGrants(dir, command)
-	if len(tokens) == 0 {
-		return nil, nil
-	}
-	grants := make([]tool.GrantDisplay, 0, len(tokens))
-	for _, tok := range tokens {
-		desc, ok := dg.DescribeGrant(tok)
-		if !ok {
-			return nil, &bashError{reason: "an escalation grant token failed MAC verification"}
-		}
-		grants = append(grants, tool.GrantDisplay{Token: tok, Description: desc})
-	}
-	return grants, nil
-}
+// Interim (replaced in Task 3.4): the legacy BuildRequest/PermissionPrompter
+// prompt seam and its planGrants display-grant planner were removed with the
+// old harness gate. Until Task 3.4 adds PrepareCall emitting command.execute
+// (grant class command.start.v1) plus the explicitly declared filesystem and
+// network deltas, Bash is an unprepared effectful tool and the harness runner
+// fails closed: the call is never evaluated or executed.
 
 // resolveDir resolves a workspace-relative workdir to the confined absolute directory
 // a command runs in. It delegates to the package-level resolveSpawnDir so InvokableRun
@@ -356,10 +282,12 @@ func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 	// once the command has been attempted (after a successful acquire).
 	defer b.invalidateObservations()
 
-	// Gather escalation grants from BOTH sources: the tool's own args and any the
-	// runner placed on ctx after a pre-ask approval (union, dedup, order-stable).
-	// The tokens stay OPAQUE — harness only carries them to a GrantedRunner.
-	merged := mergeGrants(a.Grants, tool.GrantsFromContext(ctx))
+	// Interim (replaced in Task 3.4): the ambient grant context was removed
+	// with the old harness gate — post-decision grants now travel only in the
+	// prepared execution path. Until Task 3.4 wires that path, only the
+	// model-supplied opaque retry tokens are carried; the runner still MAC
+	// verifies every token before applying it.
+	merged := mergeGrants(a.Grants, nil)
 
 	// Bound the command's runtime: clamp the caller timeout into (0, 120s].
 	timeout := clampBashTimeout(a.Timeout)
@@ -572,22 +500,9 @@ func (c *cappedBuffer) cappedString() string {
 	return s
 }
 
-// bashError is the typed failure for Bash arg parsing (used by BuildRequest). It
-// carries a non-secret reason; InvokableRun maps every failure to a tool-result
-// string rather than returning this.
-type bashError struct {
-	reason string
-	cause  error
-}
-
-func (e *bashError) Error() string { return e.reason }
-
-func (e *bashError) Unwrap() error { return e.cause }
-
-// compile-time assertions: BashTool is an InvokableTool, a PermissionPrompter (Ask),
-// and Auditable. It is NOT a WriteTarget (it is not a path-write tool).
+// compile-time assertions: BashTool is an InvokableTool and Auditable. It is
+// NOT a WriteTarget (it is not a path-write tool).
 var (
-	_ tool.InvokableTool      = (*BashTool)(nil)
-	_ tool.PermissionPrompter = (*BashTool)(nil)
-	_ tool.Auditable          = (*BashTool)(nil)
+	_ tool.InvokableTool = (*BashTool)(nil)
+	_ tool.Auditable     = (*BashTool)(nil)
 )

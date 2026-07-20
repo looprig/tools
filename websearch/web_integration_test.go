@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/fetch"
 )
 
@@ -128,17 +127,9 @@ func TestDuckDuckGoProviderLiveScrape(t *testing.T) {
 }
 
 // TestWebSearchLiveEndToEnd drives the WebSearch tool with the live provider end
-// to end (build request, run, format). Best-effort, like the scrape test.
+// to end (run + format). Best-effort, like the scrape test.
 func TestWebSearchLiveEndToEnd(t *testing.T) {
 	ws := NewWebSearch(NewDuckDuckGoProvider(tls12Client()))
-
-	req, err := ws.BuildRequest(`{"query":"golang"}`, nil)
-	if err != nil {
-		t.Fatalf("BuildRequest() error = %v", err)
-	}
-	if _, ok := req.(tool.WebSearchRequest); !ok {
-		t.Fatalf("want tool.WebSearchRequest, got %T", req)
-	}
 
 	res, err := ws.InvokableRun(context.Background(), `{"query":"golang","results":3}`)
 	if err != nil {

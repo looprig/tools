@@ -73,12 +73,6 @@ import (
 // AutoApprove only via the manifest's HardApprove list (which names "Skill").
 const skillToolName = "Skill"
 
-// EffectChecker is the narrow structural contract used by the permission gate.
-// It is declared here so Skill does not depend on the standard permission package.
-type EffectChecker interface {
-	CheckEffect(argsJSON string) (loop.Effect, bool)
-}
-
 // skillSchema is the JSON Schema for Skill's argument object: a single required
 // {name} string selecting a skill from the agent's <available_skills> catalog.
 const skillSchema = `{
@@ -182,39 +176,12 @@ func (s *Skill) decodeName(argsJSON string) (name string, ok bool) {
 	return name, true
 }
 
-// CheckEffect (EffectChecker, Stage 3) decides the per-call effect for THIS Skill
-// call. It is the early gate that keeps embedded skills auto-approve while forcing
-// every untrusted workspace load through the human prompt:
-//
-//   - An EMBEDDED name for this agent → handled=false: fall through to Stage 4
-//     HardApprove (which names "Skill"), preserving the P2 auto-approve. Embedded
-//     wins, so an embedded name never reaches the workspace branch.
-//   - A WORKSPACE-ENABLED, NON-embedded name → (EffectAsk, true): an untrusted
-//     workspace load MUST be human-gated. Pinning EffectAsk here also stops a later
-//     HardApprove/persisted/session stage from ever auto-approving a workspace load.
-//   - Otherwise (embedded-only, unknown name, OR unparseable args) → handled=false:
-//     auto-approve, then InvokableRun fails secure at the RESULT (UnknownSkillError
-//     string). There is no workspace to consult, so there is nothing to gate.
-//
-// Bad/empty args yield handled=false: the call still auto-approves but resolves to
-// an error tool-result, identical to the embedded-only failure model.
-func (s *Skill) CheckEffect(argsJSON string) (loop.Effect, bool) {
-	name, ok := s.decodeName(argsJSON)
-	if !ok {
-		return loop.EffectAsk, false
-	}
-	// Embedded-wins: an embedded name is auto-approved (fall through to HardApprove).
-	if s.loader.Allowed(s.agent, name) {
-		return loop.EffectAsk, false
-	}
-	// A non-embedded name on a workspace-enabled tool is an untrusted load → gate it.
-	if s.workspaceEnabled() {
-		return loop.EffectAsk, true
-	}
-	// Embedded-only, non-embedded name: no workspace to gate; auto-approve and let
-	// InvokableRun fail secure at the result.
-	return loop.EffectAsk, false
-}
+// Interim (replaced in Task 3.3): the legacy CheckEffect/EffectChecker and
+// BuildRequest/PermissionPrompter gate seams were removed with the old harness
+// gate. Until Task 3.3 adds PrepareCall emitting context.load (and any
+// applicable filesystem requirement) from the TOCTOU-safe snapshot below,
+// Skill is an unprepared effectful tool and the harness runner fails closed:
+// the call is never evaluated or executed.
 
 // Prepare (Preparer) computes the per-call artifact ONCE, before the prompt. It is
 // the TOCTOU-safe snapshot seam for a workspace load:
@@ -260,26 +227,6 @@ func (s *Skill) Prepare(_ context.Context, _ uuid.UUID, argsJSON string) (tool.P
 	return &art, nil
 }
 
-// BuildRequest (PermissionPrompter) derives the approval prompt. It is reached only
-// on an Ask — i.e. a workspace load — so prepared MUST be the *tool.SkillArtifact
-// Prepare produced for this call. It renders the snapshot's SAFE metadata into a
-// SkillLoadRequest (RelPath/Size/SHA256 + the requesting agent); the body is never
-// in the prompt. Any other prepared value is unexpected (embedded never gates), so
-// it is treated fail-secure with a typed error → the runner falls back to a
-// redacted UnknownRequest rather than guessing a request.
-func (s *Skill) BuildRequest(_ string, prepared tool.PreparedArtifact) (tool.PermissionRequest, error) {
-	art, ok := prepared.(*tool.SkillArtifact)
-	if !ok || art == nil || !art.Workspace {
-		return nil, &SkillContainmentError{Name: "", Reason: "missing workspace snapshot for permission prompt"}
-	}
-	return tool.SkillLoadRequest{
-		RelPath: art.RelPath,
-		Agent:   s.agent,
-		Size:    art.Size,
-		SHA256:  art.SHA256,
-	}, nil
-}
-
 // InvokableRun returns the requested skill body as the tool result. For a WORKSPACE
 // load it returns the APPROVED SNAPSHOT body that Prepare bound to this call — read
 // back from ctx via PreparedFromContext, NEVER re-reading the file — so the bytes
@@ -289,10 +236,11 @@ func (s *Skill) BuildRequest(_ string, prepared tool.PreparedArtifact) (tool.Per
 // Every failure mode (bad args, empty name, or any loader error) is a tool-result
 // error STRING — never a Go error and never echoing a body on an error path.
 func (s *Skill) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
-	// Workspace path: a *tool.SkillArtifact in ctx is the approved snapshot. Return
-	// its Body verbatim — no decode, no loader, no re-read of the file.
-	if prepared, ok := loop.PreparedFromContext(ctx); ok {
-		if art, isSkill := prepared.(*tool.SkillArtifact); isSkill && art != nil && art.Workspace {
+	// Workspace path: a *tool.SkillArtifact on the prepared call is the approved
+	// snapshot. Return its Body verbatim — no decode, no loader, no re-read of
+	// the file.
+	if prepared, ok := loop.PreparedCallFromContext(ctx); ok {
+		if art, isSkill := prepared.Artifact.(*tool.SkillArtifact); isSkill && art != nil && art.Workspace {
 			return tool.TextResult(art.Body), nil
 		}
 	}
@@ -312,14 +260,8 @@ func (s *Skill) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRe
 	return tool.TextResult(body), nil
 }
 
-// compile-time assertions: Skill is always an InvokableTool and Auditable. It also
-// satisfies Preparer + EffectChecker + PermissionPrompter so a WORKSPACE-enabled
-// instance is gated; those methods are pass-throughs/no-ops for an embedded-only
-// instance, preserving the P2 auto-approve, side-effect-free read behavior.
+// compile-time assertions: Skill is always an InvokableTool and Auditable.
 var (
-	_ tool.InvokableTool      = (*Skill)(nil)
-	_ tool.Auditable          = (*Skill)(nil)
-	_ tool.Preparer           = (*Skill)(nil)
-	_ tool.PermissionPrompter = (*Skill)(nil)
-	_ EffectChecker           = (*Skill)(nil)
+	_ tool.InvokableTool = (*Skill)(nil)
+	_ tool.Auditable     = (*Skill)(nil)
 )

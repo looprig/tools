@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 // runEditFile invokes EditFile (bound to the given per-loop observation map) and
@@ -225,24 +224,8 @@ func TestEditFileWriteTarget(t *testing.T) {
 	}
 }
 
-func TestEditFileBuildRequest(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	req, err := NewEditFile(root, newFileObservations()).BuildRequest(`{"path":"x.txt","old":"secret-old","new":"secret-new"}`, nil)
-	if err != nil {
-		t.Fatalf("BuildRequest err = %v", err)
-	}
-	fw, ok := req.(tool.FileWriteRequest)
-	if !ok {
-		t.Fatalf("request type = %T, want tool.FileWriteRequest", req)
-	}
-	if !strings.HasSuffix(fw.Path, "x.txt") {
-		t.Errorf("FileWriteRequest.Path = %q, want it to end with x.txt", fw.Path)
-	}
-	if strings.Contains(fw.Description(), "secret-old") || strings.Contains(fw.Description(), "secret-new") {
-		t.Errorf("request Description leaked substrings: %q", fw.Description())
-	}
-}
+// Interim: the legacy gate-seam tests here were removed with the old harness
+// prompt contracts; Task 3.3 adds PrepareCall coverage.
 
 func TestEditFileAuditSummary(t *testing.T) {
 	t.Parallel()

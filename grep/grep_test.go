@@ -346,9 +346,6 @@ func TestGrepAuditSummary(t *testing.T) {
 func TestGrepCapabilities(t *testing.T) {
 	t.Parallel()
 	var it tool.InvokableTool = NewGrep(t.TempDir(), newFakeReadGuard(1<<20))
-	if _, ok := it.(tool.PermissionPrompter); ok {
-		t.Error("Grep must not implement PermissionPrompter (AutoApprove)")
-	}
 	if _, ok := it.(tool.Auditable); !ok {
 		t.Error("Grep must implement Auditable")
 	}

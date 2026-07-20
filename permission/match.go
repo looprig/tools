@@ -1,292 +1,124 @@
 package permission
 
 import (
-	"net/url"
-	"path"
 	"strings"
 
-	"golang.org/x/net/idna"
-
-	"github.com/looprig/tools/internal/workspace"
+	"github.com/looprig/harness/pkg/tool"
 )
 
-// match.go holds the per-tool predicates that decide whether a saved
-// ApprovalRecord.Match string matches a live tool call. These are
-// SECURITY-CRITICAL: a false positive auto-approves a call the user never
-// granted. Every predicate is FAIL-SECURE — any parse, normalization, or
-// ambiguity error yields NO match (the caller then falls through to
-// EffectAsk/EffectDeny, never EffectAutoApprove).
+// match.go answers whether one durable rule matches one prepared
+// requirement. The store consults it identically for deny and allow rules;
+// deny-before-allow ordering belongs to the gate evaluator.
 //
-// The predicates are pure (no I/O) and return a plain bool: a matcher that
-// "errors" is, by contract, a no-match. There is no (bool, error) signature
-// because callers must treat every failure identically as "deny side" — a
-// separate error channel would invite a caller to accidentally treat an error
-// as anything other than no-match.
+// A rule matches only within its own capability and enforcement class. The
+// requirement side of each class contract is the canonical Match encoding
+// documented in rule.go; preparation builds those strings.
 
-// schemeDefault is the scheme an Fetch approval record is interpreted under when
-// it omits one: an "http://" grant must be explicit, so a bare host defaults to
-// https (the safer scheme).
-const schemeDefault = "https"
-
-// fetchFieldCount is the number of space-separated fields in the Fetch match
-// grammar "<METHOD> <target>": exactly two.
-const fetchFieldCount = 2
-
-// MatchFileGlob reports whether pattern matches the workspace-relative path
-// relPath. relPath MUST be the relativised containedPath output (cleaned,
-// symlink-resolved, workspace-relative) produced by the caller; as a fail-secure
-// safety net this rejects any relPath that is absolute or contains a ".."
-// segment, since such a path could never be a legitimate contained relPath and
-// must never be matched. Matching itself delegates to the shared matchGlob
-// (supports "**").
-func MatchFileGlob(pattern, relPath string) bool {
-	if isUnsafeRelPath(relPath) {
+// matchesRequirement reports whether rule matches the prepared requirement.
+// Anything unparseable or foreign matches nothing: an incompatible record
+// can tighten nothing and widen nothing.
+func matchesRequirement(rule Rule, requirement tool.Requirement) bool {
+	if rule.Capability != requirement.Kind {
 		return false
 	}
-	return workspace.MatchGlob(pattern, relPath)
-}
-
-// isUnsafeRelPath reports whether relPath is absolute or escapes its root via a
-// ".." segment. The caller is supposed to pass an already-contained relative
-// path; anything else is a programming error or an attempted escape, and is
-// treated as no-match.
-func isUnsafeRelPath(relPath string) bool {
-	// path.IsAbs for slash paths IS HasPrefix(relPath, "/"); the explicit
-	// prefix clause is a belt-and-suspenders guard documenting that a
-	// leading-slash input is rejected regardless of path.IsAbs internals.
-	if path.IsAbs(relPath) || strings.HasPrefix(relPath, "/") {
+	switch rule.Class {
+	case ClassCommandInvoke:
+		return requirement.Match == rule.Command
+	case ClassCommandInvokeWildcard:
+		// Bash(*) satisfies only the command-execution decision. The issued
+		// grant remains the exact-command command.start.v1.
 		return true
-	}
-	cleaned := path.Clean(relPath)
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return true
-	}
-	// Inspect the pre-clean segments too: "a/../b" cleans to "b" (which is safe
-	// to match as "b"), but we deliberately reject any input that contained a
-	// ".." segment so a caller can never smuggle traversal through normalization.
-	for _, seg := range strings.Split(relPath, "/") {
-		if seg == ".." {
-			return true
-		}
+	case ClassCommandInvokeFamily:
+		// Family storage lands in Task 3.1; the token-aware shell-segment
+		// matcher is Task 3.2 and plugs in here. Until then a family rule
+		// matches nothing, which fails closed for allow and never widens.
+		return false
+	case ClassNetworkTarget:
+		return matchesNetworkTarget(rule, requirement)
+	case ClassNetworkBroad:
+		return matchesCommandBound(rule, requirement, rule.Class)
+	case ClassFilesystemPathRead, ClassFilesystemPathWrite:
+		return isCanonicalPathRequirement(requirement) && requirement.Match == rule.Path
+	case ClassFilesystemTreeRead, ClassFilesystemTreeWrite:
+		return matchesTree(rule, requirement)
+	case ClassFilesystemHostRead, ClassFilesystemHostWrite:
+		return matchesCommandBound(rule, requirement, rule.Class)
 	}
 	return false
 }
 
-// MatchBash reports whether a live shell command matches a recorded Bash
-// approval. record is the recorded Match; prefix is the record's Prefix flag
-// (the hand-edited, risky opt-in); call is the live command.
-//
-// Both sides are normalized (trim + collapse internal whitespace runs to a
-// single space). Default (prefix=false) is EXACT normalized equality: a grant of
-// "go test ./..." does NOT approve "go test ./...; echo x". With prefix=true the
-// match succeeds when the normalized call has the normalized record as a leading
-// substring — used only when a human explicitly opts in.
-func MatchBash(record string, prefix bool, call string) bool {
-	nr := normalizeWhitespace(record)
-	nc := normalizeWhitespace(call)
-	if prefix {
-		return strings.HasPrefix(nc, nr)
+// matchesNetworkTarget requires every constraint present in the rule. A
+// command-bound broad requirement never matches a target rule and a target
+// rule never satisfies a broad requirement.
+func matchesNetworkTarget(rule Rule, requirement tool.Requirement) bool {
+	if requirement.GrantClass != "" && requirement.GrantClass != GrantClassNetworkProxyTarget {
+		return false
 	}
-	return nc == nr
-}
-
-// normalizeWhitespace trims leading/trailing whitespace and collapses every
-// internal run of whitespace (spaces, tabs, newlines) to a single space. It is
-// the canonical Bash command normalization shared by Grant (which records the
-// normalized command) and MatchBash (which compares against it).
-func normalizeWhitespace(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
-// fetchTarget is the parsed scheme+host+path of one side of a Fetch match: the
-// canonical, IDNA-normalized comparison form. host is always lower-cased and
-// punycode (ASCII); path is the cleaned URL path ("" means "any path").
-type fetchTarget struct {
-	method   string // upper-cased HTTP method
-	scheme   string // lower-cased scheme (default https on the record side)
-	host     string // lower-cased, idna.Lookup.ToASCII-normalized hostname (no port)
-	hostDot  bool   // true if the record host began with a leading "." (suffix match)
-	pathPref string // path-prefix; "" means "any path" (record side only)
-}
-
-// MatchFetch reports whether a live Fetch call (callMethod + callURL) matches a
-// recorded Fetch approval whose Match grammar is "<METHOD> <scheme>://<host>
-// [<path-prefix>]". Matching is exact on method and scheme, exact-or-leading-dot
-// -suffix on host (NEVER substring), and an opt-in segment-aware path prefix.
-// Every parse or IDNA-normalization failure on either side returns false
-// (fail-secure).
-func MatchFetch(record, callMethod, callURL string) bool {
-	rec, ok := parseFetchRecord(record)
+	transport, host, port, ok := parseNetworkTargetMatch(requirement.Match)
 	if !ok {
 		return false
 	}
-	call, ok := parseFetchCall(callMethod, callURL)
-	if !ok {
+	if rule.Host != host {
 		return false
 	}
-	if rec.method != call.method {
+	if rule.Transport != "" && rule.Transport != transport {
 		return false
 	}
-	if rec.scheme != call.scheme {
+	if rule.Port != 0 && rule.Port != port {
 		return false
 	}
-	if !hostMatches(rec, call.host) {
+	return true
+}
+
+// matchesCommandBound implements the exact-command-bound broad classes:
+// the requirement must carry the identical enforcement class and the rule's
+// exact bound command; a broad rule can never satisfy a direct or
+// target-scoped request.
+func matchesCommandBound(rule Rule, requirement tool.Requirement, class string) bool {
+	if requirement.GrantClass != class {
 		return false
 	}
-	return pathMatches(rec.pathPref, call.pathPref)
+	bound, ok := parseCommandBoundMatch(requirement.Match)
+	if !ok || bound.Command != rule.Command {
+		return false
+	}
+	if rule.Class == ClassNetworkBroad {
+		return bound.Target == rule.Target && requirement.GrantTarget == rule.Target
+	}
+	return true
 }
 
-// parseFetchRecord parses the record Match grammar into a canonical fetchTarget.
-// It returns ok=false on any malformed input or non-normalizable host
-// (fail-secure). A record host beginning with "." is a leading-dot suffix
-// pattern; the dot is stripped for normalization and hostDot is set.
-func parseFetchRecord(record string) (fetchTarget, bool) {
-	fields := strings.Fields(record)
-	if len(fields) != fetchFieldCount {
-		return fetchTarget{}, false
+// matchesTree covers a canonical path at or below the root and the tree
+// requirement for the identical root.
+func matchesTree(rule Rule, requirement tool.Requirement) bool {
+	if requirement.GrantClass != "" && !strings.HasPrefix(requirement.GrantClass, "filesystem.path.") && !strings.HasPrefix(requirement.GrantClass, "filesystem.tree.") {
+		return false
 	}
-	method := strings.ToUpper(fields[0])
-	target := fields[1]
-
-	// Default the scheme to https when the record omits "scheme://".
-	if !strings.Contains(target, "://") {
-		target = schemeDefault + "://" + target
+	match := requirement.Match
+	if root, isTree := strings.CutPrefix(match, "tree:"); isTree {
+		return validCanonicalPath(root) && pathWithinRoot(root, rule.Root)
 	}
-	u, err := url.Parse(target)
-	if err != nil {
-		return fetchTarget{}, false
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme == "" {
-		return fetchTarget{}, false
-	}
-
-	rawHost := strings.ToLower(u.Hostname()) // Hostname() => port excluded
-	dot := strings.HasPrefix(rawHost, ".")
-	if dot {
-		rawHost = strings.TrimPrefix(rawHost, ".")
-	}
-	host, ok := normalizeHost(rawHost)
-	if !ok {
-		return fetchTarget{}, false
-	}
-
-	return fetchTarget{
-		method:   method,
-		scheme:   scheme,
-		host:     host,
-		hostDot:  dot,
-		pathPref: cleanPathPrefix(u.Path),
-	}, true
+	return validCanonicalPath(match) && pathWithinRoot(match, rule.Root)
 }
 
-// parseFetchCall parses the live call's method + URL into a canonical
-// fetchTarget. The call side never carries a leading-dot host or a path-prefix
-// pattern (its path is the concrete request path). It returns ok=false on a
-// malformed URL, a missing host, or a non-normalizable host (fail-secure).
-func parseFetchCall(callMethod, callURL string) (fetchTarget, bool) {
-	u, err := url.Parse(callURL)
-	if err != nil {
-		return fetchTarget{}, false
+// isCanonicalPathRequirement guards the exact-path classes against
+// command-bound or tree-scoped requirement encodings.
+func isCanonicalPathRequirement(requirement tool.Requirement) bool {
+	if requirement.GrantClass != "" && !strings.HasPrefix(requirement.GrantClass, "filesystem.path.") {
+		return false
 	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme == "" {
-		return fetchTarget{}, false
-	}
-	rawHost := strings.ToLower(u.Hostname())
-	if rawHost == "" {
-		return fetchTarget{}, false
-	}
-	host, ok := normalizeHost(rawHost)
-	if !ok {
-		return fetchTarget{}, false
-	}
-	return fetchTarget{
-		method:   strings.ToUpper(strings.TrimSpace(callMethod)),
-		scheme:   scheme,
-		host:     host,
-		pathPref: cleanPathPrefix(u.Path),
-	}, true
+	return validCanonicalPath(requirement.Match)
 }
 
-// normalizeHost converts a hostname to its canonical ASCII (punycode) form via
-// idna.Lookup.ToASCII (the strict lookup profile). A non-normalizable host
-// (homograph with disallowed runes, invalid ACE label, etc.) returns ok=false
-// so the caller fails secure. An empty host is not normalizable. A trailing-dot
-// FQDN (e.g. "example.com.") is intentionally treated as a DISTINCT host that
-// will NOT match "example.com" (fail-secure: the rooted form is not silently
-// equated with the relative form).
-func normalizeHost(host string) (string, bool) {
-	if host == "" {
-		return "", false
-	}
-	ascii, err := idna.Lookup.ToASCII(host)
-	if err != nil || ascii == "" {
-		return "", false
-	}
-	return ascii, true
-}
-
-// hostMatches reports whether callHost satisfies the record's host. With no
-// leading dot it is EXACT equality. With a leading dot ("/.github.com") it
-// matches the apex (callHost == record host) OR any subdomain (callHost ends in
-// ".<recordHost>"). It is NEVER a substring/prefix match, so "example.com" can
-// never match "example.com.evil.com".
-func hostMatches(rec fetchTarget, callHost string) bool {
-	if callHost == rec.host {
+// pathWithinRoot reports whether canonical path sits at or below canonical
+// root. Both are validated canonical absolute paths, so a byte comparison
+// with a separator boundary is exact.
+func pathWithinRoot(path, root string) bool {
+	if path == root {
 		return true
 	}
-	if rec.hostDot {
-		return strings.HasSuffix(callHost, "."+rec.host)
-	}
-	return false
-}
-
-// cleanPathPrefix returns the cleaned URL path used for prefix comparison. A
-// root ("/") or empty path normalizes to "" meaning "any path". Otherwise the
-// path is path.Clean-ed and any trailing slash dropped so comparison is
-// segment-aligned.
-func cleanPathPrefix(p string) string {
-	if p == "" || p == "/" {
-		return ""
-	}
-	cleaned := path.Clean(p)
-	if cleaned == "/" || cleaned == "." {
-		return ""
-	}
-	return cleaned
-}
-
-// fetchMatchString derives the canonical Fetch record Match "<METHOD>
-// <scheme>://<host>" from a live call's method + URL, reusing parseFetchCall so
-// the derivation and the matcher share the SAME normalization (lower-cased
-// idna-punycode host, port excluded, upper-cased method, lower-cased scheme). It
-// records NO path-prefix — a grant approves the whole scheme+host+method, the
-// conservative breadth the design specifies (a path-scoped grant is a hand-edited
-// opt-in). ok=false on any unparseable/non-normalizable input (Grant then fails
-// secure). The produced string round-trips: MatchFetch(out, method, url) is true.
-func fetchMatchString(callMethod, callURL string) (string, bool) {
-	call, ok := parseFetchCall(callMethod, callURL)
-	if !ok {
-		return "", false
-	}
-	if call.method == "" {
-		return "", false
-	}
-	return call.method + " " + call.scheme + "://" + call.host, true
-}
-
-// pathMatches reports whether callPath satisfies a record path-prefix. An empty
-// recordPref means the record opted out of path matching → any path matches.
-// Otherwise matching is SEGMENT-AWARE: callPath must equal recordPref or have it
-// as a path-segment prefix ("/api" matches "/api" and "/api/v1" but NOT
-// "/apixyz").
-func pathMatches(recordPref, callPath string) bool {
-	if recordPref == "" {
+	if root == "/" {
 		return true
 	}
-	if callPath == recordPref {
-		return true
-	}
-	return strings.HasPrefix(callPath, recordPref+"/")
+	return strings.HasPrefix(path, root+"/")
 }

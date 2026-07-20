@@ -5,8 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-
-	"github.com/looprig/harness/pkg/tool"
 )
 
 // fakeSearchProvider is a canned SearchProvider for unit-testing the WebSearch
@@ -144,42 +142,8 @@ func TestWebSearchResultsCap(t *testing.T) {
 	}
 }
 
-func TestWebSearchBuildRequest(t *testing.T) {
-	t.Parallel()
-
-	ws := NewWebSearch(&fakeSearchProvider{})
-	tests := []struct {
-		name      string
-		argsJSON  string
-		wantErr   bool
-		wantQuery string
-	}{
-		{name: "valid query", argsJSON: `{"query":"golang generics"}`, wantQuery: "golang generics"},
-		{name: "missing query is an error", argsJSON: `{}`, wantErr: true},
-		{name: "empty query is an error", argsJSON: `{"query":""}`, wantErr: true},
-		{name: "unparseable args is an error", argsJSON: `nope`, wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			req, err := ws.BuildRequest(tt.argsJSON, nil)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("BuildRequest() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if tt.wantErr {
-				return
-			}
-			wsr, ok := req.(tool.WebSearchRequest)
-			if !ok {
-				t.Fatalf("want tool.WebSearchRequest, got %T", req)
-			}
-			if wsr.Query != tt.wantQuery {
-				t.Errorf("Query = %q, want %q", wsr.Query, tt.wantQuery)
-			}
-		})
-	}
-}
+// Interim: the legacy gate-seam tests here were removed with the old harness
+// prompt contracts; Task 3.4 adds PrepareCall coverage.
 
 func TestWebSearchAuditSummary(t *testing.T) {
 	t.Parallel()

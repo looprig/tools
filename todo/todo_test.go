@@ -64,9 +64,6 @@ func TestTodoAuditSummary(t *testing.T) {
 func TestTodoNotPermissionPrompter(t *testing.T) {
 	t.Parallel()
 	var ti tool.InvokableTool = NewTodo()
-	if _, ok := ti.(tool.PermissionPrompter); ok {
-		t.Error("Todo must NOT implement PermissionPrompter (it is AutoApprove)")
-	}
 	if _, ok := ti.(tool.Auditable); !ok {
 		t.Error("Todo should implement Auditable")
 	}

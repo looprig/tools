@@ -1,335 +1,570 @@
 package permission
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
+
+	"github.com/looprig/harness/pkg/tool"
 )
 
-// store.go resolves the OUT-OF-REPO policy-store file paths (design §3c). The
-// store deliberately lives under the user's home, NEVER in the repo, so a cloned
-// or hostile repo cannot ship an approvals.json that silently auto-approves a
-// tool call. The workspace-scoped file is keyed by a sha256 of the RESOLVED
-// workspace root so two checkouts of different roots never share approvals.
+// store.go is the single hardened workspace permission store.
 //
-// Only the reading path (workspaceHash + the two file-path resolvers) lives here
-// for now; Grant's atomic-write + filesystem hardening (Task 3.6) extends this
-// file.
-
-const (
-	// looprigDirName is the per-user looprig store directory under the home dir.
-	looprigDirName = ".looprig"
-	// workspacesDirName holds one subdirectory per workspace (named by hash).
-	workspacesDirName = "workspaces"
-	// userApprovalsName is the user-global approvals file (~/.looprig/approvals.json).
-	userApprovalsName = "approvals.json"
-	// workspaceApprovalsName is the per-workspace approvals file
-	// (~/.looprig/workspaces/<hash>/approvals.json).
-	workspaceApprovalsName = "approvals.json"
-)
-
-// workspaceHash returns the lowercase hex sha256 of the EvalSymlinks-resolved
-// workspace root. Resolving symlinks first makes the hash stable across symlink
-// aliases of the same directory and matches the containment root resolution, so
-// the workspace file is found regardless of which alias the workspace root was
-// supplied as. A root that cannot be resolved yields the error so the caller can
-// fail secure (treat the workspace store as absent).
-func workspaceHash(workspaceRoot string) (string, error) {
-	resolved, err := filepath.EvalSymlinks(workspaceRoot)
-	if err != nil {
-		return "", &PolicyPathError{Root: workspaceRoot, Reason: "workspace root could not be resolved", Err: err}
-	}
-	resolved, err = filepath.Abs(resolved)
-	if err != nil {
-		return "", &PolicyPathError{Root: workspaceRoot, Reason: "workspace root could not be made absolute", Err: err}
-	}
-	sum := sha256.Sum256([]byte(resolved))
-	return hex.EncodeToString(sum[:]), nil
-}
-
-// userApprovalsPath returns the path to the user-global approvals file given a
-// resolved home directory: <home>/.looprig/approvals.json.
-func userApprovalsPath(home string) string {
-	return filepath.Join(home, looprigDirName, userApprovalsName)
-}
-
-// workspaceApprovalsPath returns the path to the workspace-scoped approvals file:
-// <home>/.looprig/workspaces/<hash>/approvals.json.
-func workspaceApprovalsPath(home, hash string) string {
-	return filepath.Join(home, looprigDirName, workspacesDirName, hash, workspaceApprovalsName)
-}
-
-// PolicyPathError is the typed failure for resolving a policy-store path (e.g. an
-// unresolvable workspace root). It is fail-secure: the caller treats a non-nil
-// PolicyPathError as "this store is absent", contributing no approvals.
-type PolicyPathError struct {
-	Root   string // the workspace root being hashed (when applicable)
-	Reason string // non-secret, human-readable reason
-	Err    error  // underlying cause, may be nil
-}
-
-func (e *PolicyPathError) Error() string {
-	if e.Err != nil {
-		return "tools: policy path error: " + e.Reason + " (root=" + e.Root + "): " + e.Err.Error()
-	}
-	return "tools: policy path error: " + e.Reason + " (root=" + e.Root + ")"
-}
-
-func (e *PolicyPathError) Unwrap() error { return e.Err }
-
-// Filesystem-hardening permission constants (design §3c). The policy store is
-// security-sensitive, so directories are owner-only and files are owner
-// read/write only — a group/world bit on either is a hardening violation.
-const (
-	// storeDirPerm is the mode for ~/.looprig and ~/.looprig/workspaces/<hash> (owner rwx).
-	storeDirPerm os.FileMode = 0o700
-	// storeFilePerm is the mode for the approvals.json file (owner rw).
-	storeFilePerm os.FileMode = 0o600
-	// groupWorldWritable is the perm-bit mask that flags a file as writable by the
-	// group or other ("020" group-write | "002" other-write). The loader rejects
-	// any approvals file with either bit set (a non-owner could tamper with it).
-	groupWorldWritable os.FileMode = 0o022
-)
-
-// storeRelSegments validates that full is genuinely a descendant of base (the
-// resolved home, the trust anchor) and returns the path segments BELOW base, in
-// order from the shallowest store component down to the leaf. It is the single
-// source of truth for "which components are the store's own (and therefore ours
-// to walk/check/chmod), as opposed to home and above (outside our control)".
-// Both the read-side hardening walk and the write-side chmod walk consume this so
-// they stay consistent. A "." or a ".."-escaping rel means full is not under base
-// — a typed refusal (the store path must live under home).
-func storeRelSegments(base, full string) ([]string, error) {
-	rel, err := filepath.Rel(base, full)
-	if err != nil {
-		return nil, &PolicyStoreError{Path: full, Reason: "policy path is not relative to home", Err: err}
-	}
-	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return nil, &PolicyStoreError{Path: full, Reason: "policy path is not under the home dir"}
-	}
-	return strings.Split(rel, string(os.PathSeparator)), nil
-}
-
-// assertNoSymlinkComponent walks every path component from base (inclusive,
-// exclusive of base's own ancestry) down to full and rejects if ANY component is
-// a symlink. It is the §3c "don't follow a symlinked ~/.looprig or workspaces/<hash>"
-// rule, shared by the write path (Grant) and the read path (the loader). base
-// must be an ancestor of full and is assumed trusted (the resolved home dir); it
-// is NOT itself re-checked here (the home dir is the trust anchor). A component
-// that does not yet exist is fine (Lstat ErrNotExist is not a violation — Grant
-// will create it 0700); any OTHER Lstat error, or a symlink, is a violation.
+// One Store serves one explicit permission-file path supplied by the
+// consumer; the store never computes HOME-relative or otherwise implicit
+// locations. An interactive workspace store re-reads the file for every
+// query, so concurrent CodeRig processes observe each other's atomically
+// renamed updates without watching. A read-only (headless) store loads one
+// immutable snapshot at construction and never reloads.
 //
-// It uses os.Lstat (which does NOT follow the final component) at each level so a
-// symlinked directory is detected rather than traversed.
-func assertNoSymlinkComponent(base, full string) error {
-	segs, err := storeRelSegments(base, full)
+// The Store satisfies the harness gate's structural RuleMatcher and
+// RuleWriter contracts. Deny-before-allow ordering belongs to the gate;
+// the store answers both queries independently.
+
+// Config configures one Store.
+type Config struct {
+	// Path is the one explicit permission-file path. Interactive stores
+	// require it; a read-only store with an empty Path uses an empty rule
+	// set. The store never discovers HOME or any other implicit location.
+	Path string
+	// MaxFileBytes bounds the permission file size. Zero selects
+	// DefaultMaxFileBytes.
+	MaxFileBytes int64
+	// FamilyEligible is the consumer's automatic-family eligibility catalog
+	// predicate, used only to produce non-fatal diagnostics for manual
+	// out-of-catalog allow families. Nil treats every allow family as out of
+	// catalog. It never alters matching.
+	FamilyEligible FamilyEligibility
+}
+
+// DefaultMaxFileBytes is the default permission-file size bound.
+const DefaultMaxFileBytes int64 = 1 << 20
+
+// filePerm is the exact required permission-file mode: owner read/write
+// only. Any other mode is rejected.
+const filePerm os.FileMode = 0o600
+
+// dirPerm is the owner-only mode used when creating the store directory.
+const dirPerm os.FileMode = 0o700
+
+// lockSuffix names the sibling interprocess lock file.
+const lockSuffix = ".lock"
+
+// lockRetryInterval paces the non-blocking flock retry loop so lock waits
+// stay cancellable through the caller's context.
+const lockRetryInterval = 5 * time.Millisecond
+
+// Store is the hardened workspace permission store.
+type Store struct {
+	path           string
+	maxFileBytes   int64
+	familyEligible FamilyEligibility
+	readOnly       bool
+
+	mu          sync.Mutex
+	snapshot    []Rule // read-only stores only
+	diagnostics []Diagnostic
+
+	// Test seams. Production construction wires the real operations; tests
+	// inject failures to prove rollback.
+	euid       int
+	renameFile func(oldPath, newPath string) error
+	syncFile   func(file interface{ Sync() error }) error
+}
+
+// NewWorkspaceStore constructs the interactive read/write store for one
+// workspace permission file. The file may not exist yet; an existing file
+// must be secure and well-formed or construction fails. The returned
+// diagnostics are the non-fatal findings of the initial load.
+func NewWorkspaceStore(cfg Config) (*Store, []Diagnostic, error) {
+	store, _, err := newWorkspaceStoreNoLoad(cfg)
 	if err != nil {
+		return nil, nil, err
+	}
+	rules, err := store.loadCurrent()
+	if err != nil {
+		return nil, nil, err
+	}
+	diagnostics := store.recordDiagnostics(rules)
+	return store, diagnostics, nil
+}
+
+// newWorkspaceStoreNoLoad builds the interactive store without the fail-fast
+// initial load. Tests use it to observe exact match-time failures.
+func newWorkspaceStoreNoLoad(cfg Config) (*Store, []Diagnostic, error) {
+	if cfg.Path == "" {
+		return nil, nil, &FileError{Reason: FileMissing, Err: errors.New("workspace store requires one explicit permission-file path")}
+	}
+	if !filepath.IsAbs(cfg.Path) {
+		return nil, nil, &FileError{Path: cfg.Path, Reason: FileMalformed, Err: errors.New("permission-file path must be absolute")}
+	}
+	return newStore(cfg, false), nil, nil
+}
+
+// NewReadOnlyStore constructs the headless store. A configured path is
+// loaded once as an immutable snapshot; a missing, malformed, insecure,
+// oversized, or unsupported configured file fails startup. An empty path
+// yields an empty rule set. The store never watches or reloads the file and
+// rejects every write.
+func NewReadOnlyStore(cfg Config) (*Store, []Diagnostic, error) {
+	store := newStore(cfg, true)
+	if cfg.Path == "" {
+		return store, nil, nil
+	}
+	if !filepath.IsAbs(cfg.Path) {
+		return nil, nil, &FileError{Path: cfg.Path, Reason: FileMalformed, Err: errors.New("permission-file path must be absolute")}
+	}
+	rules, err := store.loadFile(true)
+	if err != nil {
+		return nil, nil, err
+	}
+	store.snapshot = rules
+	diagnostics := store.recordDiagnostics(rules)
+	return store, diagnostics, nil
+}
+
+func newStore(cfg Config, readOnly bool) *Store {
+	maxBytes := cfg.MaxFileBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxFileBytes
+	}
+	return &Store{
+		path:           cfg.Path,
+		maxFileBytes:   maxBytes,
+		familyEligible: cfg.FamilyEligible,
+		readOnly:       readOnly,
+		euid:           os.Geteuid(),
+		renameFile:     os.Rename,
+		syncFile:       func(file interface{ Sync() error }) error { return file.Sync() },
+	}
+}
+
+// MatchesDeny reports whether any stored deny rule matches the requirement.
+// Any load failure fails closed as an error; the gate rejects the call.
+func (s *Store) MatchesDeny(ctx context.Context, requirement tool.Requirement) (bool, error) {
+	return s.matches(ctx, requirement, EffectDeny)
+}
+
+// MatchesAllow reports whether any stored allow rule matches the
+// requirement.
+func (s *Store) MatchesAllow(ctx context.Context, requirement tool.Requirement) (bool, error) {
+	return s.matches(ctx, requirement, EffectAllow)
+}
+
+func (s *Store) matches(ctx context.Context, requirement tool.Requirement, effect Effect) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	rules, err := s.currentRules()
+	if err != nil {
+		return false, err
+	}
+	for _, rule := range rules {
+		if rule.Effect == effect && matchesRequirement(rule, requirement) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// currentRules returns the immutable snapshot for read-only stores and a
+// fresh hardened load for interactive stores. Atomic-rename updates make a
+// lock-free read observe one complete file version.
+func (s *Store) currentRules() ([]Rule, error) {
+	if s.readOnly {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.snapshot, nil
+	}
+	return s.loadCurrent()
+}
+
+func (s *Store) loadCurrent() ([]Rule, error) {
+	rules, err := s.loadFile(false)
+	if err != nil {
+		return nil, err
+	}
+	s.recordDiagnostics(rules)
+	return rules, nil
+}
+
+// Diagnostics returns the non-fatal rule diagnostics of the most recent
+// load. Diagnostics are reported separately from fatal file errors and
+// never alter rule precedence.
+func (s *Store) Diagnostics() []Diagnostic {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Diagnostic(nil), s.diagnostics...)
+}
+
+func (s *Store) recordDiagnostics(rules []Rule) []Diagnostic {
+	diagnostics := diagnoseRules(rules, s.familyEligible)
+	s.mu.Lock()
+	s.diagnostics = diagnostics
+	s.mu.Unlock()
+	return append([]Diagnostic(nil), diagnostics...)
+}
+
+// WriteRules atomically appends the complete displayed allow-candidate
+// batch to the workspace file. It locks the workspace, re-reads and merges
+// under the lock, writes an owner-only temporary file, fsyncs it, renames
+// it into place, and fsyncs the directory. Any failure leaves the prior
+// complete file intact and returns an error, so the approved call is
+// blocked rather than silently downgraded to a once-only approval.
+func (s *Store) WriteRules(ctx context.Context, candidates []tool.RuleCandidate) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	cur := base
-	for _, seg := range segs {
-		cur = filepath.Join(cur, seg)
-		fi, err := os.Lstat(cur)
+	if s.readOnly {
+		return &FileError{Path: s.path, Reason: FileReadOnly, Err: errors.New("read-only permission store cannot persist approvals")}
+	}
+
+	incoming := make([]Rule, 0, len(candidates))
+	for index, candidate := range candidates {
+		rule, err := candidateRule(index, candidate)
 		if err != nil {
-			if os.IsNotExist(err) {
-				// This component (and therefore everything below it) does not exist
-				// yet; there is nothing to follow. Stop walking — no violation.
-				return nil
+			return &FileError{Path: s.path, Reason: FileCandidateInvalid, Err: err}
+		}
+		incoming = append(incoming, rule)
+	}
+
+	directory := filepath.Dir(s.path)
+	if err := os.MkdirAll(directory, dirPerm); err != nil {
+		return &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	if err := s.checkDirectory(directory); err != nil {
+		return err
+	}
+
+	unlock, err := s.acquireLock(ctx, directory)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	existing, err := s.loadFile(false)
+	if err != nil {
+		return err
+	}
+	merged := mergeRules(existing, incoming)
+	encoded, err := encodeFile(merged)
+	if err != nil {
+		return withPath(err, s.path)
+	}
+	if int64(len(encoded)) > s.maxFileBytes {
+		return &FileError{Path: s.path, Reason: FileTooLarge, Err: fmt.Errorf("merged file would be %d bytes (limit %d)", len(encoded), s.maxFileBytes)}
+	}
+	if err := s.replaceFile(directory, encoded); err != nil {
+		return err
+	}
+	s.recordDiagnostics(merged)
+	return nil
+}
+
+// replaceFile performs the owner-only temp write, fsync, atomic rename, and
+// directory fsync. On any failure the temporary file is removed and the
+// prior complete file remains.
+func (s *Store) replaceFile(directory string, encoded []byte) error {
+	temp, err := os.CreateTemp(directory, ".permissions-*.tmp")
+	if err != nil {
+		return &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	tempPath := temp.Name()
+	fail := func(reason FileErrorReason, cause error) error {
+		_ = temp.Close()        // best-effort cleanup; the primary error is reported
+		_ = os.Remove(tempPath) // best-effort cleanup; the prior file is intact
+		return &FileError{Path: s.path, Reason: reason, Err: cause}
+	}
+	if err := temp.Chmod(filePerm); err != nil {
+		return fail(FileIO, err)
+	}
+	if _, err := temp.Write(encoded); err != nil {
+		return fail(FileIO, err)
+	}
+	if err := s.syncFile(temp); err != nil {
+		return fail(FileIO, err)
+	}
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath) // best-effort cleanup; the prior file is intact
+		return &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	if err := s.renameFile(tempPath, s.path); err != nil {
+		_ = os.Remove(tempPath) // best-effort cleanup; the prior file is intact
+		return &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	// #nosec G304 -- directory is the parent of the one consumer-configured
+	// permission-file path, opened only to fsync the completed rename.
+	dir, err := os.OpenFile(directory, os.O_RDONLY, 0)
+	if err != nil {
+		return &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	defer dir.Close()
+	if err := s.syncFile(dir); err != nil {
+		return &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	return nil
+}
+
+// acquireLock takes the per-workspace interprocess lock: an exclusive flock
+// on the sibling lock file, retried non-blocking so ctx cancellation is
+// honored. flock associates the lock with the open file description, so
+// separate Store instances contend correctly whether they live in one
+// process or many.
+func (s *Store) acquireLock(ctx context.Context, directory string) (func(), error) {
+	lockFile, err := os.OpenFile(s.path+lockSuffix, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, filePerm)
+	if err != nil {
+		return nil, &FileError{Path: s.path, Reason: FileLock, Err: err}
+	}
+	for {
+		err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() {
+				// Best-effort release: closing the descriptor also drops the
+				// flock even if the explicit unlock fails.
+				_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+				_ = lockFile.Close()
+			}, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			_ = lockFile.Close() // best-effort cleanup; the lock error is reported
+			return nil, &FileError{Path: s.path, Reason: FileLock, Err: err}
+		}
+		select {
+		case <-ctx.Done():
+			_ = lockFile.Close() // best-effort cleanup; cancellation is reported
+			return nil, &FileError{Path: s.path, Reason: FileLock, Err: ctx.Err()}
+		case <-time.After(lockRetryInterval):
+		}
+	}
+}
+
+// loadFile performs one hardened read of the permission file. required
+// selects the headless-startup behavior where a configured file must
+// exist; an interactive store treats a missing file as an empty rule set.
+func (s *Store) loadFile(required bool) ([]Rule, error) {
+	file, err := os.OpenFile(s.path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			if required {
+				return nil, &FileError{Path: s.path, Reason: FileMissing, Err: err}
 			}
-			return &PolicyStoreError{Path: cur, Reason: "policy path component could not be stat-ed", Err: err}
+			return nil, nil
+		case errors.Is(err, syscall.ELOOP), errors.Is(err, syscall.EMLINK):
+			return nil, &FileError{Path: s.path, Reason: FileSymlink, Err: err}
+		default:
+			return nil, &FileError{Path: s.path, Reason: FileIO, Err: err}
 		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return &PolicyStoreError{Path: cur, Reason: "policy path component is a symlink (refusing to follow)"}
-		}
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	if err := s.checkFileInfo(info); err != nil {
+		return nil, err
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, s.maxFileBytes+1))
+	if err != nil {
+		return nil, &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	if int64(len(data)) > s.maxFileBytes {
+		return nil, &FileError{Path: s.path, Reason: FileTooLarge, Err: fmt.Errorf("file exceeds %d bytes", s.maxFileBytes)}
+	}
+	rules, err := decodeFile(data)
+	if err != nil {
+		return nil, withPath(err, s.path)
+	}
+	return rules, nil
+}
+
+// checkFileInfo enforces the hardening matrix on an opened file: regular
+// type, exact owner-only mode, expected owner, single link, and bounded
+// size. The stat comes from the open descriptor, so the checks bind to the
+// bytes actually read.
+func (s *Store) checkFileInfo(info fs.FileInfo) error {
+	mode := info.Mode()
+	if !mode.IsRegular() {
+		return &FileError{Path: s.path, Reason: FileNotRegular, Err: fmt.Errorf("mode %v is not a regular file", mode)}
+	}
+	if perm := mode.Perm(); perm != filePerm {
+		return &FileError{Path: s.path, Reason: FileModeUnexpected, Err: fmt.Errorf("mode %04o, require exactly %04o", perm, filePerm)}
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return &FileError{Path: s.path, Reason: FileIO, Err: errors.New("underlying stat unavailable")}
+	}
+	if int(stat.Uid) != s.euid {
+		return &FileError{Path: s.path, Reason: FileOwnerUnexpected, Err: fmt.Errorf("owner uid %d, require %d", stat.Uid, s.euid)}
+	}
+	if stat.Nlink != 1 {
+		return &FileError{Path: s.path, Reason: FileLinkCount, Err: fmt.Errorf("link count %d, require 1", stat.Nlink)}
+	}
+	if info.Size() > s.maxFileBytes {
+		return &FileError{Path: s.path, Reason: FileTooLarge, Err: fmt.Errorf("size %d exceeds %d bytes", info.Size(), s.maxFileBytes)}
 	}
 	return nil
 }
 
-// assertHardenedStorePath is the READ-side store-path hardening walk (§3c). In a
-// SINGLE os.Lstat pass over every component from home (exclusive) down to full it
-// rejects, fail-secure, if ANY component is:
-//   - a symlink (don't follow a symlinked ~/.looprig or workspaces/<hash>); or
-//   - a DIRECTORY that is group- or world-writable (mode & 0o022 != 0) — a
-//     non-owner could otherwise have planted/tampered with the approvals.json via
-//     the loose ancestor dir, bypassing the file's own 0600 check.
-//
-// Folding the perm check into the existing symlink walk avoids extra stats and
-// shrinks the TOCTOU surface (one Lstat decides both per component). It is scoped
-// strictly to components UNDER home: home itself (the trust anchor) and anything
-// above it are NEVER inspected. The final component is the approvals FILE; its own
-// regular-file + group/world-writable check is done separately on the open fd by
-// the caller, so the writable check here is applied only to non-final (directory)
-// components. A non-existent component is not a violation (an absent store is
-// normal — the caller handles the missing file); any OTHER Lstat error is.
-func assertHardenedStorePath(home, full string) error {
-	segs, err := storeRelSegments(home, full)
+// checkDirectory rejects a store directory another user could tamper with.
+func (s *Store) checkDirectory(directory string) error {
+	info, err := os.Lstat(directory)
 	if err != nil {
-		return err
+		return &FileError{Path: s.path, Reason: FileIO, Err: err}
 	}
-	cur := home
-	for i, seg := range segs {
-		cur = filepath.Join(cur, seg)
-		fi, err := os.Lstat(cur)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil // absent component (and below) — nothing to follow/check.
+	if !info.IsDir() {
+		return &FileError{Path: s.path, Reason: FileNotRegular, Err: errors.New("store parent is not a directory")}
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return &FileError{Path: s.path, Reason: FileModeUnexpected, Err: fmt.Errorf("store directory mode %04o is group/world writable", perm)}
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return &FileError{Path: s.path, Reason: FileIO, Err: errors.New("underlying stat unavailable")}
+	}
+	if int(stat.Uid) != s.euid {
+		return &FileError{Path: s.path, Reason: FileOwnerUnexpected, Err: fmt.Errorf("store directory owner uid %d, require %d", stat.Uid, s.euid)}
+	}
+	return nil
+}
+
+// mergeRules appends the incoming rules that are not already present,
+// preserving every existing record (including denies) untouched.
+func mergeRules(existing, incoming []Rule) []Rule {
+	merged := append([]Rule(nil), existing...)
+	seen := make(map[string]struct{}, len(existing))
+	for _, rule := range existing {
+		seen[rule.identity()] = struct{}{}
+	}
+	for _, rule := range incoming {
+		key := rule.identity()
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, rule)
+	}
+	return merged
+}
+
+// withPath attaches the store path to a codec FileError.
+func withPath(err error, path string) error {
+	var fileErr *FileError
+	if errors.As(err, &fileErr) && fileErr.Path == "" {
+		fileErr.Path = path
+	}
+	return err
+}
+
+// candidateRule converts one displayed, validated allow candidate into its
+// durable schema-v2 record. The conversion is strict: an unsupported kind,
+// syntax, or grant pairing rejects the whole batch and nothing persists.
+func candidateRule(index int, candidate tool.RuleCandidate) (Rule, error) {
+	rule := Rule{Effect: EffectAllow, Capability: candidate.Kind}
+	switch candidate.Kind {
+	case CapabilityCommandExecute:
+		if candidate.GrantClass != GrantClassCommandStart {
+			return Rule{}, &RuleError{Index: index, Reason: "command candidate requires grant class " + GrantClassCommandStart}
+		}
+		return commandCandidateRule(index, rule, candidate.Match)
+	case CapabilityNetwork:
+		switch candidate.GrantClass {
+		case "", GrantClassNetworkProxyTarget:
+			transport, host, port, ok := parseNetworkTargetMatch(candidate.Match)
+			if !ok {
+				return Rule{}, &RuleError{Index: index, Reason: "network candidate match is not a canonical target"}
 			}
-			return &PolicyStoreError{Path: cur, Reason: "policy path component could not be stat-ed", Err: err}
+			rule.Class, rule.Transport, rule.Host, rule.Port = ClassNetworkTarget, transport, host, port
+		case ClassNetworkBroad:
+			bound, ok := parseCommandBoundMatch(candidate.Match)
+			if !ok || bound.Target != candidate.GrantTarget {
+				return Rule{}, &RuleError{Index: index, Reason: "broad egress candidate match is not command-bound"}
+			}
+			rule.Class, rule.Command, rule.Target = ClassNetworkBroad, bound.Command, bound.Target
+		default:
+			return Rule{}, &RuleError{Index: index, Reason: "unsupported network grant class " + candidate.GrantClass}
 		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return &PolicyStoreError{Path: cur, Reason: "policy path component is a symlink (refusing to follow)"}
+	case CapabilityFilesystemRead, CapabilityFilesystemWrite:
+		return filesystemCandidateRule(index, rule, candidate)
+	default:
+		return Rule{}, &RuleError{Index: index, Reason: "capability " + candidate.Kind + " has no durable rule representation"}
+	}
+	if err := rule.validate(index); err != nil {
+		return Rule{}, err
+	}
+	return rule, nil
+}
+
+// commandCandidateRule parses the command candidate display syntax:
+// Bash(*), Bash(tokens:*), or an exact normalized command. The stored
+// canonical representation is structured; a raw string prefix is never
+// stored.
+func commandCandidateRule(index int, rule Rule, match string) (Rule, error) {
+	switch {
+	case match == "Bash(*)":
+		rule.Class = ClassCommandInvokeWildcard
+	case strings.HasPrefix(match, "Bash(") && strings.HasSuffix(match, ":*)"):
+		body := strings.TrimSuffix(strings.TrimPrefix(match, "Bash("), ":*)")
+		tokens := strings.Fields(body)
+		if err := validateFamilyTokens(tokens); err != nil {
+			return Rule{}, &RuleError{Index: index, Reason: "family candidate rejected: " + err.Error()}
 		}
-		// The final segment is the approvals FILE — its perms are checked on the
-		// open fd by the caller. Every non-final segment is a store DIRECTORY: a
-		// group/world-writable bit on it is a store-poisoning vector.
-		if i < len(segs)-1 && fi.Mode().Perm()&groupWorldWritable != 0 {
-			return &PolicyStoreError{Path: cur, Reason: "policy path directory component is group- or world-writable"}
+		if strings.Join(tokens, " ") != body {
+			return Rule{}, &RuleError{Index: index, Reason: "family candidate is not a normalized token sequence"}
 		}
+		rule.Class, rule.Tokens, rule.TrailingArguments = ClassCommandInvokeFamily, tokens, true
+	case strings.HasPrefix(match, "Bash("):
+		return Rule{}, &RuleError{Index: index, Reason: "unsupported Bash(...) candidate syntax"}
+	default:
+		rule.Class, rule.Command = ClassCommandInvoke, match
 	}
-	return nil
+	if err := rule.validate(index); err != nil {
+		return Rule{}, err
+	}
+	return rule, nil
 }
 
-// mkdirStoreDir creates dir (and any missing parents up to home) at 0700 and then
-// tightens EVERY store-owned component UNDER home to exactly 0700 — not just the
-// leaf. MkdirAll honours the umask (which may have stripped group/other bits) but
-// an EXISTING component keeps its old (possibly group/world-writable) mode, so a
-// pre-existing loose ~/.looprig or ~/.looprig/workspaces would otherwise survive and
-// let a non-owner plant a poisoned approvals.json. We therefore chmod each
-// component from the shallowest store dir DOWN to dir. base (the resolved home)
-// is the trust anchor: it (and anything above it) is NEVER chmod-ed. A chmod
-// failure on any component — e.g. EPERM because an ancestor is owned by another
-// user, the attack signal — is a typed error and Grant writes nothing.
-func mkdirStoreDir(home, dir string) error {
-	if err := os.MkdirAll(dir, storeDirPerm); err != nil {
-		return &PolicyStoreError{Path: dir, Reason: "could not create policy store directory", Err: err}
-	}
-	segs, err := storeRelSegments(home, dir)
-	if err != nil {
-		return err
-	}
-	// Walk each store-owned component from home DOWN to the leaf and force 0700.
-	cur := home
-	for _, seg := range segs {
-		cur = filepath.Join(cur, seg)
-		if err := os.Chmod(cur, storeDirPerm); err != nil {
-			return &PolicyStoreError{Path: cur, Reason: "could not set policy store directory mode", Err: err}
+// filesystemCandidateRule converts path, tree, and command-bound host
+// candidates.
+func filesystemCandidateRule(index int, rule Rule, candidate tool.RuleCandidate) (Rule, error) {
+	write := candidate.Kind == CapabilityFilesystemWrite
+	pick := func(read, writeClass string) string {
+		if write {
+			return writeClass
 		}
+		return read
 	}
-	return nil
-}
-
-// writeApprovalsFileAtomically serializes af and writes it to finalPath via a
-// temp-file-in-the-same-dir + Rename, with the §3c hardening:
-//   - the temp file is opened O_CREATE|O_EXCL|O_WRONLY|O_NOFOLLOW at 0600, so a
-//     pre-planted symlink/temp cannot be followed or clobbered;
-//   - the bytes are fsync'd before close so the rename publishes durable content;
-//   - on ANY failure after creation the temp file is removed (no litter, no
-//     half-written file left readable);
-//   - os.Rename is atomic within a directory, so a concurrent reader sees either
-//     the old file or the new one, never a partial write.
-//
-// dir (finalPath's directory) must already exist and be hardened by the caller.
-func writeApprovalsFileAtomically(dir, finalPath string, af ApprovalsFile) error {
-	data, err := marshalApprovals(af)
-	if err != nil {
-		return err
+	switch candidate.GrantClass {
+	case ClassFilesystemHostRead, ClassFilesystemHostWrite:
+		if candidate.GrantClass != pick(ClassFilesystemHostRead, ClassFilesystemHostWrite) {
+			return Rule{}, &RuleError{Index: index, Reason: "host grant class direction does not match capability"}
+		}
+		bound, ok := parseCommandBoundMatch(candidate.Match)
+		if !ok || bound.Target != "" {
+			return Rule{}, &RuleError{Index: index, Reason: "host filesystem candidate match is not command-bound"}
+		}
+		rule.Class, rule.Command = candidate.GrantClass, bound.Command
+	case "", ClassFilesystemPathRead, ClassFilesystemPathWrite, ClassFilesystemTreeRead, ClassFilesystemTreeWrite:
+		if root, isTree := strings.CutPrefix(candidate.Match, "tree:"); isTree {
+			rule.Class, rule.Root = pick(ClassFilesystemTreeRead, ClassFilesystemTreeWrite), root
+		} else {
+			rule.Class, rule.Path = pick(ClassFilesystemPathRead, ClassFilesystemPathWrite), candidate.Match
+		}
+	default:
+		return Rule{}, &RuleError{Index: index, Reason: "unsupported filesystem grant class " + candidate.GrantClass}
 	}
-
-	// A unique temp name in the SAME dir (so Rename stays on one filesystem).
-	tmp, err := uniqueTempPath(dir)
-	if err != nil {
-		return err
+	if err := rule.validate(index); err != nil {
+		return Rule{}, err
 	}
-
-	// #nosec G304 -- tmp = dir (trusted home + fixed store names + a sha256 hash) +
-	// a crypto/rand suffix; NOT user input. O_EXCL|O_NOFOLLOW additionally refuse to
-	// follow or clobber a pre-planted symlink/file (the §3c write hardening).
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, storeFilePerm)
-	if err != nil {
-		return &PolicyStoreError{Path: tmp, Reason: "could not create temp approvals file", Err: err}
-	}
-	// From here on, any failure must remove the temp file.
-	if err := writeSyncClose(f, data); err != nil {
-		_ = os.Remove(tmp)
-		return &PolicyStoreError{Path: tmp, Reason: "could not write temp approvals file", Err: err}
-	}
-	if err := os.Rename(tmp, finalPath); err != nil {
-		_ = os.Remove(tmp)
-		return &PolicyStoreError{Path: finalPath, Reason: "could not rename temp approvals file into place", Err: err}
-	}
-	return nil
-}
-
-// writeSyncClose writes data to f, fsyncs, and closes it. It returns the first
-// error encountered; Close is always attempted so the fd is not leaked.
-func writeSyncClose(f *os.File, data []byte) error {
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-// uniqueTempPath returns a never-before-used temp file path in dir using a
-// crypto/rand suffix (collision-resistant; O_EXCL still guards the create). It
-// does NOT create the file — the caller opens it O_EXCL|O_NOFOLLOW.
-func uniqueTempPath(dir string) (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", &PolicyStoreError{Path: dir, Reason: "could not generate temp file name", Err: err}
-	}
-	return filepath.Join(dir, ".approvals-"+hex.EncodeToString(b[:])+".tmp"), nil
-}
-
-// marshalApprovals serializes an ApprovalsFile to indented JSON (human-editable
-// store). A marshal error (e.g. an out-of-range Effect via Effect.MarshalJSON) is
-// returned typed so Grant fails secure without writing.
-func marshalApprovals(af ApprovalsFile) ([]byte, error) {
-	data, err := json.MarshalIndent(af, "", "  ")
-	if err != nil {
-		return nil, &PolicyStoreError{Path: "", Reason: "could not marshal approvals", Err: err}
-	}
-	return data, nil
-}
-
-// PolicyStoreError is the typed failure for a policy-store WRITE or a hardening
-// violation (a symlinked path component, an unresolvable home dir during Grant, a
-// directory-creation/temp-write/rename failure). It is fail-secure: Grant returns
-// it WITHOUT having persisted anything to a wrong place. Path names the offending
-// path (never file contents).
-type PolicyStoreError struct {
-	Path   string // the offending store path (never contents)
-	Reason string // non-secret, human-readable reason
-	Err    error  // underlying cause, may be nil
-}
-
-func (e *PolicyStoreError) Error() string {
-	if e.Err != nil {
-		return "tools: policy store error: " + e.Reason + " (path=" + e.Path + "): " + e.Err.Error()
-	}
-	return "tools: policy store error: " + e.Reason + " (path=" + e.Path + ")"
-}
-
-func (e *PolicyStoreError) Unwrap() error { return e.Err }
-
-// UnsupportedScopeError is the typed failure Grant returns for a scope it will
-// not persist: ScopeOnce (the runner never passes it — it persists nothing by
-// definition) or any out-of-range ApprovalScope value. It is fail-secure: Grant
-// returns it WITHOUT writing a file or adding a session policy.
-type UnsupportedScopeError struct {
-	Scope uint8 // the offending ApprovalScope value
-}
-
-func (e *UnsupportedScopeError) Error() string {
-	return "tools: Grant does not persist this approval scope: " + strconv.Itoa(int(e.Scope))
+	return rule, nil
 }

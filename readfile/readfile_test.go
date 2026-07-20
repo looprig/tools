@@ -230,9 +230,6 @@ func TestReadFileAuditSummary(t *testing.T) {
 func TestReadFileCapabilities(t *testing.T) {
 	t.Parallel()
 	var it tool.InvokableTool = NewReadFile(t.TempDir(), newFakeReadGuard(1<<20), tool.NewWorkspaceObservations())
-	if _, ok := it.(tool.PermissionPrompter); ok {
-		t.Error("ReadFile must not implement PermissionPrompter (AutoApprove)")
-	}
 	if _, ok := it.(tool.Auditable); !ok {
 		t.Error("ReadFile must implement Auditable")
 	}

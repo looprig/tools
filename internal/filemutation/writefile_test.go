@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/readfile"
 )
 
@@ -275,31 +274,8 @@ func TestWriteFileWriteTarget(t *testing.T) {
 	}
 }
 
-func TestWriteFileBuildRequest(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	wf := NewWriteFile(root, newFileObservations())
-
-	req, err := wf.BuildRequest(`{"path":"sub/x.txt","content":"secret-content-here"}`, nil)
-	if err != nil {
-		t.Fatalf("BuildRequest err = %v", err)
-	}
-	fw, ok := req.(tool.FileWriteRequest)
-	if !ok {
-		t.Fatalf("request type = %T, want tool.FileWriteRequest", req)
-	}
-	want := resolvedJoin(t, root, filepath.Join("sub", "x.txt"))
-	if fw.Path != want {
-		t.Errorf("FileWriteRequest.Path = %q, want %q", fw.Path, want)
-	}
-	if strings.Contains(fw.Description(), "secret-content-here") {
-		t.Errorf("request Description leaked content: %q", fw.Description())
-	}
-
-	if _, err := wf.BuildRequest(`{"path":"../escape","content":"x"}`, nil); err == nil {
-		t.Errorf("BuildRequest(escape) err = nil, want non-nil")
-	}
-}
+// Interim: the legacy gate-seam tests here were removed with the old harness
+// prompt contracts; Task 3.3 adds PrepareCall coverage.
 
 func TestWriteFileAuditSummary(t *testing.T) {
 	t.Parallel()

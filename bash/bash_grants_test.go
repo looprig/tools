@@ -70,16 +70,14 @@ func runBashCtx(t *testing.T, ctx context.Context, b *BashTool, args map[string]
 	return tb.Text
 }
 
-// TestBashGrantDispatch exercises the merge + GrantedRunner routing: grants from
-// the args, from the ctx (via tool.WithGrants), and both merged (union, dedup,
-// order-stable, args first). No grants → the plain RunCommand path (never the
-// grants method).
+// TestBashGrantDispatch exercises the args-grant + GrantedRunner routing. The
+// ambient ctx-grant seam was removed with the old harness gate; Task 3.4 moves
+// post-decision grants onto the prepared execution path.
 func TestBashGrantDispatch(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name        string
 		argsGrants  []string // nil => omit the "grants" arg entirely
-		ctxGrants   []string // nil => don't call tool.WithGrants
 		wantGranted bool     // expect RunCommandWithGrants (not RunCommand)
 		wantGrants  []string // tokens the grants method should receive
 	}{
@@ -88,19 +86,6 @@ func TestBashGrantDispatch(t *testing.T) {
 			argsGrants:  []string{"tok-a"},
 			wantGranted: true,
 			wantGrants:  []string{"tok-a"},
-		},
-		{
-			name:        "ctx grants are merged in",
-			ctxGrants:   []string{"tok-ctx"},
-			wantGranted: true,
-			wantGrants:  []string{"tok-ctx"},
-		},
-		{
-			name:        "args and ctx union, dedup, args first",
-			argsGrants:  []string{"tok-a", "tok-b"},
-			ctxGrants:   []string{"tok-b", "tok-c"},
-			wantGranted: true,
-			wantGrants:  []string{"tok-a", "tok-b", "tok-c"},
 		},
 		{
 			name:        "duplicate args grants are de-duplicated",
@@ -127,9 +112,6 @@ func TestBashGrantDispatch(t *testing.T) {
 			b := NewBash(root, WithRunner(fake))
 
 			ctx := context.Background()
-			if tt.ctxGrants != nil {
-				ctx = tool.WithGrants(ctx, tt.ctxGrants)
-			}
 			args := map[string]any{"command": "echo hi"}
 			if tt.argsGrants != nil {
 				args["grants"] = tt.argsGrants

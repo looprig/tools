@@ -110,15 +110,11 @@ func (e *EditFile) AuditSummary(argsJSON string) string {
 	return "EditFile " + a.Path
 }
 
-// BuildRequest derives the approval prompt (the resolved path only — never the
-// substrings). An unparseable args document or an escaping path is a typed error.
-func (e *EditFile) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
-	abs, err := e.resolveEditPath(argsJSON)
-	if err != nil {
-		return nil, err
-	}
-	return tool.FileWriteRequest{Path: abs}, nil
-}
+// Interim (replaced in Task 3.3): the legacy BuildRequest/PermissionPrompter
+// prompt seam was removed with the old harness gate. Until Task 3.3 adds
+// PrepareCall emitting the filesystem.write requirement for the resolved
+// canonical path, EditFile is an unprepared effectful tool and the harness
+// runner fails closed: the call is never evaluated or executed.
 
 // WriteTarget returns the resolved edit path as the serialization key (an edit is
 // a write). ok is true for a well-formed call; a non-nil err (bad args/escape)
@@ -317,11 +313,10 @@ func isSymlinkLoop(err error) bool {
 	return errors.Is(err, syscall.ELOOP)
 }
 
-// compile-time assertions: EditFile is an InvokableTool, a PermissionPrompter
-// (Ask), Auditable, and a WriteTarget.
+// compile-time assertions: EditFile is an InvokableTool, Auditable, and a
+// WriteTarget.
 var (
-	_ tool.InvokableTool      = (*EditFile)(nil)
-	_ tool.PermissionPrompter = (*EditFile)(nil)
-	_ tool.Auditable          = (*EditFile)(nil)
-	_ tool.WriteTarget        = (*EditFile)(nil)
+	_ tool.InvokableTool = (*EditFile)(nil)
+	_ tool.Auditable     = (*EditFile)(nil)
+	_ tool.WriteTarget   = (*EditFile)(nil)
 )

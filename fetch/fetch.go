@@ -143,17 +143,11 @@ func (f *Fetch) AuditSummary(argsJSON string) string {
 	return method + " " + host
 }
 
-// BuildRequest derives the approval prompt: the method + full URL (the user
-// approves the exact target). An unparseable args document, a missing/invalid
-// URL, or an unsupported method is a typed error so the runner treats the call as
-// invalid (and never prompts with a malformed request).
-func (f *Fetch) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
-	a, method, _, err := parseFetchArgs(argsJSON)
-	if err != nil {
-		return nil, err
-	}
-	return tool.FetchRequest{Method: method, URL: a.URL}, nil
-}
+// Interim (replaced in Task 3.4): the legacy BuildRequest/PermissionPrompter
+// prompt seam was removed with the old harness gate. Until Task 3.4 adds
+// PrepareCall emitting the shared network requirement, Fetch is an unprepared
+// effectful tool and the harness runner fails closed: the call is never
+// evaluated or executed.
 
 // InvokableRun performs the request and returns status + header summary + capped
 // body as a tool result. Every failure mode (parse, validation, transport,
@@ -335,11 +329,9 @@ func (e *fetchError) Error() string { return e.reason }
 
 func (e *fetchError) Unwrap() error { return e.cause }
 
-// compile-time assertions: Fetch is an InvokableTool, a PermissionPrompter (Ask),
-// and Auditable. It is NOT a WriteTarget (it is a network tool, not a path-write
-// tool).
+// compile-time assertions: Fetch is an InvokableTool and Auditable. It is NOT a
+// WriteTarget (it is a network tool, not a path-write tool).
 var (
-	_ tool.InvokableTool      = (*Fetch)(nil)
-	_ tool.PermissionPrompter = (*Fetch)(nil)
-	_ tool.Auditable          = (*Fetch)(nil)
+	_ tool.InvokableTool = (*Fetch)(nil)
+	_ tool.Auditable     = (*Fetch)(nil)
 )

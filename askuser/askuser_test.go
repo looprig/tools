@@ -70,9 +70,6 @@ func TestAskUserAuditSummary(t *testing.T) {
 func TestAskUserNotPermissionPrompter(t *testing.T) {
 	t.Parallel()
 	var ti tool.InvokableTool = NewAskUser()
-	if _, ok := ti.(tool.PermissionPrompter); ok {
-		t.Error("AskUser must NOT implement PermissionPrompter (it is AutoApprove)")
-	}
 	if _, ok := ti.(tool.Auditable); !ok {
 		t.Error("AskUser should implement Auditable")
 	}

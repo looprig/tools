@@ -108,16 +108,11 @@ func (w *WebSearch) AuditSummary(argsJSON string) string {
 	return "WebSearch: " + a.Query
 }
 
-// BuildRequest derives the approval prompt: the query string. An unparseable args
-// document or an empty query is a typed error so the runner treats the call as
-// invalid.
-func (w *WebSearch) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
-	a, err := parseWebSearchArgs(argsJSON)
-	if err != nil {
-		return nil, err
-	}
-	return tool.WebSearchRequest{Query: a.Query}, nil
-}
+// Interim (replaced in Task 3.4): the legacy BuildRequest/PermissionPrompter
+// prompt seam was removed with the old harness gate. Until Task 3.4 adds
+// PrepareCall emitting each provider's endpoint network requirements,
+// WebSearch is an unprepared effectful tool and the harness runner fails
+// closed: the call is never evaluated or executed.
 
 // InvokableRun validates the args, clamps the result count, calls the provider
 // under ctx, and formats the results. A parse error, empty query, or provider
@@ -199,10 +194,9 @@ func (e *webSearchError) Error() string { return e.reason }
 
 func (e *webSearchError) Unwrap() error { return e.cause }
 
-// compile-time assertions: WebSearch is an InvokableTool, a PermissionPrompter
-// (Ask), and Auditable. It is NOT a WriteTarget.
+// compile-time assertions: WebSearch is an InvokableTool and Auditable. It is
+// NOT a WriteTarget.
 var (
-	_ tool.InvokableTool      = (*WebSearch)(nil)
-	_ tool.PermissionPrompter = (*WebSearch)(nil)
-	_ tool.Auditable          = (*WebSearch)(nil)
+	_ tool.InvokableTool = (*WebSearch)(nil)
+	_ tool.Auditable     = (*WebSearch)(nil)
 )

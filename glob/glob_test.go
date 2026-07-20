@@ -264,9 +264,6 @@ func TestGlobAuditSummary(t *testing.T) {
 func TestGlobCapabilities(t *testing.T) {
 	t.Parallel()
 	var it tool.InvokableTool = NewGlob(t.TempDir(), newFakeReadGuard(1<<20))
-	if _, ok := it.(tool.PermissionPrompter); ok {
-		t.Error("Glob must not implement PermissionPrompter (AutoApprove)")
-	}
 	if _, ok := it.(tool.Auditable); !ok {
 		t.Error("Glob must implement Auditable")
 	}
