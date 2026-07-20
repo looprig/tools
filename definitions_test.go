@@ -90,6 +90,7 @@ func TestDefinitionDependencyValidation(t *testing.T) {
 	var typedNilGuard *fakeReadGuard
 	var typedNilRunner *definitionRunner
 	var typedNilProvider *definitionProvider
+	var typedNilClient *http.Client
 	tests := []struct {
 		name       string
 		definition tool.Definition
@@ -101,6 +102,8 @@ func TestDefinitionDependencyValidation(t *testing.T) {
 		{name: "typed nil runner", definition: Bash(bash.WithRunner(typedNilRunner)), dependency: "runner"},
 		{name: "nil search provider", definition: WebSearchDefinition(nil), dependency: "provider"},
 		{name: "typed nil search provider", definition: WebSearchDefinition(typedNilProvider), dependency: "provider"},
+		{name: "nil fetch client", definition: FetchDefinition(nil), dependency: "client"},
+		{name: "typed nil fetch client", definition: FetchDefinition(typedNilClient), dependency: "client"},
 	}
 	for _, test := range tests {
 		test := test

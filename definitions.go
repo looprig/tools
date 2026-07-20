@@ -66,6 +66,9 @@ func WebSearchDefinition(provider websearch.SearchProvider) tool.Definition {
 
 func FetchDefinition(client *http.Client) tool.Definition {
 	return tool.NewDefinition("Fetch", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		if workspace.IsNil(client) {
+			return nil, &DefinitionBuildError{Definition: "Fetch", Dependency: "client"}
+		}
 		return []tool.InvokableTool{fetch.NewFetch(client)}, nil
 	})
 }
