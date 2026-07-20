@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/looprig/core/content"
 )
 
 // runEditFile invokes EditFile (bound to the given per-loop observation map) and
@@ -21,18 +19,7 @@ func runEditFile(t *testing.T, root string, obs *fileObservations, args map[stri
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
 	}
-	res, err := NewEditFile(root, obs).InvokableRun(context.Background(), string(b))
-	if err != nil {
-		t.Fatalf("InvokableRun returned a Go error %v; edit tool returns tool-result strings", err)
-	}
-	if res == nil || len(res.Content) != 1 {
-		t.Fatalf("result = %v, want exactly 1 block", res)
-	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	return tb.Text
+	return prepareRun(context.Background(), t, NewEditFile(root, obs), string(b))
 }
 
 func TestEditFileInfo(t *testing.T) {

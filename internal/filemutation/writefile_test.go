@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/looprig/core/content"
 	"github.com/looprig/tools/readfile"
 )
 
@@ -23,18 +22,7 @@ func runWriteFile(t *testing.T, root string, obs *fileObservations, args map[str
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
 	}
-	res, err := NewWriteFile(root, obs).InvokableRun(context.Background(), string(b))
-	if err != nil {
-		t.Fatalf("InvokableRun returned a Go error %v; write tools return tool-result strings", err)
-	}
-	if res == nil || len(res.Content) != 1 {
-		t.Fatalf("result = %v, want exactly 1 block", res)
-	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	return tb.Text
+	return prepareRun(context.Background(), t, NewWriteFile(root, obs), string(b))
 }
 
 // observeFile runs a real ReadFile bound to obs so a subsequent WriteFile/EditFile
@@ -46,11 +34,7 @@ func observeFile(t *testing.T, root string, obs *fileObservations, rel string) {
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
 	}
-	res, err := readfile.NewReadFile(root, newFakeReadGuard(1<<20), obs).InvokableRun(context.Background(), string(b))
-	if err != nil {
-		t.Fatalf("observe read Go error: %v", err)
-	}
-	if got := res.Content[0].(*content.TextBlock).Text; strings.HasPrefix(got, "error:") {
+	if got := prepareRun(context.Background(), t, readfile.NewReadFile(root, newFakeReadGuard(1<<20), obs), string(b)); strings.HasPrefix(got, "error:") {
 		t.Fatalf("observe read of %q failed: %q", rel, got)
 	}
 }

@@ -113,7 +113,7 @@ func TestWriteFileAcquiresPathPermit(t *testing.T) {
 	coord := &recordingCoordinator{}
 	w := NewWriteFile(root, obs, WithMutationCoordinator(coord))
 
-	if _, err := w.InvokableRun(context.Background(), mustJSON(t, writeFileArgs{Path: "f.txt", Content: "hello"})); err != nil {
+	if _, err := invokePrepared(context.Background(), t, w, mustJSON(t, writeFileArgs{Path: "f.txt", Content: "hello"})); err != nil {
 		t.Fatalf("InvokableRun() error = %v", err)
 	}
 	if b, rerr := os.ReadFile(filepath.Join(root, "f.txt")); rerr != nil || string(b) != "hello" {
@@ -146,7 +146,7 @@ func TestWriteFileUnhealthyLeaseBlocksCommit(t *testing.T) {
 	coord := &recordingCoordinator{healthErr: errors.New("lease expired")}
 	w := NewWriteFile(root, obs, WithMutationCoordinator(coord))
 
-	res, err := w.InvokableRun(context.Background(), mustJSON(t, writeFileArgs{Path: "f.txt", Content: "replacement"}))
+	res, err := invokePrepared(context.Background(), t, w, mustJSON(t, writeFileArgs{Path: "f.txt", Content: "replacement"}))
 	if err != nil {
 		t.Fatalf("InvokableRun() error = %v", err)
 	}
@@ -177,7 +177,7 @@ func TestWriteFileCanceledCtxBlocksCommit(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	res, err := w.InvokableRun(ctx, mustJSON(t, writeFileArgs{Path: "f.txt", Content: "replacement"}))
+	res, err := invokePrepared(ctx, t, w, mustJSON(t, writeFileArgs{Path: "f.txt", Content: "replacement"}))
 	if err != nil {
 		t.Fatalf("InvokableRun() error = %v", err)
 	}
@@ -205,11 +205,11 @@ func TestEditFileAcquiresPathPermit(t *testing.T) {
 	coord := &recordingCoordinator{}
 	// Record a complete observation via a ReadFile so the edit is authorized.
 	rf := readfile.NewReadFile(root, newFakeReadGuard(1<<20), obs)
-	if _, err := rf.InvokableRun(context.Background(), mustJSON(t, map[string]string{"path": "f.txt"})); err != nil {
+	if _, err := invokePrepared(context.Background(), t, rf, mustJSON(t, map[string]string{"path": "f.txt"})); err != nil {
 		t.Fatalf("ReadFile error = %v", err)
 	}
 	ef := NewEditFile(root, obs, WithMutationCoordinator(coord))
-	if _, err := ef.InvokableRun(context.Background(), mustJSON(t, editFileArgs{Path: "f.txt", Old: "alpha", New: "beta"})); err != nil {
+	if _, err := invokePrepared(context.Background(), t, ef, mustJSON(t, editFileArgs{Path: "f.txt", Old: "alpha", New: "beta"})); err != nil {
 		t.Fatalf("EditFile error = %v", err)
 	}
 	if b, _ := os.ReadFile(target); string(b) != "beta" {
@@ -306,7 +306,7 @@ func TestFileToolsAndBashShareObservations(t *testing.T) {
 	bashTool := bash.NewBash(root, bash.WithWorkspaceCoordinator(coord), bash.WithObservations(shared))
 
 	// Read records a complete observation, so an immediate overwrite is authorized.
-	if _, err := read.InvokableRun(context.Background(), mustJSON(t, map[string]string{"path": "f.txt"})); err != nil {
+	if _, err := invokePrepared(context.Background(), t, read, mustJSON(t, map[string]string{"path": "f.txt"})); err != nil {
 		t.Fatalf("ReadFile error = %v", err)
 	}
 	// Bash runs and (sharing the same observation set) invalidates that observation.
@@ -314,7 +314,7 @@ func TestFileToolsAndBashShareObservations(t *testing.T) {
 		t.Fatalf("Bash error = %v", err)
 	}
 	// The overwrite is now refused as stale (the shared observation was cleared by Bash).
-	res, err := write.InvokableRun(context.Background(), mustJSON(t, writeFileArgs{Path: "f.txt", Content: "v2"}))
+	res, err := invokePrepared(context.Background(), t, write, mustJSON(t, writeFileArgs{Path: "f.txt", Content: "v2"}))
 	if err != nil {
 		t.Fatalf("WriteFile error = %v", err)
 	}

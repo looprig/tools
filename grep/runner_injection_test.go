@@ -41,7 +41,7 @@ func TestGrepWithArgvRunnerRoutesArgv(t *testing.T) {
 	absA := resolvedJoin(t, root, "a.go")
 	runner := &fakeArgvRunner{out: []byte(absA + ":2:func target() {}\n")}
 	grep := newGrepWithBackend(root, newFakeReadGuard(1<<20), true, WithArgvRunner(runner))
-	result, err := grep.InvokableRun(context.Background(), `{"pattern":"target"}`)
+	result, err := invokePreparedGrep(context.Background(), t, grep, `{"pattern":"target"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestGrepWithArgvRunnerTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	grep := newGrepWithBackend(root, newFakeReadGuard(1<<20), true, WithArgvRunner(&fakeArgvRunner{err: context.Canceled}))
-	result, err := grep.InvokableRun(ctx, `{"pattern":"findme"}`)
+	result, err := invokePreparedGrep(ctx, t, grep, `{"pattern":"findme"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestGrepNilArgvRunnerDirectExec(t *testing.T) {
 	if grep.argvRunner != nil {
 		t.Fatal("nil runner should preserve direct execution")
 	}
-	result, err := grep.InvokableRun(context.Background(), `{"pattern":"target"}`)
+	result, err := invokePreparedGrep(context.Background(), t, grep, `{"pattern":"target"}`)
 	if err != nil {
 		t.Fatal(err)
 	}

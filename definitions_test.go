@@ -173,3 +173,34 @@ func blueprintBindings() tool.Bindings {
 }
 
 var _ loop.ReadGuard = (*fakeReadGuard)(nil)
+
+// TestDefinitionToolsArePrepared proves every file/context/utility tool built
+// from the public definitions implements the mandatory preparation capability
+// (tool.CallPreparer) — an effectful tool without it fails closed in the
+// runner and a pure tool without it would be unusable. Bash, Fetch, and
+// WebSearch gain preparation in their own network-preparation change and are
+// deliberately not asserted here.
+func TestDefinitionToolsArePrepared(t *testing.T) {
+	t.Parallel()
+	guard := &fakeReadGuard{maxBytes: 1024}
+	definitions := []tool.Definition{
+		ReadFileDefinition(guard),
+		WriteFileDefinition(),
+		EditFileDefinition(),
+		GlobDefinition(guard),
+		GrepDefinition(guard),
+		TodoDefinition(),
+		AskUserDefinition(),
+	}
+	for _, definition := range definitions {
+		built, err := definition.Build(context.Background(), blueprintBindings())
+		if err != nil {
+			t.Fatalf("%s: Build() error = %v", definition.Name(), err)
+		}
+		for _, builtTool := range built {
+			if _, ok := builtTool.(tool.CallPreparer); !ok {
+				t.Errorf("%s: built tool %T does not implement tool.CallPreparer", definition.Name(), builtTool)
+			}
+		}
+	}
+}

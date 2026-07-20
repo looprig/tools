@@ -18,8 +18,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/prepared"
 	"github.com/looprig/tools/internal/workspace"
 )
 
@@ -29,9 +31,11 @@ import (
 // scan. Denied-path enforcement is TWO-LAYER (design §4b note): a best-effort
 // noise/secret `rg --glob '!…'` skip for performance, BACKSTOPPED by an
 // authoritative DeniedRead filter on every emitted result path (the rg path) and
-// directly during traversal (the WalkDir path). AutoApprove; Auditable.
+// directly during traversal (the WalkDir path). It is a CallPreparer
+// (PrepareCall emits ONE direct filesystem.read requirement for the canonical
+// walked root, with the tree Match encoding) and Auditable.
 
-// grepToolName is the EXACT tool name classifyTool keys on for the read class.
+// grepToolName is the EXACT tool name — it MUST equal "Grep".
 const grepToolName = "Grep"
 
 const defaultSearchDir = "."
@@ -83,9 +87,7 @@ var grepNoiseDirs = map[string]bool{
 	".vscode":      true,
 }
 
-// grepSchema is the JSON Schema for Grep's args. Field names (pattern/path/…) are
-// the boundary-extraction contract shared with check.go (which parses "pattern"
-// and "path").
+// grepSchema is the JSON Schema for Grep's args.
 const grepSchema = `{
   "type": "object",
   "properties": {
@@ -181,46 +183,105 @@ func (g *Grep) AuditSummary(argsJSON string) string {
 	return "Grep " + a.Pattern
 }
 
-// InvokableRun validates args, contains the search path, compiles the pattern,
-// runs the chosen backend, and renders capped, denied-filtered matches. Every
-// failure is a tool-result string.
-func (g *Grep) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+// grepArtifact is Grep's typed prepared artifact: the validated pattern (raw
+// and compiled), the canonicalized walk root, and the normalized options,
+// bound to one call by PrepareCall and consumed by InvokableRun without
+// reparsing the raw JSON. It deliberately embeds tool.TokenArtifact to satisfy
+// the sealed tool.PreparedArtifact marker.
+type grepArtifact struct {
+	tool.TokenArtifact
+	pattern      string // raw pattern (rg backend)
+	re           *regexp.Regexp
+	searchRel    string // model-supplied search path (display + run-time re-check)
+	searchAbs    string // canonical resolved walk root (requirement Scope)
+	resolvedRoot string // canonical workspace root (relative-path anchor)
+	opts         grepOptions
+}
+
+// prepareGrep is the SINGLE parse-validate-canonicalize step for a Grep call:
+// it decodes the args, validates the option shapes, compiles the pattern, and
+// contains the search root.
+func (g *Grep) prepareGrep(argsJSON string) (*grepArtifact, error) {
 	var a grepArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
+		return nil, &grepError{reason: "invalid arguments: not a JSON object", cause: err}
 	}
 	if a.Pattern == "" {
-		return tool.TextResult("error: a non-empty 'pattern' is required"), nil
+		return nil, &grepError{reason: "a non-empty 'pattern' is required"}
 	}
 	if a.ContextLines < 0 {
-		return tool.TextResult("error: context_lines must be >= 0"), nil
+		return nil, &grepError{reason: "context_lines must be >= 0"}
 	}
-
 	searchRel := a.Path
 	if searchRel == "" {
 		searchRel = defaultSearchDir
 	}
 	searchAbs, err := workspace.ContainedPath(g.root, searchRel)
 	if err != nil {
-		return tool.TextResult("error: search path is outside the workspace: " + searchRel), nil
+		return nil, &grepError{reason: "search path is outside the workspace: " + searchRel, cause: err}
 	}
 	resolvedRoot, err := workspace.ResolveRoot(g.root)
 	if err != nil {
-		return tool.TextResult("error: workspace root could not be resolved"), nil
+		return nil, &grepError{reason: "workspace root could not be resolved", cause: err}
 	}
-
-	// Compile the pattern up front: an invalid regex is a clean tool-result error
-	// (and the fallback needs the compiled form anyway).
+	// Compile the pattern up front: an invalid regex fails preparation (and the
+	// fallback needs the compiled form anyway).
 	re, err := compileGrepRegexp(a.Pattern, a.IgnoreCase)
 	if err != nil {
-		return tool.TextResult("error: invalid pattern: " + err.Error()), nil
+		return nil, &grepError{reason: "invalid pattern: " + err.Error(), cause: err}
+	}
+	return &grepArtifact{
+		pattern:      a.Pattern,
+		re:           re,
+		searchRel:    searchRel,
+		searchAbs:    searchAbs,
+		resolvedRoot: resolvedRoot,
+		opts: grepOptions{
+			recursive:    a.Recursive == nil || *a.Recursive, // default true.
+			ignoreCase:   a.IgnoreCase,
+			contextLines: a.ContextLines,
+			includeAll:   a.IncludeAll,
+		},
+	}, nil
+}
+
+// PrepareCall decodes and validates the untrusted arguments ONCE (including
+// compiling the pattern), resolves the canonical walk root ONCE, and returns
+// the typed request — ONE filesystem.read requirement for the walked root
+// (plain canonical path as Scope, canonical tree encoding as Match, empty
+// grant pair) — plus the typed artifact InvokableRun executes. Invalid input
+// fails here and never reaches the permission gate.
+func (g *Grep) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	art, err := g.prepareGrep(argsJSON)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	return tool.Request{
+		ToolName:     grepToolName,
+		ExecutionID:  executionID.String(),
+		Requirements: []tool.Requirement{prepared.TreeReadRequirement(art.searchAbs)},
+	}, art, nil
+}
+
+// InvokableRun executes the PREPARED artifact bound to this call — the raw
+// argsJSON is never reparsed, so mutating it after preparation changes
+// nothing; without its artifact the tool fails closed. It runs the chosen
+// backend over the approved root and renders capped, denied-filtered matches.
+// Every failure is a tool-result string.
+func (g *Grep) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	art, ok := prepared.FromContext[*grepArtifact](ctx)
+	if !ok || art == nil {
+		return tool.TextResult("error: permission denied: Grep requires its prepared call artifact"), nil
 	}
 
-	opts := grepOptions{
-		recursive:    a.Recursive == nil || *a.Recursive, // default true.
-		ignoreCase:   a.IgnoreCase,
-		contextLines: a.ContextLines,
-		includeAll:   a.IncludeAll,
+	// Enforce the APPROVED resolved walk root: a resolution changed between
+	// prepare and run (a symlink swap) refuses the search fail-closed.
+	searchAbs, err := workspace.ContainedPath(g.root, art.searchRel)
+	if err != nil {
+		return tool.TextResult("error: search path is outside the workspace: " + art.searchRel), nil
+	}
+	if searchAbs != art.searchAbs {
+		return tool.TextResult("error: search path resolution changed since approval: " + art.searchRel), nil
 	}
 
 	// Bound the search (rg exec or fallback walk) so neither can block past
@@ -233,15 +294,26 @@ func (g *Grep) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 	var matches []string
 	var truncated, expired bool
 	if g.useRg {
-		matches, truncated, expired = g.runRg(ctx, a.Pattern, searchAbs, resolvedRoot, opts)
+		matches, truncated, expired = g.runRg(ctx, art.pattern, art.searchAbs, art.resolvedRoot, art.opts)
 	} else {
-		matches, truncated, expired = g.runFallback(ctx, searchAbs, resolvedRoot, re, opts)
+		matches, truncated, expired = g.runFallback(ctx, art.searchAbs, art.resolvedRoot, art.re, art.opts)
 	}
 	if expired {
 		return tool.TextResult("error: grep timed out"), nil
 	}
 	return tool.TextResult(renderGrepResults(matches, truncated)), nil
 }
+
+// grepError is the typed preparation failure for a Grep call: a non-secret
+// reason plus an optional cause.
+type grepError struct {
+	reason string
+	cause  error
+}
+
+func (e *grepError) Error() string { return e.reason }
+
+func (e *grepError) Unwrap() error { return e.cause }
 
 // compileGrepRegexp compiles the pattern, prefixing "(?i)" for a case-insensitive
 // search. A bad pattern returns the regexp error (rendered as a tool-result).
@@ -518,5 +590,6 @@ func renderGrepResults(matches []string, truncated bool) string {
 // compile-time assertions.
 var (
 	_ tool.InvokableTool = (*Grep)(nil)
+	_ tool.CallPreparer  = (*Grep)(nil)
 	_ tool.Auditable     = (*Grep)(nil)
 )

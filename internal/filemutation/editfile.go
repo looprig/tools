@@ -11,8 +11,9 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/tools/internal/workspace"
+	"github.com/looprig/tools/internal/prepared"
 )
 
 // editfile.go implements the EditFile tool: an exact-string-replace editor over a
@@ -23,16 +24,15 @@ import (
 // final-component symlink rather than following it. It replaces `old` with
 // `replacement` under strict occurrence rules, writes back atomically (the shared
 // atomicWriteFile temp+Rename), and returns a diff preview. Like WriteFile it
-// defaults to Ask (PermissionPrompter → tool.FileWriteRequest), is Auditable (no
-// content), and is a WriteTarget.
+// is a CallPreparer (direct filesystem.write requirement + typed artifact), is
+// Auditable (no content), and is a WriteTarget.
 //
 // Occurrence rules (the §4b contract):
 //   - 0 matches of `old`          → tool-result error ("not found")
 //   - ≥2 matches && !replace_all  → tool-result error ("ambiguous: N matches…")
 //   - exactly 1, or replace_all   → perform the replacement (all if replace_all)
 
-// editFileToolName is the EXACT tool name classifyTool keys on for the write
-// class — it MUST equal "EditFile" (check.go's toolEditFile).
+// editFileToolName is the EXACT tool name — it MUST equal "EditFile".
 const editFileToolName = "EditFile"
 
 // maxEditFileBytes caps the file EditFile will read so a pathological target
@@ -44,9 +44,7 @@ const maxEditFileBytes int64 = 1 << 20
 // shows on each side of a changed region (keeps the preview compact but readable).
 const diffPreviewContextLines = 2
 
-// editFileSchema is the JSON Schema for EditFile's argument object. The field
-// names (path/old/new/replace_all) are the boundary-extraction contract: check.go
-// parses "path"; the runner/tool parse the rest.
+// editFileSchema is the JSON Schema for EditFile's argument object.
 const editFileSchema = `{
   "type": "object",
   "properties": {
@@ -110,69 +108,88 @@ func (e *EditFile) AuditSummary(argsJSON string) string {
 	return "EditFile " + a.Path
 }
 
-// Interim (replaced in Task 3.3): the legacy BuildRequest/PermissionPrompter
-// prompt seam was removed with the old harness gate. Until Task 3.3 adds
-// PrepareCall emitting the filesystem.write requirement for the resolved
-// canonical path, EditFile is an unprepared effectful tool and the harness
-// runner fails closed: the call is never evaluated or executed.
+// editFileArtifact is EditFile's typed prepared artifact: the validated,
+// canonicalized target plus the exact replacement, bound to one call by
+// PrepareCall and consumed by InvokableRun without reparsing the raw JSON. It
+// deliberately embeds tool.TokenArtifact to satisfy the sealed
+// tool.PreparedArtifact marker; the typed fields stay tool-private.
+type editFileArtifact struct {
+	tool.TokenArtifact
+	target      mutationTarget
+	old         string
+	replacement string
+	replaceAll  bool
+}
 
-// WriteTarget returns the resolved edit path as the serialization key (an edit is
-// a write). ok is true for a well-formed call; a non-nil err (bad args/escape)
-// tells the runner to treat the call as invalid.
+// prepareEdit is the SINGLE parse-validate-canonicalize step for an EditFile
+// call, shared by PrepareCall and WriteTarget so the scheduling key and the
+// requirement Scope can never diverge.
+func (e *EditFile) prepareEdit(argsJSON string) (*editFileArtifact, error) {
+	var a editFileArgs
+	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+		return nil, &writeFileError{reason: "invalid arguments: not a JSON object", cause: err}
+	}
+	if a.Path == "" {
+		return nil, &writeFileError{reason: "a non-empty 'path' is required"}
+	}
+	if a.Old == "" {
+		return nil, &writeFileError{reason: "'old' must be a non-empty substring to find"}
+	}
+	target, err := resolveMutationTarget(e.root, a.Path)
+	if err != nil {
+		return nil, err
+	}
+	return &editFileArtifact{target: target, old: a.Old, replacement: a.New, replaceAll: a.ReplaceAll}, nil
+}
+
+// PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
+// canonical edit target ONCE, and returns the typed request — one direct
+// filesystem.write requirement whose Scope and Match are the canonical resolved
+// path, empty grant pair — plus the typed artifact InvokableRun executes.
+// Invalid input fails here and never reaches the permission gate.
+func (e *EditFile) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	art, err := e.prepareEdit(argsJSON)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	return mutationRequest(editFileToolName, executionID.String(), art.target), art, nil
+}
+
+// WriteTarget returns the CANONICAL prepared edit path as the serialization key
+// (an edit is a write), derived by the same preparation step that emits the
+// requirement Scope — preparation is the single source of the scheduling key.
+// ok is true for a well-formed call; a non-nil err (bad args/escape) tells the
+// runner to treat the call as invalid.
 func (e *EditFile) WriteTarget(argsJSON string) (string, bool, error) {
-	abs, err := e.resolveEditPath(argsJSON)
+	art, err := e.prepareEdit(argsJSON)
 	if err != nil {
 		return "", false, err
 	}
-	return abs, true, nil
+	return art.target.abs, true, nil
 }
 
-// resolveEditPath is the shared parse-and-contain step for BuildRequest and
-// WriteTarget: decode the args, require a non-empty path, and contain it.
-func (e *EditFile) resolveEditPath(argsJSON string) (string, error) {
-	var a editFileArgs
-	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return "", &writeFileError{reason: "invalid arguments: not a JSON object", cause: err}
-	}
-	if a.Path == "" {
-		return "", &writeFileError{reason: "a non-empty 'path' is required"}
-	}
-	abs, err := workspace.ContainedPath(e.root, a.Path)
-	if err != nil {
-		return "", &writeFileError{reason: "path is outside the workspace", cause: err}
-	}
-	return abs, nil
-}
-
-// InvokableRun applies the edit and returns a diff preview, or a tool-result
-// error string for every failure mode (bad args, escape, not-found file, empty
-// 'old', 0 matches, ambiguous matches, read/write failure). Never a Go error,
-// never echoing the full file body.
-func (e *EditFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
-	var a editFileArgs
-	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
-	}
-	if a.Path == "" {
-		return tool.TextResult("error: a non-empty 'path' is required"), nil
-	}
-	if a.Old == "" {
-		return tool.TextResult("error: 'old' must be a non-empty substring to find"), nil
+// InvokableRun executes the PREPARED artifact bound to this call — the raw
+// argsJSON is never reparsed, so mutating it after preparation changes
+// nothing. Without its typed artifact the effectful tool fails closed. It
+// applies the edit and returns a diff preview, or a tool-result error string
+// for every failure mode. Never a Go error, never echoing the full file body.
+func (e *EditFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	art, ok := prepared.FromContext[*editFileArtifact](ctx)
+	if !ok || art == nil {
+		return tool.TextResult("error: permission denied: EditFile requires its prepared call artifact"), nil
 	}
 
-	// Stage 1: containment (symlink-aware). Proves the symlink-RESOLVED target is
-	// inside the workspace; an escape (including an in-workspace symlink pointing
-	// OUT) is rejected here. The resolved path is the CANONICAL observation key.
-	abs, err := workspace.ContainedPath(e.root, a.Path)
-	if err != nil {
-		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
+	// Stage 1: enforce the APPROVED resolved path (see WriteFile.InvokableRun):
+	// a resolution changed since preparation refuses the edit fail-closed.
+	if err := enforceApprovedResolution(e.root, art.target); err != nil {
+		return tool.TextResult("error: " + err.Error()), nil
 	}
 
 	// Stage 2: take the SHARED session-mutation + canonical-PATH permit (and verify
 	// lease health) BEFORE the commit critical section — the OUTER lock over commit's
 	// per-path st.mu (consistent ordering). A ctx-canceled acquire or an unhealthy
 	// lease returns WITHOUT editing.
-	key := canonicalObservationKey(abs)
+	key := canonicalObservationKey(art.target.abs)
 	permit, err := acquirePathMutation(ctx, e.coord, key)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
@@ -184,7 +201,7 @@ func (e *EditFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 	// form), mirroring ReadFile: the O_NOFOLLOW read rejects a final-component
 	// symlink rather than following it, and the atomic write targets the same
 	// lexical name so it REPLACES a final-component symlink rather than following it.
-	preview, err := e.commit(key, workspace.JoinedPath(e.root, a.Path), a.Path, a.Old, a.New, a.ReplaceAll)
+	preview, err := e.commit(key, art.target.lexical, art.target.display, art.old, art.replacement, art.replaceAll)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
@@ -313,10 +330,11 @@ func isSymlinkLoop(err error) bool {
 	return errors.Is(err, syscall.ELOOP)
 }
 
-// compile-time assertions: EditFile is an InvokableTool, Auditable, and a
-// WriteTarget.
+// compile-time assertions: EditFile is an InvokableTool, a CallPreparer,
+// Auditable, and a WriteTarget.
 var (
 	_ tool.InvokableTool = (*EditFile)(nil)
+	_ tool.CallPreparer  = (*EditFile)(nil)
 	_ tool.Auditable     = (*EditFile)(nil)
 	_ tool.WriteTarget   = (*EditFile)(nil)
 )

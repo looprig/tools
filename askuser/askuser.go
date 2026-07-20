@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -37,9 +38,7 @@ import (
 // answer-validation logic without standing up a real loop gate. The real loop
 // wiring is exercised by the loop package's gate tests + integration later.
 
-// askUserToolName is the EXACT tool name. It is an UNKNOWN class to classifyTool
-// (no path/command boundary), so check.go skips Stages 1–2 and the call reaches
-// AutoApprove only via the manifest's HardApprove list (which names "AskUser").
+// askUserToolName is the EXACT tool name — it MUST equal "AskUser".
 const askUserToolName = "AskUser"
 
 // otherChoice is the reserved escape-hatch answer always accepted alongside an
@@ -164,9 +163,19 @@ func validateAnswer(answer string, choices []string) string {
 	return "error: answer must be one of: " + strings.Join(choices, ", ") + ", or \"" + otherChoice + "\""
 }
 
+// PrepareCall implements the mandatory tool preparation capability with a
+// PURE, empty request: AskUser routes a question through the loop's own
+// user-input capability — no filesystem, network, or command effect — so there
+// is no capability to gate. Argument validation stays in InvokableRun (every
+// failure is a tool-result string the model can recover from).
+func (a *AskUser) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{ToolName: askUserToolName}, nil, nil
+}
+
 // compile-time assertions: AskUser is an InvokableTool and Auditable. It is
 // deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
 var (
 	_ tool.InvokableTool = (*AskUser)(nil)
+	_ tool.CallPreparer  = (*AskUser)(nil)
 	_ tool.Auditable     = (*AskUser)(nil)
 )

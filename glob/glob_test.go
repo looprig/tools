@@ -9,7 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -20,18 +21,20 @@ func runGlob(t *testing.T, root string, guard *fakeReadGuard, args map[string]an
 		t.Fatalf("marshal args: %v", err)
 	}
 	g := NewGlob(root, guard)
-	res, err := g.InvokableRun(context.Background(), string(b))
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	req, art, err := g.PrepareCall(context.Background(), id, string(b))
+	if err != nil {
+		return "error: tool preparation failed: " + err.Error()
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+	res, err := g.InvokableRun(ctx, string(b))
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
 	}
-	if res == nil || len(res.Content) != 1 {
-		t.Fatalf("result = %v, want exactly 1 block", res)
-	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	return tb.Text
+	return textOfResult(t, res)
 }
 
 func TestGlobInfo(t *testing.T) {
@@ -239,16 +242,20 @@ func TestGlobWalkTimeout(t *testing.T) {
 	cancel() // expire before the walk begins.
 
 	g := NewGlob(root, newFakeReadGuard(1<<20))
-	res, err := g.InvokableRun(ctx, `{"pattern":"**"}`)
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	req, art, err := g.PrepareCall(context.Background(), id, `{"pattern":"**"}`)
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	res, err := g.InvokableRun(loop.WithPreparedCall(ctx, tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art}), `{"pattern":"**"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
 	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	if !strings.Contains(tb.Text, "timed out") {
-		t.Errorf("output = %q, want it to report the timeout", tb.Text)
+	if out := textOfResult(t, res); !strings.Contains(out, "timed out") {
+		t.Errorf("output = %q, want it to report the timeout", out)
 	}
 }
 

@@ -26,17 +26,15 @@ import (
 // -race-clean under concurrent create/update). IDs come from crypto/rand via
 // internal/uuid.
 //
-// AUTO-APPROVE: Todo is AutoApprove — it has no external side effects worth
-// gating. It deliberately does NOT implement tool.PermissionPrompter. It DOES
-// implement tool.Auditable (the action verb is a safe, non-secret summary).
+// PURE: Todo has no external side effects worth gating, so its PrepareCall
+// returns an empty request (no requirements). It DOES implement
+// tool.Auditable (the action verb is a safe, non-secret summary).
 //
 // FAILURE MODEL: every failure — unparsable args, a bad/missing action, a missing
 // required field, an unknown id, or a bad status — is a tool-result error STRING.
 // InvokableRun never returns a Go error.
 
-// todoToolName is the EXACT tool name. Like AskUser it is classUnknown to
-// classifyTool (no path/command boundary), so it reaches AutoApprove only via the
-// manifest's HardApprove list (which names "Todo").
+// todoToolName is the EXACT tool name — it MUST equal "Todo".
 const todoToolName = "Todo"
 
 // todoAction is the typed enum of the action field. Validation rejects any value
@@ -244,9 +242,19 @@ func (td *Todo) list() (*tool.ToolResult, error) {
 	return tool.TextResult(sb.String()), nil
 }
 
+// PrepareCall implements the mandatory tool preparation capability with a
+// PURE, empty request: Todo touches only its in-memory session list (no
+// filesystem, network, or command effect), so there is no capability to gate.
+// Argument validation stays in InvokableRun (every failure is a tool-result
+// string the model can recover from).
+func (td *Todo) PrepareCall(context.Context, uuid.UUID, string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{ToolName: todoToolName}, nil, nil
+}
+
 // compile-time assertions: Todo is an InvokableTool and Auditable. It is
 // deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
 var (
 	_ tool.InvokableTool = (*Todo)(nil)
+	_ tool.CallPreparer  = (*Todo)(nil)
 	_ tool.Auditable     = (*Todo)(nil)
 )

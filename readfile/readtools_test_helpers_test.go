@@ -5,7 +5,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // fakeReadGuard is a configurable test double for loop.ReadGuard. denied holds
@@ -75,4 +77,17 @@ func resolvedJoin(t *testing.T, root, rel string) string {
 		t.Fatalf("Abs: %v", err)
 	}
 	return abs
+}
+
+// resultText extracts the single text block from a tool result.
+func resultText(t *testing.T, res *tool.ToolResult) string {
+	t.Helper()
+	if res == nil || len(res.Content) != 1 {
+		t.Fatalf("result = %v, want exactly 1 block", res)
+	}
+	tb, ok := res.Content[0].(*content.TextBlock)
+	if !ok {
+		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
+	}
+	return tb.Text
 }

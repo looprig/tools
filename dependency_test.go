@@ -84,8 +84,15 @@ func TestProductionDependencyBoundary(t *testing.T) {
 					t.Errorf("%s imports forbidden optional or internal dependency %q", path, importPath)
 				}
 			}
+			// Tool packages stay independent of each other. The permission
+			// package is deliberately NOT a tool: it is the shared workspace
+			// rule library whose exported canonical requirement-Match
+			// encodings (TreeMatch etc.) are the pinned contract between tool
+			// preparation and stored-rule matching, so preparation code may
+			// import it.
 			if path != "definitions.go" && strings.HasPrefix(importPath, "github.com/looprig/tools/") &&
-				!strings.HasPrefix(importPath, "github.com/looprig/tools/internal/") {
+				!strings.HasPrefix(importPath, "github.com/looprig/tools/internal/") &&
+				importPath != "github.com/looprig/tools/permission" {
 				t.Errorf("%s imports sibling public tool package %q", path, importPath)
 			}
 		}

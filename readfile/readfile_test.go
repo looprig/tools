@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -32,18 +32,20 @@ func runReadFile(t *testing.T, root string, guard loop.ReadGuard, args map[strin
 		t.Fatalf("marshal args: %v", err)
 	}
 	rf := NewReadFile(root, guard, tool.NewWorkspaceObservations())
-	res, err := rf.InvokableRun(context.Background(), string(b))
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	req, art, err := rf.PrepareCall(context.Background(), id, string(b))
+	if err != nil {
+		return "error: tool preparation failed: " + err.Error()
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+	res, err := rf.InvokableRun(ctx, string(b))
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
 	}
-	if res == nil || len(res.Content) != 1 {
-		t.Fatalf("result = %v, want exactly 1 block", res)
-	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	return tb.Text
+	return resultText(t, res)
 }
 
 func TestReadFileInfo(t *testing.T) {

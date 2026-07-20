@@ -13,17 +13,19 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/tools/internal/workspace"
+	"github.com/looprig/tools/internal/prepared"
 )
 
 // writefile.go implements the WriteFile tool: a workspace-contained atomic file
-// writer (design §4b). WriteFile defaults to Ask (it implements
-// PermissionPrompter → tool.FileWriteRequest), is Auditable with a content-free
-// summary, and is a WriteTarget so the runner serializes same-resolved-path
-// writes. The denied-write hard-deny list is enforced by the PermissionChecker
-// BEFORE the tool runs (the tool takes only root); the tool still runs
-// containment itself for correct path resolution and defense in depth.
+// writer (design §4b). WriteFile is a CallPreparer (PrepareCall emits the
+// direct filesystem.write requirement for the canonical resolved target and
+// binds the typed artifact InvokableRun executes), is Auditable with a
+// content-free summary, and is a WriteTarget so the runner serializes
+// same-resolved-path writes. Whether the resolved path is denied, gated, or
+// allowed is the gate evaluator's decision; the tool still runs containment
+// itself for correct path resolution and defense in depth.
 //
 // Path handling: containedPath proves the symlink-RESOLVED target is inside the
 // workspace (an escape — including an in-workspace symlink pointing out — is
@@ -48,8 +50,7 @@ import (
 // scope for this local single-user tool acting with the user's own privileges;
 // the O_EXCL|O_NOFOLLOW temp is cheap defence-in-depth, not a complete TOCTOU fix.
 
-// writeFileToolName is the EXACT tool name classifyTool keys on for the write
-// class — it MUST equal "WriteFile" (check.go's toolWriteFile).
+// writeFileToolName is the EXACT tool name — it MUST equal "WriteFile".
 const writeFileToolName = "WriteFile"
 
 // newFilePerm is the mode a freshly-written file ends up with. The temp file is
@@ -61,9 +62,7 @@ const newFilePerm os.FileMode = 0o600
 // group/other read+execute), the conventional directory mode for a workspace.
 const newDirPerm os.FileMode = 0o755
 
-// writeFileSchema is the JSON Schema for WriteFile's argument object. The field
-// names (path/content) are the boundary-extraction contract shared with check.go
-// (which parses "path").
+// writeFileSchema is the JSON Schema for WriteFile's argument object.
 const writeFileSchema = `{
   "type": "object",
   "properties": {
@@ -126,61 +125,79 @@ func (w *WriteFile) AuditSummary(argsJSON string) string {
 	return "WriteFile " + a.Path + " (" + strconv.Itoa(len(a.Content)) + " bytes)"
 }
 
-// Interim (replaced in Task 3.3): the legacy BuildRequest/PermissionPrompter
-// prompt seam was removed with the old harness gate. Until Task 3.3 adds
-// PrepareCall emitting the filesystem.write requirement for the resolved
-// canonical path, WriteFile is an unprepared effectful tool and the harness
-// runner fails closed: the call is never evaluated or executed.
+// writeFileArtifact is WriteFile's typed prepared artifact: the validated,
+// canonicalized target plus the exact content to write, bound to one call by
+// PrepareCall and consumed by InvokableRun without reparsing the raw JSON. It
+// deliberately embeds tool.TokenArtifact to satisfy the sealed
+// tool.PreparedArtifact marker; the typed fields stay tool-private.
+type writeFileArtifact struct {
+	tool.TokenArtifact
+	target  mutationTarget
+	content string
+}
 
-// WriteTarget returns the resolved write path as the serialization key so the
-// runner groups concurrent writes to the same on-disk file. ok is true for every
+// prepareWrite is the SINGLE parse-validate-canonicalize step for a WriteFile
+// call, shared by PrepareCall and WriteTarget so the scheduling key and the
+// requirement Scope can never diverge.
+func (w *WriteFile) prepareWrite(argsJSON string) (*writeFileArtifact, error) {
+	var a writeFileArgs
+	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+		return nil, &writeFileError{reason: "invalid arguments: not a JSON object", cause: err}
+	}
+	if a.Path == "" {
+		return nil, &writeFileError{reason: "a non-empty 'path' is required"}
+	}
+	target, err := resolveMutationTarget(w.root, a.Path)
+	if err != nil {
+		return nil, err
+	}
+	return &writeFileArtifact{target: target, content: a.Content}, nil
+}
+
+// PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
+// canonical write target ONCE, and returns the typed request — one direct
+// filesystem.write requirement whose Scope and Match are the canonical resolved
+// path, empty grant pair — plus the typed artifact InvokableRun executes.
+// Invalid input fails here and never reaches the permission gate.
+func (w *WriteFile) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	art, err := w.prepareWrite(argsJSON)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	return mutationRequest(writeFileToolName, executionID.String(), art.target), art, nil
+}
+
+// WriteTarget returns the CANONICAL prepared write path as the serialization
+// key so the runner groups concurrent writes to the same on-disk file. It is
+// derived by the same preparation step that emits the requirement Scope —
+// preparation is the single source of the scheduling key. ok is true for every
 // well-formed write; a non-nil err (unparseable args or an escape) tells the
 // runner to treat the call as invalid rather than execute it ungrouped.
 func (w *WriteFile) WriteTarget(argsJSON string) (string, bool, error) {
-	abs, err := w.resolveWritePath(argsJSON)
+	art, err := w.prepareWrite(argsJSON)
 	if err != nil {
 		return "", false, err
 	}
-	return abs, true, nil
+	return art.target.abs, true, nil
 }
 
-// resolveWritePath is the shared parse-and-contain step for BuildRequest and
-// WriteTarget: decode the args, require a non-empty path, and resolve it through
-// containedPath. The returned path is the canonical resolved write target.
-func (w *WriteFile) resolveWritePath(argsJSON string) (string, error) {
-	var a writeFileArgs
-	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return "", &writeFileError{reason: "invalid arguments: not a JSON object", cause: err}
-	}
-	if a.Path == "" {
-		return "", &writeFileError{reason: "a non-empty 'path' is required"}
-	}
-	abs, err := workspace.ContainedPath(w.root, a.Path)
-	if err != nil {
-		return "", &writeFileError{reason: "path is outside the workspace", cause: err}
-	}
-	return abs, nil
-}
-
-// InvokableRun writes the file atomically. Every failure mode (bad args, escape,
-// mkdir/temp/rename failure) is returned as a tool-result error string — never a
-// Go error and never echoing the content.
-func (w *WriteFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
-	var a writeFileArgs
-	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
-	}
-	if a.Path == "" {
-		return tool.TextResult("error: a non-empty 'path' is required"), nil
+// InvokableRun executes the PREPARED artifact bound to this call — the raw
+// argsJSON is never reparsed, so mutating it after preparation changes
+// nothing. Without its typed artifact the effectful tool fails closed. Every
+// failure mode is a tool-result error string — never a Go error and never
+// echoing the content.
+func (w *WriteFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	art, ok := prepared.FromContext[*writeFileArtifact](ctx)
+	if !ok || art == nil {
+		return tool.TextResult("error: permission denied: WriteFile requires its prepared call artifact"), nil
 	}
 
-	// Stage 1: containment (symlink-aware). An escape (including an in-workspace
-	// symlink pointing OUT) is rejected here; echo only the requested path. The
-	// resolved path is the CANONICAL observation key (lexical/symlinked-dir aliases
-	// of the same real file collapse to one entry).
-	abs, err := workspace.ContainedPath(w.root, a.Path)
-	if err != nil {
-		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
+	// Stage 1: enforce the APPROVED resolved path. Preparation proved
+	// containment for the permission decision; re-proving that the resolution
+	// still equals the approved canonical target closes the prepare→run window
+	// (a parent-dir symlink swap redirects the write nowhere: it is refused).
+	if err := enforceApprovedResolution(w.root, art.target); err != nil {
+		return tool.TextResult("error: " + err.Error()), nil
 	}
 
 	// Stage 2: take the SHARED session-mutation + canonical-PATH permit (and verify
@@ -189,7 +206,7 @@ func (w *WriteFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.To
 	// permit is the OUTER lock; commit's per-path st.mu is the INNER lock (consistent
 	// ordering, no inversion). A ctx-canceled acquire or an unhealthy lease returns
 	// WITHOUT writing.
-	key := canonicalObservationKey(abs)
+	key := canonicalObservationKey(art.target.abs)
 	permit, err := acquirePathMutation(ctx, w.coord, key)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
@@ -200,10 +217,10 @@ func (w *WriteFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.To
 	// on-disk write targets the LEXICAL joined path (NOT the symlink-resolved form),
 	// mirroring ReadFile/EditFile: an atomic Rename/Link on this lexical name never
 	// follows a final-component symlink.
-	if err := w.commit(key, workspace.JoinedPath(w.root, a.Path), a.Path, []byte(a.Content)); err != nil {
+	if err := w.commit(key, art.target.lexical, art.target.display, []byte(art.content)); err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
-	return tool.TextResult("wrote " + a.Path + " (" + strconv.Itoa(len(a.Content)) + " bytes)"), nil
+	return tool.TextResult("wrote " + art.target.display + " (" + strconv.Itoa(len(art.content)) + " bytes)"), nil
 }
 
 // commit performs the optimistic-concurrency write for one path while holding that
@@ -436,10 +453,11 @@ func (e *writeFileError) Error() string { return e.reason }
 
 func (e *writeFileError) Unwrap() error { return e.cause }
 
-// compile-time assertions: WriteFile is an InvokableTool, Auditable, and a
-// WriteTarget.
+// compile-time assertions: WriteFile is an InvokableTool, a CallPreparer,
+// Auditable, and a WriteTarget.
 var (
 	_ tool.InvokableTool = (*WriteFile)(nil)
+	_ tool.CallPreparer  = (*WriteFile)(nil)
 	_ tool.Auditable     = (*WriteFile)(nil)
 	_ tool.WriteTarget   = (*WriteFile)(nil)
 )

@@ -10,14 +10,18 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/prepared"
 	"github.com/looprig/tools/internal/workspace"
 )
 
 // glob.go implements the Glob tool: a workspace-contained, denied-path-excluding
 // filename search using the shared `**`-aware matchGlob over WalkDir-discovered
-// entries (design §4b). It is AutoApprove and Auditable (pattern/root only).
+// entries (design §4b). It is a CallPreparer (PrepareCall emits ONE direct
+// filesystem.read requirement for the canonical walked root, with the tree
+// Match encoding) and Auditable (pattern/root only).
 
 // maxGlobResults caps the number of paths Glob returns so a broad pattern cannot
 // flood the model context. A larger match set is truncated with a notice.
@@ -46,13 +50,12 @@ var globNoiseDirs = map[string]bool{
 	"__pycache__":  true, // Python bytecode cache.
 }
 
-// globToolName is the EXACT tool name classifyTool keys on for the read class.
+// globToolName is the EXACT tool name — it MUST equal "Glob".
 const globToolName = "Glob"
 
 const defaultSearchDir = "."
 
-// globSchema is the JSON Schema for Glob's args. Field names (pattern/root) are
-// the boundary-extraction contract shared with check.go.
+// globSchema is the JSON Schema for Glob's args.
 const globSchema = `{
   "type": "object",
   "properties": {
@@ -104,18 +107,27 @@ func (g *Glob) AuditSummary(argsJSON string) string {
 	return "Glob " + a.Pattern
 }
 
-// InvokableRun walks the (contained) search root, matches each workspace-relative
-// path against the pattern, EXCLUDES any path DeniedRead reports, caps results,
-// and returns a newline-separated list. Every failure is a tool-result string.
-func (g *Glob) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+// globArtifact is Glob's typed prepared artifact: the validated pattern and
+// the canonicalized walk root, bound to one call by PrepareCall and consumed
+// by InvokableRun without reparsing the raw JSON. It deliberately embeds
+// tool.TokenArtifact to satisfy the sealed tool.PreparedArtifact marker.
+type globArtifact struct {
+	tool.TokenArtifact
+	pattern      string
+	searchRel    string // model-supplied search root (display + run-time re-check)
+	searchAbs    string // canonical resolved walk root (requirement Scope)
+	resolvedRoot string // canonical workspace root (relative-path anchor)
+}
+
+// prepareGlob is the SINGLE parse-validate-canonicalize step for a Glob call.
+func (g *Glob) prepareGlob(argsJSON string) (*globArtifact, error) {
 	var a globArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
+		return nil, &globError{reason: "invalid arguments: not a JSON object", cause: err}
 	}
 	if a.Pattern == "" {
-		return tool.TextResult("error: a non-empty 'pattern' is required"), nil
+		return nil, &globError{reason: "a non-empty 'pattern' is required"}
 	}
-
 	searchRel := a.Root
 	if searchRel == "" {
 		searchRel = defaultSearchDir
@@ -125,19 +137,72 @@ func (g *Glob) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 	// computed against the resolved workspace root.
 	searchAbs, err := workspace.ContainedPath(g.root, searchRel)
 	if err != nil {
-		return tool.TextResult("error: search root is outside the workspace: " + searchRel), nil
+		return nil, &globError{reason: "search root is outside the workspace: " + searchRel, cause: err}
 	}
 	resolvedRoot, err := workspace.ResolveRoot(g.root)
 	if err != nil {
-		return tool.TextResult("error: workspace root could not be resolved"), nil
+		return nil, &globError{reason: "workspace root could not be resolved", cause: err}
+	}
+	return &globArtifact{pattern: a.Pattern, searchRel: searchRel, searchAbs: searchAbs, resolvedRoot: resolvedRoot}, nil
+}
+
+// PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
+// canonical walk root ONCE, and returns the typed request — ONE filesystem.read
+// requirement for the walked root (plain canonical path as Scope for profile
+// routing, canonical tree encoding as Match for durable tree rules, empty
+// grant pair) — plus the typed artifact InvokableRun executes. Invalid input
+// fails here and never reaches the permission gate.
+func (g *Glob) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	art, err := g.prepareGlob(argsJSON)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	return tool.Request{
+		ToolName:     globToolName,
+		ExecutionID:  executionID.String(),
+		Requirements: []tool.Requirement{prepared.TreeReadRequirement(art.searchAbs)},
+	}, art, nil
+}
+
+// InvokableRun executes the PREPARED artifact bound to this call — the raw
+// argsJSON is never reparsed, so mutating it after preparation changes
+// nothing; without its artifact the tool fails closed. It walks the approved
+// root, matches each workspace-relative path against the prepared pattern,
+// EXCLUDES any path DeniedRead reports, caps results, and returns a
+// newline-separated list. Every failure is a tool-result string.
+func (g *Glob) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	art, ok := prepared.FromContext[*globArtifact](ctx)
+	if !ok || art == nil {
+		return tool.TextResult("error: permission denied: Glob requires its prepared call artifact"), nil
 	}
 
-	matches, truncated, expired := g.walk(ctx, searchAbs, resolvedRoot, a.Pattern)
+	// Enforce the APPROVED resolved walk root: a resolution changed between
+	// prepare and run (a symlink swap) refuses the walk fail-closed.
+	searchAbs, err := workspace.ContainedPath(g.root, art.searchRel)
+	if err != nil {
+		return tool.TextResult("error: search root is outside the workspace: " + art.searchRel), nil
+	}
+	if searchAbs != art.searchAbs {
+		return tool.TextResult("error: search root resolution changed since approval: " + art.searchRel), nil
+	}
+
+	matches, truncated, expired := g.walk(ctx, art.searchAbs, art.resolvedRoot, art.pattern)
 	if expired {
 		return tool.TextResult("error: glob timed out"), nil
 	}
 	return tool.TextResult(renderGlobResults(matches, truncated)), nil
 }
+
+// globError is the typed preparation failure for a Glob call: a non-secret
+// reason plus an optional cause.
+type globError struct {
+	reason string
+	cause  error
+}
+
+func (e *globError) Error() string { return e.reason }
+
+func (e *globError) Unwrap() error { return e.cause }
 
 // walk traverses searchAbs, returning the workspace-relative (slash) paths whose
 // relPath matches pattern and that the shared deny-filter does NOT exclude, sorted
@@ -233,5 +298,6 @@ func renderGlobResults(matches []string, truncated bool) string {
 // compile-time assertions.
 var (
 	_ tool.InvokableTool = (*Glob)(nil)
+	_ tool.CallPreparer  = (*Glob)(nil)
 	_ tool.Auditable     = (*Glob)(nil)
 )

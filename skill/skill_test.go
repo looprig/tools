@@ -6,7 +6,10 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // skillToolBody is the markdown body of the well-formed fixture skill, returned
@@ -104,11 +107,24 @@ func TestSkillInvokableRun(t *testing.T) {
 			loader := NewEmbeddedSkillLoader(newSkillToolFS(), skillToolAllow())
 			s := NewSkill(loader, identity.AgentName("operator"))
 
-			res, err := s.InvokableRun(context.Background(), tt.argsJSON)
+			id, err := uuid.New()
 			if err != nil {
-				t.Fatalf("InvokableRun() Go error = %v, want nil (failures are tool-result strings)", err)
+				t.Fatalf("uuid.New() error = %v", err)
 			}
-			got := textOf(t, res)
+			var got string
+			req, art, err := s.PrepareCall(context.Background(), id, tt.argsJSON)
+			if err != nil {
+				// Runner fail-secure surface: preparation failures are rendered
+				// as an error tool-result naming the reason.
+				got = "error: tool preparation failed: " + err.Error()
+			} else {
+				ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+				res, rerr := s.InvokableRun(ctx, tt.argsJSON)
+				if rerr != nil {
+					t.Fatalf("InvokableRun() Go error = %v, want nil (failures are tool-result strings)", rerr)
+				}
+				got = textOf(t, res)
+			}
 
 			if tt.wantText != "" && got != tt.wantText {
 				t.Errorf("result = %q, want %q", got, tt.wantText)

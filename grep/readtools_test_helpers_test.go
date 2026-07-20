@@ -1,11 +1,15 @@
 package grep
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // fakeReadGuard is a configurable test double for loop.ReadGuard. denied holds
@@ -75,4 +79,54 @@ func resolvedJoin(t *testing.T, root, rel string) string {
 		t.Fatalf("Abs: %v", err)
 	}
 	return abs
+}
+
+// grepText extracts the single text block from a tool result.
+func grepText(t *testing.T, res *tool.ToolResult) string {
+	t.Helper()
+	if res == nil || len(res.Content) != 1 {
+		t.Fatalf("result = %v, want exactly 1 block", res)
+	}
+	tb, ok := res.Content[0].(*content.TextBlock)
+	if !ok {
+		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
+	}
+	return tb.Text
+}
+
+// runPreparedGrep mirrors the runner's prepared-execution contract: prepare
+// once, install the prepared call on ctx, execute. A preparation failure is
+// surfaced as the runner's fail-secure tool-result string.
+func runPreparedGrep(t *testing.T, g *Grep, argsJSON string) string {
+	t.Helper()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	req, art, err := g.PrepareCall(context.Background(), id, argsJSON)
+	if err != nil {
+		return "error: tool preparation failed: " + err.Error()
+	}
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+	res, err := g.InvokableRun(ctx, argsJSON)
+	if err != nil {
+		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
+	}
+	return grepText(t, res)
+}
+
+// invokePreparedGrep prepares the call and executes under the GIVEN ctx,
+// returning the raw result (for ctx-cancellation tests). Preparation must
+// succeed.
+func invokePreparedGrep(ctx context.Context, t *testing.T, g *Grep, argsJSON string) (*tool.ToolResult, error) {
+	t.Helper()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	req, art, err := g.PrepareCall(context.Background(), id, argsJSON)
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	return g.InvokableRun(loop.WithPreparedCall(ctx, tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art}), argsJSON)
 }

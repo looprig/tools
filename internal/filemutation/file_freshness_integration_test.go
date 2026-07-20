@@ -13,6 +13,9 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // file_freshness_integration_test.go exercises the REAL filesystem publication
@@ -28,11 +31,7 @@ func itWrite(t *testing.T, root string, obs *fileObservations, path, body string
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	res, err := NewWriteFile(root, obs).InvokableRun(context.Background(), string(args))
-	if err != nil {
-		t.Fatalf("WriteFile Go error: %v", err)
-	}
-	return res.Content[0].(*content.TextBlock).Text
+	return prepareRun(context.Background(), t, NewWriteFile(root, obs), string(args))
 }
 
 // TestFSCreateWithoutReadAtomicLink proves a WriteFile with NO observation creates a
@@ -124,7 +123,23 @@ func TestFSConcurrentCreatorsExactlyOneWinner(t *testing.T) {
 			obs := newFileObservations() // a fresh loop per creator
 			args, _ := json.Marshal(map[string]any{"path": rel, "content": body})
 			<-start
-			res, err := NewWriteFile(root, obs).InvokableRun(context.Background(), string(args))
+			w := NewWriteFile(root, obs)
+			id, err := uuid.New()
+			if err != nil {
+				mu.Lock()
+				other = append(other, "uuid error: "+err.Error())
+				mu.Unlock()
+				return
+			}
+			req, art, err := w.PrepareCall(context.Background(), id, string(args))
+			if err != nil {
+				mu.Lock()
+				other = append(other, "prepare error: "+err.Error())
+				mu.Unlock()
+				return
+			}
+			ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+			res, err := w.InvokableRun(ctx, string(args))
 			if err != nil {
 				mu.Lock()
 				other = append(other, "go error: "+err.Error())

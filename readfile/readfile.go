@@ -14,28 +14,29 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/prepared"
 	"github.com/looprig/tools/internal/workspace"
 )
 
 // readfile.go implements the ReadFile tool: a workspace-contained, denied-path-
 // aware, symlink-rejecting file reader that returns line-numbered text capped by
-// the ReadGuard's per-file byte limit (design §4b). It is AutoApprove (no
-// PermissionPrompter) and Auditable (a path-only, content-free summary).
+// the ReadGuard's per-file byte limit (design §4b). It is a CallPreparer
+// (PrepareCall emits the direct filesystem.read requirement for the canonical
+// resolved path) and Auditable (a path-only, content-free summary); the
+// ReadGuard stays the in-process denied-path enforcement.
 
 // lineNumberWidth is the minimum column width for the 1-based line number prefix
 // in ReadFile output ("   1\t<line>"). It keeps short files readably aligned;
 // longer line numbers simply widen past it.
 const lineNumberWidth = 4
 
-// readFileToolName is the EXACT tool name the PermissionChecker's classifyTool
-// keys on for the read class — it MUST NOT change without updating check.go.
+// readFileToolName is the EXACT tool name — it MUST equal "ReadFile".
 const readFileToolName = "ReadFile"
 
-// readFileSchema is the JSON Schema for ReadFile's argument object. The field
-// names (path/start_line/end_line) are the boundary-extraction contract shared
-// with check.go (which parses "path").
+// readFileSchema is the JSON Schema for ReadFile's argument object.
 const readFileSchema = `{
   "type": "object",
   "properties": {
@@ -92,37 +93,93 @@ func (r *ReadFile) AuditSummary(argsJSON string) string {
 	return "ReadFile " + a.Path
 }
 
-// InvokableRun reads the file and returns line-numbered text. Every failure mode
-// (bad args, escape, denied path, symlink, not-found, not-regular, read error) is
-// returned as a tool-result error string — never a Go error and never echoing a
-// secret's contents.
-func (r *ReadFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+// readFileArtifact is ReadFile's typed prepared artifact: the validated,
+// canonicalized target plus the displayed line range, bound to one call by
+// PrepareCall and consumed by InvokableRun without reparsing the raw JSON. It
+// deliberately embeds tool.TokenArtifact to satisfy the sealed
+// tool.PreparedArtifact marker; the typed fields stay tool-private.
+type readFileArtifact struct {
+	tool.TokenArtifact
+	abs       string // canonical symlink-resolved path (requirement Scope/Match, observation key)
+	lexical   string // lexically-joined on-disk name the O_NOFOLLOW open targets
+	display   string // model-supplied path, used only in messages
+	startLine int
+	endLine   int
+}
+
+// prepareRead is the SINGLE parse-validate-canonicalize step for a ReadFile
+// call.
+func (r *ReadFile) prepareRead(argsJSON string) (*readFileArtifact, error) {
 	var a readFileArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
-		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
+		return nil, &readFileError{reason: "invalid arguments: not a JSON object", cause: err}
 	}
 	if a.Path == "" {
-		return tool.TextResult("error: a non-empty 'path' is required"), nil
+		return nil, &readFileError{reason: "a non-empty 'path' is required"}
 	}
 	if err := validateLineRange(a.StartLine, a.EndLine); err != nil {
-		return tool.TextResult("error: " + err.Error()), nil
+		return nil, err
 	}
-
-	// Stage 1: containment (symlink-aware). Resolves symlinks and proves the
-	// target is inside the workspace; an escape (including an in-workspace symlink
-	// pointing OUT) is rejected here. On escape, echo only the requested path. An
-	// escaping read authorizes no mutation: we record nothing.
 	abs, err := workspace.ContainedPath(r.root, a.Path)
 	if err != nil {
-		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
+		return nil, &readFileError{reason: "path is outside the workspace", cause: err}
 	}
-	key := abs
+	return &readFileArtifact{
+		abs:       abs,
+		lexical:   joinedUnderRoot(r.root, a.Path),
+		display:   a.Path,
+		startLine: a.StartLine,
+		endLine:   a.EndLine,
+	}, nil
+}
+
+// PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
+// canonical read target ONCE, and returns the typed request — one direct
+// filesystem.read requirement whose Scope and Match are the canonical resolved
+// path, empty grant pair — plus the typed artifact InvokableRun executes.
+// Invalid input fails here and never reaches the permission gate.
+func (r *ReadFile) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	art, err := r.prepareRead(argsJSON)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	return tool.Request{
+		ToolName:     readFileToolName,
+		ExecutionID:  executionID.String(),
+		Requirements: []tool.Requirement{prepared.PathReadRequirement(art.abs)},
+	}, art, nil
+}
+
+// InvokableRun executes the PREPARED artifact bound to this call — the raw
+// argsJSON is never reparsed, so mutating it after preparation changes
+// nothing; without its artifact the tool fails closed. Every failure mode
+// (denied path, changed resolution, symlink, not-found, not-regular, read
+// error) is returned as a tool-result error string — never a Go error and
+// never echoing a secret's contents.
+func (r *ReadFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	art, ok := prepared.FromContext[*readFileArtifact](ctx)
+	if !ok || art == nil {
+		return tool.TextResult("error: permission denied: ReadFile requires its prepared call artifact"), nil
+	}
+
+	// Stage 1: enforce the APPROVED resolved path. Preparation proved
+	// containment once for the permission decision; re-proving the resolution
+	// still equals the approved canonical target closes the prepare→run window
+	// (a parent-dir symlink swap must not redirect the read).
+	abs, err := workspace.ContainedPath(r.root, art.display)
+	if err != nil {
+		return tool.TextResult("error: path is outside the workspace: " + art.display), nil
+	}
+	if abs != art.abs {
+		return tool.TextResult("error: path resolution changed since approval: " + art.display), nil
+	}
+	key := art.abs
 
 	// Stage 2: denied-path enforcement (secrets). DeniedRead's contract wants the
 	// containedPath-resolved ABSOLUTE path. Echo the requested path only, never
 	// the file body. A denied read authorizes no mutation: we record nothing.
-	if r.guard.DeniedRead(abs) {
-		return tool.TextResult("error: read denied: " + a.Path), nil
+	if r.guard.DeniedRead(art.abs) {
+		return tool.TextResult("error: read denied: " + art.display), nil
 	}
 
 	// Stage 3 (step 5): open the LEXICALLY-joined path (not the symlink-resolved
@@ -130,7 +187,7 @@ func (r *ReadFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 	// being followed — both rejecting a static symlinked file AND closing the
 	// resolve→open TOCTOU window. Containment above already guaranteed the target
 	// is inside the workspace; the fd stat below confirms a regular file.
-	body, truncated, err := r.readCapped(joinedUnderRoot(r.root, a.Path))
+	body, truncated, err := r.readCapped(art.lexical)
 	if err != nil {
 		// A DEFINITIVE not-found records absence (authorizing a later create of a
 		// genuinely new file). Every other failure — symlink (ELOOP), not-regular,
@@ -163,7 +220,7 @@ func (r *ReadFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 		})
 	}
 
-	out := numberLines(body, a.StartLine, a.EndLine)
+	out := numberLines(body, art.startLine, art.endLine)
 	if truncated {
 		out += "\n[truncated: file exceeds the " + strconv.FormatInt(r.guard.MaxReadBytes(), 10) + "-byte read cap]"
 	}
@@ -282,9 +339,10 @@ func (e *readFileError) Error() string { return e.reason }
 
 func (e *readFileError) Unwrap() error { return e.cause }
 
-// compile-time assertions: ReadFile is an InvokableTool and Auditable, and is
-// NOT a PermissionPrompter (AutoApprove).
+// compile-time assertions: ReadFile is an InvokableTool, a CallPreparer, and
+// Auditable.
 var (
 	_ tool.InvokableTool = (*ReadFile)(nil)
+	_ tool.CallPreparer  = (*ReadFile)(nil)
 	_ tool.Auditable     = (*ReadFile)(nil)
 )

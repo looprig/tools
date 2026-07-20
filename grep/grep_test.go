@@ -36,18 +36,7 @@ func runGrep(t *testing.T, root string, guard loop.ReadGuard, args map[string]an
 	// Force the deterministic WalkDir fallback so tests do not depend on whether
 	// ripgrep is installed on the host.
 	g := newGrepWithBackend(root, guard, false)
-	res, err := g.InvokableRun(context.Background(), string(b))
-	if err != nil {
-		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
-	}
-	if res == nil || len(res.Content) != 1 {
-		t.Fatalf("result = %v, want exactly 1 block", res)
-	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	return tb.Text
+	return runPreparedGrep(t, g, string(b))
 }
 
 func TestGrepInfo(t *testing.T) {
@@ -287,16 +276,12 @@ func TestGrepFallbackTimeout(t *testing.T) {
 	cancel() // expire before the walk begins.
 
 	g := newGrepWithBackend(root, newFakeReadGuard(1<<20), false)
-	res, err := g.InvokableRun(ctx, `{"pattern":"findme"}`)
+	res, err := invokePreparedGrep(ctx, t, g, `{"pattern":"findme"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
 	}
-	tb, ok := res.Content[0].(*content.TextBlock)
-	if !ok {
-		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
-	}
-	if !strings.Contains(tb.Text, "timed out") {
-		t.Errorf("output = %q, want it to report the timeout", tb.Text)
+	if out := grepText(t, res); !strings.Contains(out, "timed out") {
+		t.Errorf("output = %q, want it to report the timeout", out)
 	}
 }
 
@@ -321,7 +306,7 @@ func TestGrepTimeoutBoundIsApplied(t *testing.T) {
 	cancel() // expire before the exec begins; CommandContext refuses to start it.
 
 	g := newGrepWithBackend(root, newFakeReadGuard(1<<20), true) // force the rg backend.
-	res, err := g.InvokableRun(ctx, `{"pattern":"findme"}`)
+	res, err := invokePreparedGrep(ctx, t, g, `{"pattern":"findme"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
 	}

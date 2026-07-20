@@ -32,12 +32,7 @@ func newWorkspaceSkillTool(t *testing.T, root string) *Skill {
 	return NewSkill(loader, identity.AgentName("operator"), WithWorkspaceRoot(root))
 }
 
-// TestSkillWorkspaceNoReReadAfterPrepare is the TOCTOU proof: after Prepare takes
-// the snapshot, the on-disk file is MUTATED (and then DELETED). InvokableRun must
-// still return the ORIGINAL snapshot Body — it reads the artifact bound to the
-// call, never re-opening the file — so a workspace writer cannot swap the body
-// between the human prompt and execution.
-// TestSkillWorkspaceNoReReadAfterPrepare is the TOCTOU proof: after Prepare takes
+// TestSkillWorkspaceNoReReadAfterPrepare is the TOCTOU proof: after PrepareCall takes
 // the snapshot, the on-disk file is MUTATED (and then DELETED). InvokableRun must
 // still return the ORIGINAL snapshot Body — it reads the artifact bound to the
 // call, never re-opening the file — so a workspace writer cannot swap the body
@@ -52,9 +47,13 @@ func TestSkillWorkspaceNoReReadAfterPrepare(t *testing.T) {
 	s := newWorkspaceSkillTool(t, root)
 	args := `{"name":"ws-refactor"}`
 
-	prepared, err := s.Prepare(context.Background(), uuid.UUID{}, args)
+	id, err := uuid.New()
 	if err != nil {
-		t.Fatalf("Prepare error = %v, want nil", err)
+		t.Fatalf("uuid.New() error = %v", err)
+	}
+	req, prepared, err := s.PrepareCall(context.Background(), id, args)
+	if err != nil {
+		t.Fatalf("PrepareCall error = %v, want nil", err)
 	}
 
 	full := filepath.Join(root, filepath.FromSlash(rel))
@@ -64,7 +63,7 @@ func TestSkillWorkspaceNoReReadAfterPrepare(t *testing.T) {
 	if err := os.WriteFile(full, []byte(tampered), 0o644); err != nil {
 		t.Fatalf("rewrite file: %v", err)
 	}
-	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{Artifact: prepared})
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: prepared})
 	res, err := s.InvokableRun(ctx, args)
 	if err != nil {
 		t.Fatalf("InvokableRun (after mutate) Go error = %v, want nil", err)
@@ -91,11 +90,8 @@ func TestSkillWorkspaceNoReReadAfterPrepare(t *testing.T) {
 }
 
 // TestSkillWorkspaceBadArgsFailSecure proves a workspace-enabled tool with
-// unparseable/empty-name args returns a typed Prepare error (fail-secure) rather
-// than silently loading nothing.
-// TestSkillWorkspaceBadArgsFailSecure proves a workspace-enabled tool with
-// unparseable/empty-name args returns a typed Prepare error (fail-secure) rather
-// than silently loading nothing.
+// unparseable/empty-name args returns a typed preparation error (fail-secure)
+// rather than silently loading nothing.
 func TestSkillWorkspaceBadArgsFailSecure(t *testing.T) {
 	t.Parallel()
 
@@ -114,9 +110,13 @@ func TestSkillWorkspaceBadArgsFailSecure(t *testing.T) {
 			root := t.TempDir()
 			s := newWorkspaceSkillTool(t, root)
 
-			prepared, err := s.Prepare(context.Background(), uuid.UUID{}, tt.argsJSON)
+			id, uerr := uuid.New()
+			if uerr != nil {
+				t.Fatalf("uuid.New() error = %v", uerr)
+			}
+			_, prepared, err := s.PrepareCall(context.Background(), id, tt.argsJSON)
 			if prepared != nil {
-				t.Errorf("Prepare artifact = %v, want nil on bad args", prepared)
+				t.Errorf("PrepareCall artifact = %v, want nil on bad args", prepared)
 			}
 			var ce *SkillContainmentError
 			if !errors.As(err, &ce) {

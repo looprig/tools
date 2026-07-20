@@ -10,7 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/internal/workspace"
 	"github.com/looprig/tools/readfile"
 )
@@ -30,11 +32,7 @@ func invokeWrite(t *testing.T, root string, obs *fileObservations, path, content
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	res, err := NewWriteFile(root, obs).InvokableRun(context.Background(), string(args))
-	if err != nil {
-		t.Fatalf("WriteFile Go error: %v", err)
-	}
-	return res.Content[0].(*content.TextBlock).Text
+	return prepareRun(context.Background(), t, NewWriteFile(root, obs), string(args))
 }
 
 // invokeEdit runs an EditFile bound to obs and returns the tool-result text.
@@ -44,11 +42,7 @@ func invokeEdit(t *testing.T, root string, obs *fileObservations, path, old, rep
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	res, err := NewEditFile(root, obs).InvokableRun(context.Background(), string(args))
-	if err != nil {
-		t.Fatalf("EditFile Go error: %v", err)
-	}
-	return res.Content[0].(*content.TextBlock).Text
+	return prepareRun(context.Background(), t, NewEditFile(root, obs), string(args))
 }
 
 func seedFile(t *testing.T, root, rel, body string) {
@@ -104,9 +98,7 @@ func TestWriteFreshnessGate(t *testing.T) {
 			prepare: func(t *testing.T, root string, obs *fileObservations) {
 				// A tiny read cap forces truncation, which records NO usable hash.
 				args, _ := json.Marshal(map[string]any{"path": "f.txt"})
-				if _, err := readfile.NewReadFile(root, newFakeReadGuard(4), obs).InvokableRun(context.Background(), string(args)); err != nil {
-					t.Fatalf("truncated read Go error: %v", err)
-				}
+				_ = prepareRun(context.Background(), t, readfile.NewReadFile(root, newFakeReadGuard(4), obs), string(args))
 			},
 			newBody:  "new body\n",
 			wantErr:  true,
@@ -449,10 +441,20 @@ func TestConcurrentSamePathWritesAreSerialized(t *testing.T) {
 			defer wg.Done()
 			<-start
 			args, _ := json.Marshal(map[string]any{"path": "f.txt", "content": "payload\n"})
-			// Ignore individual results: a concurrent writer may legitimately observe
+			// Prepare-then-run per writer, mirroring the runner contract. Ignore
+			// individual results: a concurrent writer may legitimately observe
 			// a hash written by a peer and retry-fail; the invariant under test is
 			// race-freedom + a consistent final on-disk state.
-			_, _ = write.InvokableRun(context.Background(), string(args))
+			id, err := uuid.New()
+			if err != nil {
+				return
+			}
+			req, art, err := write.PrepareCall(context.Background(), id, string(args))
+			if err != nil {
+				return
+			}
+			ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+			_, _ = write.InvokableRun(ctx, string(args))
 			_ = n
 		}(i)
 	}
