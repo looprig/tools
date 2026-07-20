@@ -167,6 +167,15 @@ func (s *Store) matches(ctx context.Context, requirement tool.Requirement, effec
 	if err != nil {
 		return false, err
 	}
+	if requirement.Kind == CapabilityCommandExecute {
+		// Shell segments are matched independently and may be covered by
+		// different rules: allow requires every segment covered, deny
+		// triggers on any segment (bashrule.go).
+		if effect == EffectAllow {
+			return commandAllowCovered(rules, requirement.Match), nil
+		}
+		return commandDenyMatched(rules, requirement.Match), nil
+	}
 	for _, rule := range rules {
 		if rule.Effect == effect && matchesRequirement(rule, requirement) {
 			return true, nil
@@ -515,12 +524,13 @@ func commandCandidateRule(index int, rule Rule, match string) (Rule, error) {
 		rule.Class = ClassCommandInvokeWildcard
 	case strings.HasPrefix(match, "Bash(") && strings.HasSuffix(match, ":*)"):
 		body := strings.TrimSuffix(strings.TrimPrefix(match, "Bash("), ":*)")
-		tokens := strings.Fields(body)
-		if err := validateFamilyTokens(tokens); err != nil {
-			return Rule{}, &RuleError{Index: index, Reason: "family candidate rejected: " + err.Error()}
-		}
-		if strings.Join(tokens, " ") != body {
-			return Rule{}, &RuleError{Index: index, Reason: "family candidate is not a normalized token sequence"}
+		tokens, err := parseFamilyCandidateTokens(body)
+		if err != nil {
+			var ruleErr *RuleError
+			if errors.As(err, &ruleErr) {
+				ruleErr.Index = index
+			}
+			return Rule{}, err
 		}
 		rule.Class, rule.Tokens, rule.TrailingArguments = ClassCommandInvokeFamily, tokens, true
 	case strings.HasPrefix(match, "Bash("):

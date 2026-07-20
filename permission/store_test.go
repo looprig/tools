@@ -290,3 +290,61 @@ func TestConcurrentInterprocessMerge(t *testing.T) {
 		}
 	}
 }
+
+// TestStoreFamilyMatchingEndToEnd proves a persisted Bash(git log:*) approval
+// satisfies later exact commands through MatchesAllow, never crosses a
+// segment boundary, and composes with a later-approved exact segment.
+func TestStoreFamilyMatchingEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	path := testPath(t)
+	store := mustWorkspaceStore(t, Config{Path: path})
+
+	family := tool.RuleCandidate{Kind: CapabilityCommandExecute, Match: "Bash(git log:*)", Description: "d", GrantClass: GrantClassCommandStart, GrantTarget: "git log --graph"}
+	if err := store.WriteRules(ctx, []tool.RuleCandidate{family}); err != nil {
+		t.Fatalf("WriteRules(family): %v", err)
+	}
+
+	later := mustWorkspaceStore(t, Config{Path: path})
+	for _, command := range []string{"git log", "git log --graph", "git log -n 3"} {
+		if matched, err := later.MatchesAllow(ctx, commandRequirement(command)); err != nil || !matched {
+			t.Fatalf("persisted family did not satisfy %q: %v, %v", command, matched, err)
+		}
+	}
+	for _, command := range []string{"git status", "git catalog", "git log; rm -rf output"} {
+		if matched, err := later.MatchesAllow(ctx, commandRequirement(command)); err != nil || matched {
+			t.Fatalf("persisted family wrongly satisfied %q: %v, %v", command, matched, err)
+		}
+	}
+
+	// A separately approved exact segment completes per-segment coverage.
+	if err := store.WriteRules(ctx, []tool.RuleCandidate{commandCandidate("rm -rf output")}); err != nil {
+		t.Fatalf("WriteRules(exact): %v", err)
+	}
+	if matched, err := later.MatchesAllow(ctx, commandRequirement("git log; rm -rf output")); err != nil || !matched {
+		t.Fatalf("family plus exact segment did not cover the compound command: %v, %v", matched, err)
+	}
+}
+
+// TestStoreDenyFamilySegments proves a deny family tightens any segment of a
+// compound command even when a wildcard allow exists.
+func TestStoreDenyFamilySegments(t *testing.T) {
+	ctx := context.Background()
+	path := testPath(t)
+	writeValidFile(t, path, []Rule{
+		{Effect: EffectAllow, Capability: CapabilityCommandExecute, Class: ClassCommandInvokeWildcard},
+		{Effect: EffectDeny, Capability: CapabilityCommandExecute, Class: ClassCommandInvokeFamily, Tokens: []string{"git", "push"}, TrailingArguments: true},
+	})
+	store, _, err := NewReadOnlyStore(Config{Path: path})
+	if err != nil {
+		t.Fatalf("NewReadOnlyStore: %v", err)
+	}
+	if matched, err := store.MatchesDeny(ctx, commandRequirement("git log && git push origin main")); err != nil || !matched {
+		t.Fatalf("deny family missed its segment: %v, %v", matched, err)
+	}
+	if matched, err := store.MatchesDeny(ctx, commandRequirement("git log")); err != nil || matched {
+		t.Fatalf("deny family over-matched: %v, %v", matched, err)
+	}
+	if matched, err := store.MatchesAllow(ctx, commandRequirement("git log && git push origin main")); err != nil || !matched {
+		t.Fatalf("wildcard allow should still answer allow (gate orders deny first): %v, %v", matched, err)
+	}
+}

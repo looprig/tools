@@ -46,13 +46,18 @@ func TestMatchWildcardCommandOnly(t *testing.T) {
 	}
 }
 
-// TestMatchFamilyDeferred pins the Task 3.1 state: family rules load and
-// store, but the token-aware segment matcher lands in Task 3.2, so a family
-// rule matches nothing yet and can never satisfy another capability.
-func TestMatchFamilyDeferred(t *testing.T) {
+// TestMatchFamilyTokenSegments proves the token-aware family matcher: token
+// equality on every shell segment, no string prefixes, no boundary crossing,
+// and never another capability.
+func TestMatchFamilyTokenSegments(t *testing.T) {
 	rule := Rule{Effect: EffectAllow, Capability: CapabilityCommandExecute, Class: ClassCommandInvokeFamily, Tokens: []string{"git", "log"}, TrailingArguments: true}
-	if matchesRequirement(rule, commandRequirement("git log -n 3")) {
-		t.Fatal("family matching is Task 3.2; the store must not match yet")
+	if !matchesRequirement(rule, commandRequirement("git log -n 3")) {
+		t.Fatal("family rule did not match its own command with trailing arguments")
+	}
+	for _, other := range []string{"git status", "git catalog", "git", "git log; rm -rf output", "git log && rm x"} {
+		if matchesRequirement(rule, commandRequirement(other)) {
+			t.Fatalf("family rule matched %q", other)
+		}
 	}
 	network := tool.Requirement{Kind: CapabilityNetwork, Match: NetworkTargetMatch("tcp", "github.com", 443), Description: "d"}
 	if matchesRequirement(rule, network) {

@@ -29,10 +29,11 @@ func matchesRequirement(rule Rule, requirement tool.Requirement) bool {
 		// grant remains the exact-command command.start.v1.
 		return true
 	case ClassCommandInvokeFamily:
-		// Family storage lands in Task 3.1; the token-aware shell-segment
-		// matcher is Task 3.2 and plugs in here. Until then a family rule
-		// matches nothing, which fails closed for allow and never widens.
-		return false
+		// Token-aware shell-segment family matching: every segment of the
+		// normalized command must lead with exactly the family tokens. The
+		// store additionally combines rules per segment (bashrule.go) so a
+		// compound command may be covered by several allow rules.
+		return familyMatchesCommand(rule, requirement.Match)
 	case ClassNetworkTarget:
 		return matchesNetworkTarget(rule, requirement)
 	case ClassNetworkBroad:
