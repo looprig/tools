@@ -19,6 +19,19 @@ This module provides optional standard tools for looprig consumers. The harness 
 - Keep tool effects explicit and fail secure when permission or containment is uncertain: invalid input fails during preparation, a prepared tool without its typed artifact refuses to run, and rule-file load failures are errors.
 - Deliberate exception, recorded here: Bash hands the model-supplied command to `sh -c` (an argv list cannot express shell features). The security boundary is the permission gate over the prepared command-backed request plus the injected confined runner, not the argv shape.
 
+## Dependencies
+
+**Prefer stdlib.** Always reach for the Go standard library first. If a need can be met with stdlib — even with a bit more code — use stdlib.
+
+**External packages require explicit user approval.** Before adding any external dependency, stop and ask the user. State what the package is, why stdlib is insufficient, and what the package adds. Do not `go get` or add to `go.mod` without a clear "yes" from the user in the current conversation.
+
+**Amend this file when approved.** Once a package is approved, add it here so future sessions know it is sanctioned:
+
+<!-- Approved external packages -->
+- `github.com/securego/gosec/v2` — security static analysis tool (dev/tool only)
+- `golang.org/x/vuln/cmd/govulncheck` — official Go vulnerability scanner (dev/tool only)
+- `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
+
 ## Testing
 
 - Run `GOWORK=off go test -race ./...` (and `-tags integration` for the integration suite).
