@@ -811,11 +811,16 @@ returns and transfers its `elevatedRunnerExecution`, and the public process
 handle waits or stops that owned execution. It must not place a goroutine around
 the blocking `Launch` call. The transfer owns both the per-execution broker
 release and the compiled elevated-spec `active.Done` retirement obligation;
-compiled-spec release continues waiting for that execution. Both restricted
-and elevated Job paths retain broker/ACL, grant/path, proxy, and backend
-authority until Job-empty proof. If proof is delayed, the whole ownership
-capsule moves to process-level quarantine; no authority or lifecycle callback
-is released from the returned launch stack.
+the launch stack owns both until it reaches one of three outcomes. A failure
+before any Job/process authority exists retires both synchronously exactly once.
+After a Job exists or process authority may exist, launch failure retires
+neither until exact Job-zero proof; delayed/indeterminate proof transfers the
+whole failed-launch capsule to process-level quarantine, whose successful proof
+retires both. Successful handoff atomically transfers both obligations to the
+returned execution. Compiled-spec release continues waiting while any
+obligation is live, never returns early, and unblocks after direct or
+quarantined proof. Both restricted and elevated paths retain broker/ACL,
+grant/path, proxy, and backend authority through that boundary.
 
 ### Unsupported PTY environments
 

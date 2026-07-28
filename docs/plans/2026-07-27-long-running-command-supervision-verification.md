@@ -120,3 +120,13 @@ This was a documentation-only correction. Per the user's verification
 scheduling policy, no race, integration, fuzz, static-analysis, vulnerability,
 or trimpath command was run here; those checks remain exclusively at their
 owning phase gates.
+
+### Residual elevated-launch ownership clarification
+
+Task 10D now distinguishes pre-authority failure, failed launch after a
+Job/process may exist, and successful asynchronous handoff. The launch stack
+owns broker release and compiled-spec active retirement until one outcome
+atomically releases or transfers both. The focused plan test covers suspended
+creation, assignment, and resume failure and proves `Spec.Release` is neither
+early nor permanently blocked. This is also documentation-only; the
+phase-boundary verification schedule is unchanged.

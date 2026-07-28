@@ -1344,15 +1344,36 @@ Execute independently:
   existing `elevatedRunnerExecution`; transfer the stdio bridge and release
   closure with it. The transfer includes two distinct retirement obligations:
   the per-execution broker lease release and the compiled elevated-spec
-  `active.Done` registered before launch. Neither may remain deferred on the
-  returning `Launch` stack; both move into the owned execution and run exactly
-  once only after terminal Job-zero proof. If that proof is delayed, transfer
-  the execution together with the complete grant/path/proxy/backend capsule to
-  the process-level quarantine reaper. The compiled spec's `Release` must
-  continue waiting on `active` and cannot retire broker authority early.
+  `active.Done` registered before launch.
+
+  Ownership is conditional and linearized:
+
+  1. Before successful asynchronous handoff, the launch stack owns both
+     obligations.
+  2. A failure before creating either a Job or process authority releases the
+     broker lease and calls `active.Done` synchronously, each exactly once.
+  3. Once a Job exists or process creation may have returned authority, any
+     suspended-create, assignment, resume, or later launch failure must first
+     obtain exact Job-zero proof. If proof succeeds, that proof path releases
+     the broker lease and calls `active.Done`; if proof is delayed or
+     indeterminate, the full failed-launch capsule—including Job/process
+     handles, streams, grant/path/proxy/backend releases, broker release, and
+     `active.Done`—moves atomically to process-level quarantine. Only successful
+     quarantine proof/cleanup retires those obligations.
+  4. A successful handoff atomically transfers both obligations to the returned
+     execution; the launch stack retains neither.
+
+  The compiled spec's `Release` must remain blocked while any such `active`
+  obligation is live, must never return before authority retirement, and must
+  not remain permanently blocked after proof/quarantine completion.
   Add `TestElevatedAsyncExecutionRetainsBrokerAndSpecActivityUntilJobZero` and
   `TestElevatedAsyncExecutionQuarantineOwnsRetirements` before changing the
-  bridge.
+  bridge. Also add
+  `TestElevatedAsyncExecutionLaunchFailureRetiresAfterProof` with
+  suspended-create, Job-assignment, and resume-failure cases. It proves broker
+  release and `active.Done` do not occur before exact proof, occur exactly once
+  after direct or quarantined proof, and `Spec.Release` is neither early nor
+  permanently blocked.
   RED/GREEN selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/windows ./internal/exec -run
