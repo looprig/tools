@@ -391,7 +391,7 @@ Files: `pkg/rig/session_resource_storage.go`,
 `TestRigDefinitionCapturesResourceStorageProviderImmutably`, then run:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/rig -run 'Test(RigRequiresResourceStorage|ResourceStorage)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/rig -run 'Test(Rig.*ResourceStorage|ResourceStorage)'
 ```
 
 Expected RED: no provider option. Add only the public definition-time provider
