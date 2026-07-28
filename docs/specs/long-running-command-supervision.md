@@ -1,4 +1,4 @@
-# Long-Running Command Supervision Design
+# Long-Running Command Supervision Specification
 
 **Status:** Approved
 
@@ -114,7 +114,8 @@ Harness owns generic orchestration contracts:
 - session, loop, and tool-execution identity in bindings;
 - registration of resources that must be closed with a session;
 - keyed, concurrency-safe get-or-create access to shared session resources;
-- a private per-session storage root for resource manifests and spools;
+- a configured, restorable private per-session storage provider for resource
+  manifests and spools;
 - the async process runner interface consumed by Tools;
 - durable process lifecycle event types;
 - completion notification delivery;
@@ -148,6 +149,8 @@ Coderig is the production composition root. It owns:
 
 - the adapter from Sandbox's public asynchronous process API to Harness's public
   async runner/process contracts;
+- configuration of the durable resource root beneath Coderig's data directory
+  for persisted sessions and an isolated temporary root for headless sessions;
 - construction of one Tools supervisor through the Harness session-resource
   registry;
 - injection of the shared supervisor into Bash, ProcessOutput, ProcessInput, and
@@ -405,8 +408,16 @@ at most one terminal state and one completion event.
 The supervisor is created once per Harness session and registered as a session
 resource. Harness bindings expose a keyed session-resource registry; every
 process-tool definition resolves the same supervisor key with atomic
-get-or-create semantics. The registry also supplies a private session storage
-root, never the workspace, for manifests and spools.
+get-or-create semantics. The registry obtains storage from an explicit
+session-resource storage provider. Persisted Coderig sessions use a stable
+`<data-dir>/resources/<session-id>` root on both new and restore; headless
+sessions use isolated temporary storage and do not claim cross-process restore.
+The Coderig process owns each headless temporary root for its lifetime and keys
+the session subdirectory by SessionID. Reconstructing the same headless session
+in the same Coderig process therefore reopens the same resource root; only an
+actual Coderig restart forfeits headless restore.
+Unavailable or identity-mismatched durable storage fails session construction.
+The resource root is never the workspace.
 
 New-session and restore construction use the same late-bound session bridge.
 Definitions may be probed before the final Session and event hub exist, so a
@@ -485,7 +496,9 @@ Before returning a process handle, Tools atomically persists a manifest containi
 - spool metadata and cursor bounds;
 - OS execution metadata needed only for same-process teardown;
 - terminal result fields when complete;
-- completion-published marker.
+- stable lifecycle EventIDs and completion-notification CommandID allocated
+  before publication;
+- completion-published marker as an optimization, not the deduplication boundary.
 
 Manifest updates use write-new, sync, and atomic replace semantics. State and
 cursor metadata never move backward.
@@ -495,8 +508,11 @@ On normal session restore:
 - completed manifests and retained output are queryable;
 - a manifest marked running or starting becomes `lost_on_restore`;
 - recorded local PIDs are never trusted or signalled;
-- at most one restored completion notification is emitted, based on the durable
-  completion-published marker.
+- lifecycle and notification publication reuses the stable persisted IDs, so
+  the durable journal idempotency index deduplicates a crash between append and
+  marker;
+- the completion-published marker avoids needless retries but is not required
+  for at-most-once journal state.
 
 Authenticated reattachment to an external execution service may be added later;
 local PID reattachment is explicitly excluded.
@@ -514,6 +530,71 @@ Harness defines typed metadata-only lifecycle events:
 Events include identity, state, timestamps, exit metadata, reason, and bounded
 non-output diagnostics. Command output and stdin are excluded.
 
+Tools allocates and persists the stable lifecycle/notification IDs before a
+transition can be published. Harness uses those IDs as the EventID/CommandID
+rather than minting replacements.
+
+Stable IDs are necessary but not sufficient. Harness adds backend-neutral,
+durable journal deduplication for both event and command records:
+
+- opening a session journal reconstructs an index of every non-zero
+  idempotency ID from the durable ledger before accepting appends;
+- an identical retry returns the original sequence and `appended=false`
+  without writing or publishing again;
+- reusing an ID for a different record is a typed collision error;
+- the index is updated under the same journal append lock, so two concurrent
+  retries cannot both append;
+- the behavior is storage-backend independent and is integration-tested through
+  the real fsstore/sessionstore reopen path.
+
+The opening ownership fence deliberately uses the raw fenced append path and is
+never deduplicated, even when a lease epoch repeats. Replay preserves the
+envelope ID through inline and blob-pointer decoding, verifies that an outer
+blob-pointer ID equals the resolved inner ID, and rejects inconsistencies before
+index hydration. The durable fingerprint is the persisted record kind plus
+payload bytes; it excludes the transient `CommandRecord` route because the
+current envelope does not persist that route. `ProcessNotification` therefore
+carries its target coordinates in its sealed payload, and append validation
+requires those coordinates to equal the enclosing live command route.
+
+The Hub accepts an optional result-bearing appender. Its no-persistence appender
+reports `appended=true`; a durable duplicate reports `appended=false`, and Hub
+does not reapply or rebroadcast that event.
+
+Completion command delivery is at-least-once across a crash boundary but
+idempotent. The owning native loop keeps a bounded set of unresolved
+CommandID/payload-fingerprint entries, seeded on restore by subtracting durable
+command-causality events from the full process-notification command replay.
+Consumed IDs are not kept in an evicting cache: `appended=false` with no
+unresolved entry means the durable command was already consumed.
+
+Live delivery uses a pre-append reservation handshake. The loop atomically
+reserves the unresolved `(CommandID, fingerprint, pending)` entry and its
+bounded capacity before Harness appends the command. No capacity returns
+retryable-full before append. Append failure releases the reservation; append
+success commits it. If the regular inbox is full after append, the pending
+reservation remains and a same-ID retry reuses it, so `appended=false` cannot be
+misclassified as consumed. Restore fails closed if the reconstructed unresolved
+set exceeds its configured cap, and no path evicts an unresolved entry.
+Reservation is singleflight per `(LoopID, CommandID)` and carries a unique
+generation token. Identical concurrent claimants share the leader's outcome;
+only the current uncommitted generation may be released, and commit is
+idempotent. A failed leader cannot delete a later successful pending obligation.
+A transient acknowledgement reports accepted, duplicate, collision,
+retryable-full, or stopped. An identical unresolved command is retried; a
+consumed duplicate is ignored; a conflicting payload is rejected. The
+notification is removed from the unresolved set only after an enduring loop
+event carrying its command cause commits. This closes both the
+append-before-dispatch and dispatch-before-crash windows without making the
+ordinary audit-only command path strict.
+
+Process-enabled definitions are supported only by native Harness loops in this
+release. Bind/restore validation rejects `RequiresProcessServices` on a foreign
+engine with `process_notifications_unsupported`; it must not silently start a
+process that cannot receive completion. Legacy foreground Bash remains
+available under its existing engine rules. A future backend-neutral foreign
+notification contract may widen this scope.
+
 Completion notifications are also metadata-only. They tell the loop that a
 process reached a terminal state and provide its opaque handle. The model must
 call `ProcessOutput` to inspect command-controlled content. This keeps arbitrary
@@ -526,12 +607,19 @@ Background processes require an enforcement-capable async runner. The prepared
 filesystem access granted at spawn becomes a workspace lease held for the entire
 process lifetime.
 
-Lease classification comes from the enforcing runner's authoritative effective
-access summary, not solely from the model's requested access declaration. The
-Coderig adapter maps the Sandbox executor's normalized profile and approved
-per-spawn deltas to Harness's generic read-only, scoped-write, or broad-write
-lease description. If an async runner cannot truthfully report effective access,
-supervised spawn fails with `lifetime_enforcement_unavailable`.
+Lease classification comes from a two-phase enforcing-runner protocol, not from
+the model's declaration or Coderig parsing opaque grants:
+
+1. `PrepareProcess` validates and reserves grants/resources without spawning,
+   returning an opaque prepared process and its authoritative effective access;
+2. Tools acquires the matching Harness lifetime workspace lease;
+3. `Start` consumes the preparation exactly once and spawns;
+4. any failure closes the preparation and releases all reservations.
+
+The Coderig adapter only maps Sandbox's normalized access type to Harness's
+generic read-only, scoped-write, or broad-write description. If the runner
+cannot truthfully prepare access or prove lifetime containment, supervised spawn
+fails with `lifetime_enforcement_unavailable`.
 
 Lease compatibility:
 
@@ -544,21 +632,48 @@ Lease compatibility:
 All writable background leases block workspace snapshots. Workspace restore
 first stops all supervised processes, confirms their exit, then performs restore.
 
+Each admission captures the originating loop's observation capability.
 Observation caches are invalidated at process spawn, on reported filesystem
-activity when available, and at process completion. A broad writer invalidates
-the entire workspace observation set.
+activity when the prepared/running process exposes an activity source, and at
+process completion. A broad writer invalidates the entire workspace observation
+set.
+
+Activity reporting is an optional typed process capability:
+
+```go
+type ProcessActivity struct {
+    Kind WorkspaceActivityKind
+}
+
+type ProcessActivitySource interface {
+    Activities() <-chan ProcessActivity
+}
+```
+
+Sandbox may expose the equivalent interface without importing Harness and
+Coderig maps the value mechanically. Every reported filesystem activity
+invalidates the loop's complete observation cache; scoped observation
+invalidation is not part of this feature. Malformed or overflowed activity is
+treated as broad activity. Activity can never narrow or mutate the immutable
+lifetime lease. The activity channel closes before `Wait` returns.
 
 The bare, unenforced runner remains available only for legacy foreground Bash.
 It may not create a background, yielded, or detached process.
 
 ## Sandbox process contract
 
-Harness exposes a public, shell-agnostic async runner contract conceptually
+Harness exposes a public, shell-agnostic two-phase runner contract conceptually
 equivalent to:
 
 ```go
 type AsyncProcessRunner interface {
-    StartProcess(context.Context, ProcessRequest) (Process, error)
+    PrepareProcess(context.Context, ProcessRequest) (PreparedProcess, error)
+}
+
+type PreparedProcess interface {
+    EffectiveWorkspaceAccess() WorkspaceAccess
+    Start(context.Context) (Process, error)
+    Close() error
 }
 
 type Process interface {
@@ -576,8 +691,12 @@ type Process interface {
 Exact Go names may follow existing package conventions, but the contract must:
 
 - distinguish pipe and PTY streams;
+- validate/reserve grants before lease acquisition without spawning;
+- make prepared start single-use and close idempotent;
 - make `Wait` safe to call exactly once through a supervisor-controlled path;
 - define concurrent stdin and signal behavior;
+- optionally expose the typed activity stream above, with closure ordered
+  before `Wait` returns;
 - return typed spawn, setup, signal, wait, and teardown errors;
 - confirm whole-tree exit;
 - not expose an OS PID as the model-facing identity.
@@ -596,6 +715,12 @@ Each process starts in a dedicated process group. Sandbox signals the group, not
 only its initial child. A lifetime shim holds a parent-death pipe; EOF causes the
 shim to terminate the group. PTY support uses `github.com/creack/pty`, approved
 for this feature.
+
+On Linux, cgroup/PID-namespace capabilities are used where required to prevent
+session escape. A Unix backend that cannot prove descendant containment,
+including a Darwin configuration vulnerable to `setsid` escape, reports
+`lifetime_enforcement_unavailable` for supervised execution. It must not claim
+the guarantee based only on process groups or polling.
 
 ### Windows
 
@@ -638,6 +763,7 @@ The public error taxonomy includes:
 - `process_quota_exceeded`;
 - `output_quota_exceeded`;
 - `lifetime_enforcement_unavailable`;
+- `process_notifications_unsupported`;
 - `spawn_failed`;
 - `process_setup_failed`;
 - `pty_unavailable`;
@@ -674,7 +800,10 @@ The implementation is unacceptable unless all of these remain true:
 6. The model never receives a host path or OS PID as a control handle.
 7. Command output never appears in a trusted completion notification.
 8. Output and input remain bounded in memory and on disk.
-9. Terminal state and completion publication occur at most once.
+9. Terminal state occurs once; lifecycle and notification publication reuse
+   pre-persisted stable IDs, durable journal appends deduplicate identical IDs
+   across reopen, and restored loop notification state suppresses replayed
+   commands.
 10. Restore never signals a PID recovered from persisted metadata.
 
 ## Delivery phases
