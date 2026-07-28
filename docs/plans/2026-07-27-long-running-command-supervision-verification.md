@@ -64,3 +64,12 @@ rerun is required and will be recorded here before Phase 3 begins.
   worker evidence.
 - Live Sandbox evidence remains an explicit Phase 3 blocker; it is not reported
   as passing or silently skipped.
+
+## Phase 1 — Verification scheduling note
+
+On 2026-07-28 the user directed that expensive verification run only at phase
+boundaries. Task 1's focused non-race tests and review evidence remain valid.
+The proposed post-task Harness Govulncheck was not run and is not reported as
+passing; it is deferred to the complete Phase Gate 1 `make secure` invocation,
+alongside the phase race suite, tagged integration listing/execution, and
+trimpath builds.

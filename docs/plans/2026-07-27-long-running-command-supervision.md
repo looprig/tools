@@ -47,8 +47,8 @@ For every numbered task:
 1. Dispatch a fresh implementation subagent with the complete task text.
 2. Require `superpowers:test-driven-development`.
 3. The implementer writes one failing test and runs it before production code.
-4. The implementer writes only enough code for green, runs affected race tests,
-   refactors while green, self-reviews, and commits.
+4. The implementer writes only enough code for green, runs the focused
+   non-race test, refactors while green, self-reviews, and commits.
 5. Dispatch a fresh spec-compliance reviewer.
 6. Send every gap back to the same implementer, then re-review until approved.
 7. Dispatch a fresh code-quality/security reviewer with the task's base and head
@@ -57,24 +57,34 @@ For every numbered task:
    until approved.
 9. Only then mark the task complete.
 
-Before every commit, run `git diff --check`, affected `go test -race` commands,
-and repository-required security checks. Harness and Coderig require
-`make secure` before every commit. Tools and Sandbox also run `make secure`
-before commit unless the task changes only documentation; any environment-blocked
-vulnerability lookup is rerun with the required approved network permission and
-may not be reported as passing without evidence.
+Before every task or microtask commit, run only:
 
-At every `PHASE GATE`, run the listed unit, race, integration, build, and static
-checks. Then dispatch one phase-level spec reviewer and one phase-level
-code-quality/security reviewer over the complete phase diff. Do not enter the
-next phase with an unresolved finding.
+1. `gofmt` on changed Go files;
+2. the task's focused `go test` command without `-race`; and
+3. `git diff --check`.
+
+Do not run race tests, tagged integration discovery or execution, fuzzing,
+repeated/count stress, static analysis, vulnerability checks, `make secure`, or
+trimpath/cross-platform builds at task or microtask boundaries. This keeps the
+TDD loop fast without weakening acceptance: every one of those checks is
+batched at the owning `PHASE GATE`.
+
+At every `PHASE GATE`, run its complete command matrix: full relevant
+`go test -race` suites; `go test -tags integration -list` followed by tagged
+integration execution where that phase owns integration tests; every fuzz
+target accumulated through that phase; repository `make secure` (which includes
+format checks, Vet, Staticcheck, Gosec, and Govulncheck); and `CGO_ENABLED=0`
+trimpath native/cross-builds relevant to the changed repositories. Then dispatch
+one phase-level spec reviewer and one phase-level code-quality/security reviewer
+over the complete phase diff. Do not enter the next phase with an unresolved
+finding or a deferred required check.
 
 Append one section per gate to
 `tools/docs/plans/2026-07-27-long-running-command-supervision-verification.md`
 containing exact base/head SHAs for every affected repository, command strings,
-exit codes, the integration test names printed by `go test -list`, environment
-or CI run IDs, reviewer findings, fixes, re-review disposition, and the final
-gate decision. Commit that evidence before the next phase.
+exit codes, integration test names printed by `go test -list`, fuzz durations,
+environment or CI run IDs, reviewer findings, fixes, re-review disposition, and
+the final gate decision. Commit that evidence before the next phase.
 
 No production code may be written before its failing test. Configuration and
 module metadata synchronization in Task 0 is the only non-production exception.
@@ -121,9 +131,9 @@ Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=readonly go test -race ./pkg/tool
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=readonly go test ./pkg/tool
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./bash
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash
 ```
 
 Expected: both fail with `updates to go.mod needed, disabled by -mod=readonly`.
@@ -145,20 +155,20 @@ GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache go mod tidy
 Expected: only existing requirements are synchronized; no new direct module is
 introduced.
 
-**Step 3: Verify the baseline**
+**PHASE GATE 0: Verify the baseline**
 
 Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/tool ./internal/sessionruntime
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/tool ./internal/sessionruntime
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./bash .
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash .
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/policy ./internal/platform ./pkg/profile
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/policy ./internal/platform ./pkg/profile
 CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./internal/app
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app
 ```
 
 Expected: PASS. Separately run Sandbox's existing live `./internal/exec` suite
@@ -255,7 +265,7 @@ Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/tool -run 'TestProcessContract|TestProcessError|TestWorkspaceAccess'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/tool -run 'TestProcessContract|TestProcessError|TestWorkspaceAccess'
 ```
 
 Expected: FAIL because `process.go` and its types do not exist.
@@ -269,13 +279,7 @@ handles out of this runner layer.
 
 **Step 4: Verify GREEN**
 
-Run the focused command, then:
-
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/tool
-```
-
-Expected: PASS.
+Re-run the exact focused command from Step 2. Expected: PASS.
 
 **Step 5: Commit**
 
@@ -305,7 +309,7 @@ transition, and is activated only when the real Session, hub, publisher, and
 notifier exist.
 
 Execute each subsection below as its own implementer assignment, RED/GREEN
-cycle, review pair, secure check, and commit.
+cycle, review pair, focused commit checks, and commit.
 
 **2A — public contracts and binding attenuation**
 
@@ -317,13 +321,13 @@ Files: `pkg/tool/session_resource.go`, `pkg/tool/definition.go`, and
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/tool -run 'Test(ProcessBinding|AttenuateBindings.*Process)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/tool -run 'Test(ProcessBinding|AttenuateBindings.*Process)'
 ```
 
 Expected RED: missing contracts/requirement. Add `SessionResource`,
 `SessionResourceRegistry`, `SessionResourceServices`, `ProcessBinding`, and
 `RequiresProcessServices`, including typed-nil validation, cloning, and
-attenuation. Re-run the exact command, run `make secure`, and commit only those
+attenuation. Re-run the exact command, and commit only those
 three files as `feat(tool): bind session process resources`.
 
 Use this public resource shape:
@@ -356,12 +360,12 @@ shutdown racing creation must close rather than leak; activation/shutdown and
 deterministic error aggregation are at most once. Run:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./internal/sessionruntime -run '^TestSessionResources'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run '^TestSessionResources'
 ```
 
 Expected RED: no concrete registry. Implement only registry creation,
-activation, admission close, and shutdown linearization. Re-run with
-`-count=20`, run `make secure`, and commit these two files as
+activation, admission close, and shutdown linearization. Re-run the focused
+non-race command, then commit these two files as
 `feat(session): manage shared session resources`.
 
 **2C — durable storage provider**
@@ -375,13 +379,13 @@ Files: `pkg/rig/session_resource_storage.go`,
 `TestResourceStorageUnavailableFailsConstruction`, then run:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/rig -run 'Test(RigRequiresResourceStorage|ResourceStorage)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/rig -run 'Test(RigRequiresResourceStorage|ResourceStorage)'
 ```
 
 Expected RED: no provider option. Add a provider returning `{Path, Identity}`
 for a SessionID. Require a stable root outside the workspace and reject
 unavailable or identity-mismatched restore. Re-run the exact command, run
-`make secure`, and commit these files as
+the commit-boundary `gofmt` and diff checks, then commit these files as
 `feat(rig): provide durable session resource storage`.
 
 **2D — restore late binding**
@@ -395,7 +399,7 @@ Files: `internal/sessionruntime/session.go`,
 `TestForeignLoopRejectsProcessServices`, then run:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./internal/sessionruntime -run 'Test(Restore.*Resource|ForeignLoopRejectsProcessServices)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run 'Test(Restore.*Resource|ForeignLoopRejectsProcessServices)'
 ```
 
 Expected RED: probe and live bindings do not share a bridge. Thread the same
@@ -405,13 +409,8 @@ notifier exist. Reject process-enabled definitions on non-native engines with
 `process_notifications_unsupported`; legacy foreground-only Bash retains its
 existing foreign-engine behavior. Never expose `*sessionruntime.Session`
 publicly. Re-run the
-focused command plus:
-
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/tool ./pkg/rig ./internal/sessionruntime
-```
-
-Run `make secure` and commit these files as
+focused command. Run the standard focused non-race commit checks and commit
+these files as
 `feat(session): activate process resources after restore`.
 
 ### Task 3: Add lifetime workspace leases
@@ -450,7 +449,7 @@ double release                                   => harmless
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./internal/sessionruntime -run 'TestWorkspaceCoordinator.*Lifetime'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run 'TestWorkspaceCoordinator.*Lifetime'
 ```
 
 Expected: FAIL because lifetime operations and tree overlap do not exist.
@@ -464,11 +463,7 @@ acquiring the checkpoint permit, and always resume admission on failure.
 
 **Step 4: Verify GREEN**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./internal/sessionruntime -run 'TestWorkspaceCoordinator|TestRestoreWorkspace'
-```
-
-Expected: PASS.
+Re-run the exact focused command from Step 2. Expected: PASS.
 
 **Step 5: Commit**
 
@@ -510,7 +505,7 @@ Round-trip each event through the existing sealed event codec. Reject:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/event -run 'TestProcess'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/event ./pkg/journal ./pkg/sessionstore -run 'TestProcess'
 ```
 
 Expected: FAIL because process events are absent.
@@ -522,11 +517,7 @@ format unchanged; process events use the existing generic event envelope.
 
 **Step 4: Verify GREEN**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/event ./pkg/journal ./pkg/sessionstore
-```
-
-Expected: PASS.
+Re-run the exact focused command from Step 2. Expected: PASS.
 
 **Step 5: Commit**
 
@@ -552,19 +543,13 @@ new/restore, and exercise a lifetime scoped-write/checkpoint conflict.
 
 Verify the test exists and runs:
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -list '^TestProcessServicesIntegration' ./internal/sessionruntime
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -race ./internal/sessionruntime -run '^TestProcessServicesIntegrationNewRestoreAndLease$'
-```
+Defer tagged integration discovery and execution to Phase Gate 1, where the
+exact test name must be listed before the test is run.
 
-Expected: the list prints the exact test name and the test passes.
-
-Run the full affected Harness race suite and secure gate, then commit this
-integration file separately so its reviewed SHA is part of Phase Gate 1:
+Commit this integration file separately so its reviewed SHA is part of Phase
+Gate 1. Its tagged discovery and execution remain exclusively at the gate:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/tool ./pkg/event ./internal/sessionruntime
-make secure
 git add internal/sessionruntime/process_services_integration_test.go
 git commit -m "test(session): integrate process service contracts"
 ```
@@ -578,10 +563,18 @@ Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/tool ./pkg/event ./pkg/journal ./pkg/sessionstore ./internal/sessionruntime
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/tool ./pkg/event ./pkg/journal ./pkg/sessionstore ./pkg/rig ./internal/sessionruntime
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -list '^TestProcessServicesIntegration' ./internal/sessionruntime
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -race ./internal/sessionruntime -run '^TestProcessServicesIntegration'
+make secure
 CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
 ```
+
+No fuzz target exists yet. `make secure` is the sole phase-boundary invocation
+of Harness format checks, Vet, Staticcheck, Gosec, and Govulncheck. Record the
+integration list output and every command result in the verification ledger.
 
 Phase spec review must confirm:
 
@@ -641,7 +634,7 @@ type Origin struct {
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process -run 'Test(Handle|Owner|State|Error|Config)'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run 'Test(Handle|Owner|State|Error|Config)'
 ```
 
 Expected: FAIL because package `process` does not exist.
@@ -654,11 +647,7 @@ clock in tests. Do not expose a PID field.
 
 **Step 4: Verify GREEN**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process
-```
-
-Expected: PASS.
+Re-run the exact focused command from Step 2. Expected: PASS.
 
 **Step 5: Commit**
 
@@ -712,7 +701,7 @@ Test spool invariants:
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./internal/atomicfile ./process -run 'Test(Atomic|Manifest|Spool)'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/atomicfile ./process -run 'Test(Atomic|Manifest|Spool)'
 ```
 
 Expected: FAIL because storage does not exist.
@@ -725,7 +714,8 @@ the workspace. Keep spool and manifest paths unexported.
 
 **Step 4: Verify GREEN**
 
-Run the focused command twice, including `-count=20` for atomic-failure tests.
+Re-run the exact focused command from Step 2 once. Repeated failure-injection
+stress is deferred to Phase Gate 2's race suite.
 
 **Step 5: Commit**
 
@@ -768,7 +758,7 @@ Cover:
 **Step 3: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./internal/safetext ./process -run 'Test(Buffer|Cursor|SafeText|Render|Base64|Artifact)'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/safetext ./process -run 'Test(Buffer|Cursor|SafeText|Render|Base64|Artifact)'
 ```
 
 Expected: FAIL.
@@ -779,14 +769,10 @@ The rolling window serves recent reads; the spool remains authoritative. A gap
 returns the earliest retained data with `gap:true`. Cursor-ahead is a typed
 error. Base64 reads use the same owner check and byte limits as safe text.
 
-**Step 5: Verify GREEN and fuzz**
+**Step 5: Verify GREEN**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./internal/safetext ./process
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/safetext -run '^$' -fuzz FuzzNormalize -fuzztime 10s
-```
-
-Expected: PASS and no crash.
+Re-run the exact focused command from Step 3 once. Fuzzing is deferred to Phase
+Gate 2.
 
 **Step 6: Commit**
 
@@ -829,28 +815,28 @@ not a consolidated implementation assignment:
 
 - **8A:** edit `process/supervisor.go`, `process/supervisor_test.go`, and
   `process/fake_runner_test.go`; RED/GREEN command
-  `go test -race ./process -run '^TestSupervisor(ReservesQuotaBeforePrepare|PrepareFailureReleasesQuota|RejectsSessionAndLoopQuota)$'`;
+  `go test ./process -run '^TestSupervisor(ReservesQuotaBeforePrepare|PrepareFailureReleasesQuota|RejectsSessionAndLoopQuota)$'`;
   RED is missing admission/quota reservation. Implement reservation and rollback
-  only, run `make secure`, and commit `feat(process): reserve supervisor admission`.
+  only, and commit `feat(process): reserve supervisor admission`.
 - **8B:** edit `process/entry.go`, `process/entry_test.go`,
   `process/supervisor.go`, and `process/supervisor_test.go`; RED/GREEN command
-  `go test -race ./process -run '^TestSupervisor(PersistsBeforeReturningHandle|DrainsOrderedStreams|OutputLimitStopsProcess)$'`;
+  `go test ./process -run '^TestSupervisor(PersistsBeforeReturningHandle|DrainsOrderedStreams|OutputLimitStopsProcess)$'`;
   RED is missing durable handoff/drain. Implement manifest-before-handoff and
-  bounded stream ownership only, run `make secure`, and commit
+  bounded stream ownership only, and commit
   `feat(process): persist and drain supervised processes`.
 - **8C:** edit `process/entry.go`, `process/entry_test.go`,
   `process/supervisor.go`, and `process/supervisor_test.go`; RED/GREEN command
-  `go test -race ./process -run '^TestSupervisor(TerminalRaceChoosesOnce|PublishesStableLifecycleIDs|ReleasesLeaseOnce)$'`;
+  `go test ./process -run '^TestSupervisor(TerminalRaceChoosesOnce|PublishesStableLifecycleIDs|ReleasesLeaseOnce)$'`;
   RED is missing one-shot terminal arbitration. Implement only the CAS
-  terminal path and pre-persisted IDs, verify with `-count=20`, run
-  `make secure`, and commit `feat(process): arbitrate terminal lifecycle`.
+  terminal path and pre-persisted IDs, verify with the focused command, and
+  commit `feat(process): arbitrate terminal lifecycle`.
 - **8D:** edit `process/entry.go`, `process/entry_test.go`,
   `process/supervisor.go`, and `process/supervisor_test.go`; RED/GREEN command
-  `go test -race ./process -run '^TestSupervisor(NeverEvictsRunning|EvictsCompletedLRU|InvalidatesObservations|ShutdownRejectsAdmission)$'`;
+  `go test ./process -run '^TestSupervisor(NeverEvictsRunning|EvictsCompletedLRU|InvalidatesObservations|ShutdownRejectsAdmission)$'`;
   RED is missing retention/activity/admission-close behavior. Implement
   deterministic terminal LRU, spawn/activity/end invalidation, activity-channel
-  drain/closure handling, and admission close only; verify with `-count=20`,
-  run `make secure`, and commit
+  drain/closure handling, and admission close only; verify with the focused
+  command and commit
   `feat(process): retain entries and invalidate observations`.
 
 **Task 8 combined acceptance**
@@ -876,17 +862,11 @@ Use deterministic Harness async-runner/process fakes. Test:
 - terminal entries use deterministic LRU retention;
 - shutting down rejects admission and input.
 
-After 8A–8D are individually committed and reviewed, verify the combined
-supervisor. `Start` must accept the bound owner, origin, prepared process,
+After 8A–8D are individually committed and reviewed, defer their combined race
+suite to Phase Gate 2. `Start` must accept the bound owner, origin, prepared process,
 workspace lease, lifecycle sink, observation capability, storage ceiling, and
 initial yield settings. One entry goroutine owns wait, activity, and stream
 drain; terminalization is idempotent.
-
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process -run 'TestSupervisor|TestTerminal|TestQuota' -count=20
-```
-
-Expected: PASS without flakes or races.
 
 ### Task 9: Add waiters, restore reconciliation, and shutdown
 
@@ -923,33 +903,30 @@ Execute independently:
 
 - **9A:** create `process/wait.go` and `process/wait_test.go`, modifying
   `process/supervisor.go` only as needed. RED/GREEN command:
-  `go test -race ./process -run '^TestWait(PollReturnsImmediately|AnyWakesOnAppend|AllRequiresEveryEntry|CancelRemovesWaiter)$'`.
+  `go test ./process -run '^TestWait(PollReturnsImmediately|AnyWakesOnAppend|AllRequiresEveryEntry|CancelRemovesWaiter)$'`.
   RED is the absent waiter API. Implement generation-based waiter fan-out and
-  quota only, verify with `-count=20`, run `make secure`, and commit
+  quota only, verify with the focused command, and commit
   `feat(process): wait on process generations`.
 - **9B:** create `process/restore.go`, `process/restore_test.go`, and
   `process/supervisor_integration_test.go`, modifying `process/entry.go` and
   `process/supervisor.go` only as needed. RED command:
-  `go test -race ./process -run '^TestRestore(CompletedOutput|RunningBecomesLost|NeverSignalsPersistedPID|PublicationCrashRetriesStableID)$'`.
+  `go test ./process -run '^TestRestore(CompletedOutput|RunningBecomesLost|NeverSignalsPersistedPID|PublicationCrashRetriesStableID)$'`.
   RED is absent reconciliation. Implement reopen/lost reconciliation and stable
-  publication retries without live PID use. Then use
-  `go test -tags integration -list '^TestSupervisorIntegrationPersistRestore$'
-  ./process` and run `TestSupervisorIntegrationPersistRestore`; this test does
-  not exercise coordinated shutdown. Run `make secure` and
+  publication retries without live PID use. Defer the tagged
+  `TestSupervisorIntegrationPersistRestore` execution to Phase Gate 2, then
   commit `feat(process): restore supervised process state`.
 - **9C:** create `process/shutdown_test.go`, modifying
   `process/supervisor.go` and `process/entry.go`. RED/GREEN command:
-  `go test -race ./process -run '^TestShutdown(ClosesAdmissionBeforeStop|EscalatesAndConfirmsTrees|ConcurrentCallersShareResult|TeardownFailureRetainsAuthority)$'`.
+  `go test ./process -run '^TestShutdown(ClosesAdmissionBeforeStop|EscalatesAndConfirmsTrees|ConcurrentCallersShareResult|TeardownFailureRetainsAuthority)$'`.
   RED is absent coordinated shutdown. Implement close-admission,
   terminate/escalate/confirm, shared result, and retained cleanup authority
-  only; verify with `-count=20`, run `make secure`, and commit
+  only; verify with the focused command, and commit
   `feat(process): shut down process trees`.
 - **9D:** modify only `process/supervisor_integration_test.go`. Add
   `TestSupervisorIntegrationShutdownAndRestore` with
-  `//go:build integration`; require its exact name through `go test -tags
-  integration -list`, then run it with `-race`. The test may pass immediately
-  after 9C as acceptance evidence; an actual failure starts a focused nested
-  RED/GREEN fix. Run `make secure` and commit
+  focused default-tag seam tests after 9C. Tagged execution is deferred to
+  Phase Gate 2; an actual gate failure starts a focused nested RED/GREEN fix.
+  Commit
   `test(process): integrate shutdown and restore`.
 
 **Task 9 combined acceptance**
@@ -978,18 +955,12 @@ Test:
 - notification backpressure cannot block terminalization;
 - teardown failure retains authority and reports `teardown_failed`.
 
-After 9A–9D are individually committed and reviewed, verify all wait, restore,
-shutdown, and integration behavior together. Restore creates no live runner.
+After 9A–9D are individually committed and reviewed, defer the combined
+wait/restore/shutdown race suite to Phase Gate 2. Restore creates no live runner.
 Publication retries always reuse IDs already in the manifest; the durable
 Harness journal index and restored loop projection implemented in Task 24 are
 the actual duplicate-suppression boundaries. Tools unit fakes implement that
 same append-result contract.
-
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process -count=20
-```
-
-Expected: PASS.
 
 The integration file begins with `//go:build integration`.
 `TestSupervisorIntegrationPersistRestore` covers the 9B boundary;
@@ -998,12 +969,7 @@ use a real temp resource root, OS pipes, manifest replacement, spool reads, a
 subprocess fake, session-style shutdown, and restore. They may fake only the
 Harness publisher; filesystem and subprocess boundaries are real.
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestSupervisorIntegration' ./process
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./process -run '^TestSupervisorIntegration(PersistRestore|ShutdownAndRestore)$'
-```
-
-Expected: the name is listed and the test passes.
+Phase Gate 2 must list both exact integration test names before executing them.
 
 ## PHASE GATE 2: Tools supervisor core
 
@@ -1012,9 +978,18 @@ Run:
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./internal/atomicfile ./internal/safetext ./process
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestSupervisorIntegration' ./process
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./process -run '^TestSupervisorIntegration'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/safetext -run '^$' -fuzz '^FuzzNormalize$' -fuzztime=10s
+make secure
 CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
 ```
+
+This is the first execution of the phase's integration and fuzz tests.
+`make secure` batches Tools format checks, Vet, Staticcheck, Gosec, and
+Govulncheck.
 
 Phase spec review must trace every state transition, cursor rule, quota, manifest
 field, restore rule, and completion marker to the approved design.
@@ -1092,14 +1067,9 @@ Test:
 
 **Step 2: Verify RED**
 
-```bash
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -run 'TestProcess(Pipe|Streams|Wait|EOF)|TestRunCommand'
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list '^TestIntegrationProcessPipeLifecycle$' ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run '^TestIntegrationProcessPipeLifecycle$'
-```
-
-Expected: FAIL because async process types do not exist.
+Use the exact focused RED/GREEN command specified for each microtask below.
+Expected: each command fails for its stated missing behavior before production
+code is added.
 
 **Step 3: Refactor shared preparation and implement start**
 
@@ -1122,7 +1092,7 @@ Execute independently:
 - **10A:** create `internal/exec/process.go`,
   `internal/exec/process_errors.go`, and `internal/exec/process_test.go`, plus
   the public facade declarations in `sandbox.go`/`facade_test.go`. RED/GREEN:
-  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^Test(PrepareProcessDoesNotSpawn|PreparedProcess(StartOnce|CloseBeforeStart)|ProcessStreamsBeforeExit)$'`.
   RED is missing API. Implement public types, immutable effective access, pipe
   streams, cached wait, and optional bounded activity-stream lifecycle only;
@@ -1130,36 +1100,25 @@ Execute independently:
 - **10B:** modify `internal/exec/process.go`,
   `internal/exec/process_test.go`, and
   `internal/exec/executor_lifecycle.go`. RED/GREEN:
-  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^Test(PrepareCancellationPreventsHandoff|StartCancellationPreventsHandoff|CallerCancellationAfterHandoffDoesNotKill)$'`.
   RED is incorrect context ownership. Implement setup-versus-lifetime context
-  transfer only; verify with `-count=20` and commit
+  transfer only; verify with the focused command and commit
   `feat: detach process lifetime after handoff`.
 - **10C:** modify `internal/exec/executor.go`,
   `internal/exec/executor_lifecycle.go`, and characterization tests only.
   This is the explicit characterization/refactor exception: exact legacy
   RunCommand, RunArgv, and granted-result tests must be GREEN before and after
   the pure internal refactor. Do not claim a manufactured RED. Run
-  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run 'Test(RunCommand|RunArgv|Granted|ExecutorConformance)'`.
   Implement sync prepare/start/drain/wait adaptation only and commit
   `refactor: share prepared process execution`.
 
 **Task 10 combined acceptance**
 
-After 10A–10C are individually committed and reviewed, verify shared
-preparation, backend wrapping, configure/start, ownership transfer, and sync
-adaptation together.
-
-Run the focused command and the existing executor conformance suite:
-
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -run 'Test(Process|RunCommand|ExecutorConformance)'
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list '^TestIntegrationProcessPipeLifecycle$' ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run '^TestIntegrationProcessPipeLifecycle$'
-```
-
-Expected: PASS.
+After 10A–10C are individually committed and reviewed, defer their combined
+race/conformance suite to Phase Gate 3.
 
 ### Task 11: Retain grants and enforcement resources across two-phase start
 
@@ -1198,9 +1157,7 @@ Test:
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -run 'TestProcessLifecycle|TestAsyncGrant|TestExecutorSet.*Process'
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list '^TestIntegrationProcessPreparedGrantLifetime$' ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run '^TestIntegrationProcessPreparedGrantLifetime$'
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run 'Test(ProcessLifecycle|AsyncGrant|GrantPath|ExecutorProxy|ExecutorSet)'
 ```
 
 Expected: retained grant/path/route resource lifetime tests fail because the
@@ -1216,13 +1173,7 @@ terminates it and performs wait/cleanup even when the caller abandons the handle
 
 **Step 4: Verify GREEN**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -run 'Test(ProcessLifecycle|AsyncGrant|GrantPath|ExecutorProxy|ExecutorSet)' -count=20
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list '^TestIntegrationProcessPreparedGrantLifetime$' ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run '^TestIntegrationProcessPreparedGrantLifetime$'
-```
-
-Expected: PASS.
+Re-run the exact focused command from Step 2. Expected: PASS.
 
 **Step 5: Commit**
 
@@ -1264,33 +1215,42 @@ Execute independently:
 - **12A:** files `internal/exec/process.go`,
   `internal/exec/process_tree_signal_test.go`, and platform-neutral fake-tree
   helpers. RED/GREEN command:
-  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^TestProcessSignal'`. Implement only the signal/terminal
-  state machine; verify `-count=20`; commit `feat: control process signals`.
+  state machine; rerun the focused non-race command; commit
+  `feat: control process signals`.
 - **12B:** files `internal/exec/process_tree_unix.go`,
   `internal/exec/lifetime_unix.go`,
   `internal/exec/process_parent_death_unix_test.go`,
   `internal/exec/process_parent_death_integration_unix_test.go`, and
-  `init_linux.go`. RED requires the `-list` output to contain
+  `init_linux.go`. RED/GREEN:
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
+  ./internal/exec -run '^TestProcessTreeLinuxContainmentPlan$'`. Phase Gate 3
+  requires its list output to contain
   `TestIntegrationProcessTreeParentDeath`,
   `TestIntegrationProcessTreeDoubleFork`, and
-  `TestIntegrationProcessTreeSetsidEscape`; then run those tagged tests on the
-  approved Linux worker. Implement the lifetime shim plus proven Linux
-  containment only; commit `feat: contain Unix process descendants`.
+  `TestIntegrationProcessTreeSetsidEscape`, then runs those tagged tests on the
+  approved Linux worker. During the microtask, implement the lifetime shim plus
+  proven Linux containment only; commit
+  `feat: contain Unix process descendants`.
 - **12C:** files `internal/exec/lifetime_unix.go`,
   `internal/exec/process_parent_death_integration_unix_test.go`, and
-  `init_other.go`. RED/GREEN on an approved Darwin worker:
-  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags
-  integration -race ./internal/exec -run
-  '^TestIntegrationProcessTreeDarwinSetsidGuarantee$'`. Implement a concrete
-  proof or fail before spawn with `lifetime_enforcement_unavailable`; commit
+  `init_other.go`. RED/GREEN:
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
+  ./internal/exec -run '^TestDarwinLifetimeCapabilityFailsClosed$'`. Phase Gate
+  3 runs
+  `TestIntegrationProcessTreeDarwinSetsidGuarantee` on the approved Darwin
+  worker. Implement a concrete proof or fail before spawn with
+  `lifetime_enforcement_unavailable`; commit
   `fix: fail closed without Darwin lifetime containment`.
 - **12D:** files `internal/exec/process_tree_windows.go`,
   `internal/exec/process.go`, and
-  `internal/exec/process_tree_windows_test.go`. A `go test -list` guard on the
-  Windows worker must print `TestProcessTreeWindowsJobBeforeResume` and
-  `TestProcessTreeWindowsJobEmptyOnClose`, then RED/GREEN runs both. Implement
-  Job assignment/confirmation and signal mapping only; commit
+  `internal/exec/process_tree_windows_test.go`. A focused non-race Windows
+  RED/GREEN command is `GOWORK=off
+  GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run
+  '^TestProcessTreeWindows(JobBeforeResume|JobEmptyOnClose)$'`. Phase Gate 3
+  records discovery and full race coverage. Implement Job
+  assignment/confirmation and signal mapping only; commit
   `feat: confirm Windows process job teardown`.
 
 **Task 12 combined acceptance**
@@ -1318,18 +1278,10 @@ descendant enumeration is not sufficient evidence.
 On Windows, assert the target and helper join the kill-on-close Job before resume
 and that close empties the Job.
 
-After 12A–12D are individually committed and reviewed, verify whole-tree
-control together. Unix uses a lifetime shim plus proven containment; Darwin
+After 12A–12D are individually committed and reviewed, defer whole-tree
+race/integration verification to Phase Gate 3. Unix uses a lifetime shim plus proven containment; Darwin
 fails closed when that proof is unavailable; Windows uses the reviewed Job
 path. `Pdeathsig` alone is insufficient.
-
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -run 'TestProcess(Signal|Tree|ParentDeath|SetsidEscape)' -count=10
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list 'TestIntegration.*ProcessTree' ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run 'TestIntegration.*ProcessTree'
-```
-
-Expected: PASS, with real child processes and no surviving marker/PID.
 
 ### Task 13: Wire Sandbox async acceptance coverage into CI
 
@@ -1344,7 +1296,6 @@ Expected: PASS, with real child processes and no surviving marker/PID.
 
 **Step 1: Verify feature integration tests already exist**
 
-Run `go test -tags integration -list 'TestIntegrationProcess' ./internal/exec`
 and fail this task if the exact pipe, grant, and tree tests from Tasks 10–12 are
 not listed. Those tests already exercise real commands under:
 
@@ -1384,17 +1335,9 @@ Add a `test-async-ci` Makefile target that invokes the same guard.
 
 **Step 4: Verify GREEN**
 
-```bash
-sh scripts/test-async-ci-workflow.sh
-make test-async-ci
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list 'TestIntegrationProcess' ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./...
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
-```
-
-Expected: all local checks pass; Windows workflow contains a live runtime job.
+Re-run the exact focused workflow-guard command from Step 2. Expected: PASS and
+the Windows workflow contains a live runtime job. Repository tests, builds, and
+live tagged execution are deferred to Phase Gate 3.
 
 **Step 5: Commit**
 
@@ -1409,12 +1352,19 @@ Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -count=1
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -count=1
 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree)' ./internal/exec
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree)'
+make secure
 CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
 ```
+
+No new fuzz target is owned by this phase. The approved Linux, Darwin, and
+Windows jobs must execute their applicable listed integration tests; cross-build
+success is not runtime evidence. `make secure` batches Sandbox format checks,
+Vet, Staticcheck, Gosec, and Govulncheck.
 
 Phase reviewers must trace every per-spawn cleanup resource through terminal
 exit, verify context separation, inspect real parent-death evidence, and confirm
@@ -1457,7 +1407,7 @@ must retain all normalized settings; mutating raw JSON later changes nothing.
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./bash -run 'TestBash(Schema|Supervision|Legacy|Prepared)'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash -run 'TestBash(Schema|Supervision|Legacy|Prepared)'
 ```
 
 Expected: new field tests fail; legacy tests pass.
@@ -1469,7 +1419,8 @@ factory used by root definitions. Do not route to the supervisor yet.
 
 **Step 4: Verify GREEN**
 
-Run all Bash race tests.
+Re-run the exact focused command from Step 2. Bash race coverage is deferred to
+Phase Gate 4.
 
 **Step 5: Commit**
 
@@ -1514,7 +1465,7 @@ Test:
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./bash -run 'TestSupervisedBash'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash -run 'TestSupervisedBash'
 ```
 
 Expected: FAIL because supervisor routing is absent.
@@ -1529,11 +1480,7 @@ process to `Supervisor.Start`.
 
 **Step 4: Verify GREEN**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./bash
-```
-
-Expected: PASS.
+Re-run the exact focused command from Step 2. Expected: PASS.
 
 **Step 5: Commit**
 
@@ -1559,7 +1506,7 @@ metadata, opaque artifact, owner isolation, and metadata-safe errors.
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process -run 'TestProcessOutput'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run 'TestProcessOutput'
 ```
 
 Expected: FAIL.
@@ -1571,7 +1518,8 @@ artifact, `InvokableRun`, and stable JSON rendering. Never return a spool path.
 
 **Step 4: Verify GREEN**
 
-Run focused tests with `-count=20`.
+Run the focused non-race test once. Stress repetition is deferred to Phase Gate
+4's full race suite.
 
 **Step 5: Commit**
 
@@ -1597,7 +1545,7 @@ closed input, terminal process, and cross-owner `not_found`.
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process -run 'TestProcessInput'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run 'TestProcessInput'
 ```
 
 Expected: FAIL.
@@ -1611,10 +1559,11 @@ yield.
 **Step 4: Verify GREEN and commit**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process -run 'TestProcessInput' -count=20
 git add process/input_tool.go process/input_tool_test.go
 git commit -m "feat(process): support supervised process input"
 ```
+
+Before committing, re-run the exact focused command from Step 2.
 
 ### Task 18: Implement ProcessStop
 
@@ -1632,7 +1581,7 @@ tree exit, teardown failure, lifecycle event request, and owner isolation.
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process -run 'TestProcessStop'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run 'TestProcessStop'
 ```
 
 Expected: FAIL.
@@ -1646,10 +1595,11 @@ before runner confirmation.
 **Step 4: Verify GREEN and commit**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./process -run 'TestProcessStop' -count=20
 git add process/stop_tool.go process/stop_tool_test.go
 git commit -m "feat(process): stop supervised process trees"
 ```
+
+Before committing, re-run the exact focused command from Step 2.
 
 ### Task 19: Export four independently selectable definitions
 
@@ -1677,7 +1627,7 @@ different supervisors. Options resolve once and concurrent builds remain safe.
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race . ./process -run 'Test.*Definition'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test . ./process -run 'Test.*Definition'
 ```
 
 Expected: FAIL because companion definitions are absent.
@@ -1691,10 +1641,11 @@ never a package global.
 **Step 4: Verify GREEN and commit**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race . ./bash ./process
 git add definitions.go definitions_test.go dependency_test.go process/definitions_test.go
 git commit -m "feat: export supervised process tools"
 ```
+
+Before committing, re-run the exact focused command from Step 2.
 
 ### Task 20: Add Tools workflow integration tests
 
@@ -1723,14 +1674,16 @@ They define exact tests `TestIntegrationBashSupervisedWorkflow` and
 
 **Step 2: Verify selection and acceptance**
 
+Defer tagged test discovery and execution to Phase Gate 4, which must list both
+exact names before running them. During the task, use this one focused
+default-tag seam command:
+
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegration(BashSupervisedWorkflow|ProcessToolsRestore)$' ./bash ./process
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./bash ./process
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash ./process -run 'Test(SupervisedBash|Process(Output|Input|Stop))'
 ```
 
-Expected: exact names are listed. The tests may already pass after Tasks 15–19;
-that is valid acceptance evidence. An actual failure starts a focused
-RED/GREEN fix in the owning task/repository before this suite is rerun.
+An actual gate failure starts a focused RED/GREEN fix in the owning
+task/repository before the gate is rerun.
 
 **Step 3: Complete only integration seams**
 
@@ -1739,9 +1692,6 @@ Do not import Sandbox into Tools. Keep the integration runner in `_test.go`.
 **Step 4: Verify GREEN and commit**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegration(BashSupervisedWorkflow|ProcessToolsRestore)$' ./bash ./process
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./bash ./process
-git add bash/integration_test.go process/integration_test.go
 git commit -m "test: exercise supervised tool workflows"
 ```
 
@@ -1751,10 +1701,19 @@ Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race . ./bash ./process
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./bash ./process
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^Test(SupervisorIntegration|Integration(BashSupervisedWorkflow|ProcessToolsRestore))' ./bash ./process
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./bash ./process -run '^Test(SupervisorIntegration|Integration(BashSupervisedWorkflow|ProcessToolsRestore))'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/safetext -run '^$' -fuzz '^FuzzNormalize$' -fuzztime=10s
+make secure
 CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
 ```
+
+This gate reruns the accumulated safe-text fuzz target only once, after the
+model-facing changes. `make secure` batches Tools format checks, Vet,
+Staticcheck, Gosec, and Govulncheck.
 
 Phase reviewers must compare exact JSON schemas/results with the design, rerun
 legacy characterization tests, verify owner checks and binding sharing, and
@@ -1794,7 +1753,7 @@ defines the exact live test `TestIntegrationProcessPTYLifecycle`.
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -run 'TestProcessPTY'
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run 'TestProcessPTY'
 ```
 
 Expected: FAIL with `pty_unavailable` or missing implementation.
@@ -1811,15 +1770,10 @@ Use `pty.Open`, attach the slave before the existing configure/start
 linearization, and retain both terminal endpoints through process cleanup. Do
 not use `pty.Start`, which would bypass the enforcement ownership point.
 
-**Step 4: Verify GREEN and integration**
+**Step 4: Verify GREEN**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -run 'TestProcessPTY' -count=10
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list '^TestIntegrationProcessPTY' ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run '^TestIntegrationProcessPTYLifecycle$'
-```
-
-Expected: PASS.
+Re-run the exact focused command from Step 2. Tagged integration is deferred to
+Phase Gate 5.
 
 **Step 5: Commit**
 
@@ -1866,7 +1820,7 @@ Execute independently:
 
 - **22A:** create `internal/exec/conpty_launch_plan.go` and
   `internal/exec/conpty_launch_plan_test.go` with no Windows build tag. RED:
-  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^TestConPTYLaunchPlanOrdersJobBeforeResume$'`.
   Expected failure is the absent plan/ordering. Implement the immutable
   platform-neutral plan only, re-run the exact command, and commit
@@ -1874,18 +1828,18 @@ Execute independently:
 - **22B:** create `internal/exec/terminal_windows.go` and
   `internal/exec/process_conpty_windows_test.go`, modifying the listed Windows
   implementation files. A live Windows RED/GREEN run executes
-  `go test -race ./internal/exec -run
-  '^TestProcessConPTYInteractive$'`; the local build check is the explicit
-  `GOOS=windows go test -c` below. Implement pseudo-console
+  `go test ./internal/exec -run
+  '^TestProcessConPTYInteractive$'`. Implement pseudo-console
   create/input/output/resize/cleanup only and commit
   `feat: run supervised ConPTY processes`.
 - **22C:** create
   `internal/exec/process_conpty_integration_windows_test.go` with
   `//go:build integration`, modify the broker adapters and CI workflow, and
-  require `go test -tags integration -list '^TestIntegrationConPTY'
-  ./internal/exec` on Windows to print both restricted and elevated test names.
-  RED/GREEN runs those two exact tests. Implement broker/Job preservation and
-  CI wiring only; commit `test: prove confined ConPTY execution`.
+  use `go test ./internal/exec -run '^TestConPTYBrokerJobPlan$'` as the single
+  focused default-tag RED/GREEN command. Tagged discovery and execution
+  of the restricted and elevated cases are deferred to Phase Gate 5. Implement
+  broker/Job preservation and CI wiring only; commit
+  `test: prove confined ConPTY execution`.
 
 **Task 22 combined acceptance**
 
@@ -1903,25 +1857,12 @@ On Windows test:
 
 Add compile-only non-Windows tests for facade availability and typed errors.
 
-After 22A–22C are individually committed and reviewed, verify their combined
-launch-order, pseudo-console, broker, Job, and enforcement invariants.
+After 22A–22C are individually committed and reviewed, defer their combined
+launch-order, pseudo-console, broker, Job, and enforcement verification to
+Phase Gate 5.
 
-Local cross-build:
-
-```bash
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -c -o /private/tmp/sandbox-conpty.test.exe ./internal/exec
-```
-
-Windows CI:
-
-```powershell
-go test -race ./internal/exec -run 'TestProcessConPTY|TestProcessTreeWindows'
-go test -tags integration -list '^TestIntegrationConPTY' ./internal/exec
-go test -tags integration -race ./internal/exec -run 'TestIntegration.*ConPTY'
-```
-
-Expected: PASS on the Windows worker.
+The Windows cross-build and test-binary compilation are deferred to Phase Gate
+5.
 
 ### Task 23: Verify Tools PTY semantics end to end
 
@@ -1940,14 +1881,15 @@ It defines the exact live test `TestIntegrationProcessPTYToolWorkflow`.
 
 **Step 2: Verify selection and acceptance**
 
+Defer tagged discovery and execution to Phase Gate 5, which must list the exact
+test before running it. During the task, use this focused default-tag RED/GREEN
+command:
+
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegrationProcessPTYToolWorkflow$' ./process
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./bash ./process -run 'Test.*(TTY|PTY|Resize|EOF|Interrupt)|^TestIntegrationProcessPTYToolWorkflow$'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash ./process -run 'Test.*(TTY|PTY|Resize|EOF|Interrupt)'
 ```
 
-Expected: the exact integration test is listed. It may already pass after Tasks
-21–22; that is valid acceptance evidence. Any actual missing semantic starts a
-focused RED/GREEN fix in the owning task/repository.
+Any gate failure starts a focused RED/GREEN fix in the owning task/repository.
 
 **Step 3: Implement only missing contract handling**
 
@@ -1956,9 +1898,6 @@ Do not import the PTY library into Tools.
 **Step 4: Verify GREEN and commit**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegrationProcessPTYToolWorkflow$' ./process
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./bash ./process -run 'Test.*(TTY|PTY|Resize|EOF|Interrupt)|^TestIntegrationProcessPTYToolWorkflow$'
-git add bash/supervised_test.go process/input_tool_test.go process/pty_integration_test.go
 git commit -m "test: verify interactive process tools"
 ```
 
@@ -1968,14 +1907,23 @@ Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./internal/exec -run 'Test(ProcessPTY|ConPTYLaunchPlan|ProcessPipe)'
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list 'TestIntegration(ProcessPTY|ConPTY)' ./internal/exec
-GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run '^TestIntegrationProcessPTY'
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree|ProcessPTY|ConPTY)' ./internal/exec
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./internal/exec -run 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree|ProcessPTY|ConPTY)'
+make secure
+CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -c -o /private/tmp/sandbox-conpty.test.exe ./internal/exec
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegrationProcessPTYToolWorkflow$' ./process
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./bash ./process -run 'Test.*(TTY|PTY|Resize|EOF|Interrupt)'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^Test(SupervisorIntegration|Integration(BashSupervisedWorkflow|ProcessToolsRestore|ProcessPTYToolWorkflow))' ./bash ./process
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./bash ./process -run '^Test(SupervisorIntegration|Integration(BashSupervisedWorkflow|ProcessToolsRestore|ProcessPTYToolWorkflow))'
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/safetext -run '^$' -fuzz '^FuzzNormalize$' -fuzztime=10s
+make secure
+CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
 ```
 
 The approved Darwin worker must record
@@ -2053,13 +2001,13 @@ RED:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/journal ./pkg/sessionstore -run 'Test(SessionJournal(ConcurrentIdenticalIDAppendsOnce|ReopenDeduplicatesEventAndCommand|IdempotencyCollisionFails|OffloadedRecordHydratesIdempotencyIndex)|JournalAppenderDoesNotRepublishDuplicate)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/journal ./pkg/sessionstore -run 'Test(SessionJournal(ConcurrentIdenticalIDAppendsOnce|ReopenDeduplicatesEventAndCommand|IdempotencyCollisionFails|OffloadedRecordHydratesIdempotencyIndex)|JournalAppenderDoesNotRepublishDuplicate)'
 ```
 
 Expected: duplicate IDs append multiple frames. Implement only journal result,
 fingerprinting/collision, ID-preserving index hydration, raw opening fences, and
 appender duplicate reporting.
-Re-run with `-count=20`, run `make secure`, and commit
+Re-run the focused command, and commit
 `feat(journal): deduplicate durable record retries`. Task 28 repeats the reopen
 proof through Coderig's real fsstore composition.
 
@@ -2076,12 +2024,13 @@ the old appender surface through an optional result-bearing extension; the nop
 appender reports `Appended=true`. RED/GREEN:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./internal/sessionruntime -run '^TestProcessLifecycle'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run '^TestProcessLifecycle'
 ```
 
 Implement the late-bound service by stamping bounded metadata without replacing
 the Tools ID, durably appending, and publishing live only on a new append. Run
-`make secure` and commit `feat(session): publish process lifecycle metadata`.
+the focused non-race commit checks and commit
+`feat(session): publish process lifecycle metadata`.
 
 **24C — metadata-only notification and restored live dedupe**
 
@@ -2129,7 +2078,7 @@ append failure remains explicit for this process-notification path; existing
 audit-only commands keep their established behavior. RED/GREEN:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/command ./internal/loopruntime ./internal/sessionruntime -run 'Test(ProcessNotification|ForeignLoopRejectsProcessNotification)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/command ./internal/loopruntime ./internal/sessionruntime -run 'Test(ProcessNotification|ForeignLoopRejectsProcessNotification)'
 ```
 
 Implement only the sealed command codec, restored projection, and owning-loop
@@ -2138,7 +2087,7 @@ terminalization: the retained pending reservation returns retryable-full and
 the supervisor retries with the same CommandID. Remove an unresolved entry only
 after an enduring loop causality event commits. Foreign engines reject process
 notifications; they do not silently drop them.
-Verify with `-count=20`, run `make secure`, and commit
+Verify with the focused non-race command, and commit
 `feat(session): deliver idempotent process notifications`.
 
 **Phase acceptance behavior**
@@ -2157,11 +2106,8 @@ replacement IDs. The durable journal index, not the ID field alone,
 deduplicates crash retries. Deliver notifications through the owning loop with
 the stable CommandID and explicit delivery errors.
 
-Verify the combined acceptance:
-
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/journal ./pkg/sessionstore ./pkg/command ./internal/loopruntime ./internal/sessionruntime -run 'Test(SessionJournal|JournalAppender|Process)'
-```
+Combined journal/lifecycle/notification race verification is deferred to Phase
+Gate 6.
 
 ### Task 25: Integrate shutdown, construction abort, restore, and workspace rewind
 
@@ -2196,7 +2142,7 @@ Test:
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./internal/sessionruntime -run 'Test.*(ProcessShutdown|ProcessRestore|WorkspaceRestore.*Process|ConstructionAbort.*Resource)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run 'Test.*(ProcessShutdown|ProcessRestore|WorkspaceRestore.*Process|ConstructionAbort.*Resource)'
 ```
 
 Expected: FAIL.
@@ -2206,14 +2152,10 @@ Expected: FAIL.
 Add a `session_resources` cleanup phase with bounded timeout reporting. Preserve
 existing checkpoint/hustle cleanup semantics.
 
-**Step 4: Verify GREEN and integration**
+**Step 4: Verify GREEN**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./internal/sessionruntime -count=10
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -race ./internal/sessionruntime ./pkg/rig
-```
-
-Expected: PASS.
+Re-run the exact focused command from Step 2. Broader and tagged verification
+is deferred to Phase Gate 6.
 
 **Step 5: Commit**
 
@@ -2244,7 +2186,10 @@ Execute as two reviewed microtasks:
   `TestProcessResourceRootStableAcrossRestore`,
   `TestProcessResourceRootIdentityMismatchFailsRestore`, and
   `TestHeadlessProcessResourceRootsAreIsolated`, plus
-  `TestHeadlessProcessResourceRootStableForSameProcessRestore`.
+  `TestHeadlessProcessResourceRootStableForSameProcessRestore`. Its single
+  RED/GREEN command is `GOWORK=off
+  GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test
+  ./internal/app -run 'Test(ProcessResourceRoot|HeadlessProcessResourceRoot)'`.
 - **26B — async adapter:** implement only the two-phase Sandbox-to-Harness type
   mapping below.
 
@@ -2269,7 +2214,7 @@ Test:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./internal/app -run 'TestProcessAdapter'
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'TestProcessAdapter'
 ```
 
 Expected: FAIL.
@@ -2282,10 +2227,11 @@ authorization, event, or supervisor policy in Coderig.
 **Step 4: Verify GREEN and commit**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./internal/app -run 'TestProcessAdapter'
 git add internal/app/process_adapter.go internal/app/process_adapter_test.go internal/app/toolsets.go
 git commit -m "feat: adapt sandbox async processes"
 ```
+
+Before committing, re-run the exact focused command from Step 2.
 
 ### Task 27: Install the four process definitions in Coderig
 
@@ -2307,7 +2253,7 @@ process-enabled roster on a foreign-engine loop and reports
 **Step 2: Verify RED**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./internal/app -run 'TestProcessTools|Test.*ToolDefinitions'
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'TestProcessTools|Test.*ToolDefinitions'
 ```
 
 Expected: FAIL.
@@ -2320,10 +2266,11 @@ definitions to both allowed rosters. Preserve reviewer access restrictions.
 **Step 4: Verify GREEN and commit**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./internal/app
 git add internal/app/toolsets.go internal/app/access_acceptance_test.go internal/app/process_tools_test.go
 git commit -m "feat: install supervised process tools"
 ```
+
+Before committing, re-run the exact focused command from Step 2.
 
 ### Task 28: Add full Coderig integration tests
 
@@ -2377,17 +2324,19 @@ The fixture is explicit:
 
 **Step 2: Verify fixture selection and run acceptance**
 
-```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegrationProcess' ./internal/app
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./internal/app -run '^TestIntegrationProcess'
-```
-
-Expected: the list includes workflow, restore, and
+Defer tagged discovery and execution to Phase Gate 6. Its list output must
+include workflow, restore, and
 `TestIntegrationProcessJournalIdempotencyReopen`. The newly added tests may
 already pass as acceptance evidence. An actual failure starts the focused
 nested RED/GREEN cycle below. The reopen test may script inference, but it must
 use the real fsstore, sessionstore journal/replayer, Rig, Tools, and Sandbox
 boundaries.
+
+Use this single focused default-tag composition command during the task:
+
+```bash
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'Test(ProcessAdapter|ProcessTools)'
+```
 
 **Step 3: Fix only integration defects through TDD**
 
@@ -2397,8 +2346,6 @@ repository, fix it there, review it, then rerun this integration suite.
 **Step 4: Verify GREEN and commit**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./internal/app -run '^TestIntegrationProcess'
-git add internal/app/process_integration_test.go internal/app/process_restore_integration_test.go .github/workflows/ci.yml
 git commit -m "test: exercise supervised commands end to end"
 ```
 
@@ -2408,12 +2355,25 @@ Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./pkg/command ./pkg/event ./internal/loopruntime ./internal/sessionruntime ./pkg/rig
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -list 'Test(ProcessServicesIntegration|IntegrationProcess)' ./internal/sessionruntime ./pkg/rig
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -race ./internal/sessionruntime ./pkg/rig
+make secure
+CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
-GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./internal/app
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegrationProcess' ./internal/app
 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./internal/app
+make secure
+CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
 ```
+
+No new fuzz target is owned by this phase. `make secure` runs each repository's
+format checks, Vet, Staticcheck, Gosec, and Govulncheck once at the gate.
 
 Phase spec review must trace the complete start-to-notification and
 restore-to-query flows. Phase quality/security review must inspect adapter
@@ -2458,36 +2418,27 @@ Execute each microtask with separate evidence:
 
 - **29A:** from the Tools worktree, RED/GREEN is
   `GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache
-  GOFLAGS=-mod=readonly go test -race ./process -run '^TestSecurity'`, followed
-  by 30 seconds each of `FuzzProcessArguments`, `FuzzProcessManifest`, and
-  `FuzzProcessCursor`. A new test may already pass as acceptance evidence; an
-  actual failure starts a nested RED/GREEN fix cycle. Fix only Tools
-  parsing/storage, run `make secure`, and commit only Tools files.
-- **29B:** from Sandbox after stabilization, require
-  `go test -tags integration -list '^TestSecurityProcess' ./internal/exec` to
-  print all four names, then RED/GREEN is
-  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags
-  integration -race ./internal/exec -run '^TestSecurityProcess'`. A passing new
-  test is valid evidence; an actual escape or grant-reservation failure starts
-  a nested RED/GREEN fix cycle. Fix only Sandbox, run its full secure target,
-  and commit only Sandbox files.
-- **29C:** from Harness, require
-  `go test -tags integration -list '^TestSecurity'
-  ./internal/sessionruntime` to print all three names, then RED/GREEN is
-  `GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache
-  GOFLAGS=-mod=vendor go test -tags integration -race
-  ./internal/sessionruntime -run '^TestSecurity'`. A passing new test is valid
-  evidence; an actual identity, publication, or lease failure starts a nested
-  RED/GREEN fix cycle. Fix only Harness, run `make secure`, and commit only
-  Harness files.
-- **29D:** from Coderig, require
-  `go test -tags integration -list '^TestSecurityProcess' ./internal/app` to
-  print all three names, then RED/GREEN is
-  `GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache
-  GOFLAGS=-mod=readonly go test -tags integration -race ./internal/app -run
-  '^TestSecurityProcess'`. A passing new test is valid evidence; an actual
-  composed isolation/cleanup failure starts a nested RED/GREEN fix cycle. Fix
-  only Coderig, run `make secure`, and commit only Coderig files.
+  GOFLAGS=-mod=readonly go test ./process -run '^TestSecurity'`. Author the
+  three fuzz targets but defer fuzz execution to Phase Gate 7. Fix only Tools
+  parsing/storage and commit only Tools files.
+- **29B:** from Sandbox, use focused default-tag unit seams under
+  `./internal/exec`; its single RED/GREEN command is `GOWORK=off
+  GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run
+  '^TestSecurityProcessUnit'`. Author all four tagged security cases, but defer
+  their discovery and execution to Phase Gate 7. Fix and commit only Sandbox
+  files.
+- **29C:** from Harness, use focused default-tag process identity/publication
+  seams; its single RED/GREEN command is `GOWORK=off
+  GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test
+  ./internal/sessionruntime -run '^TestSecurity(Process|Workspace)'`. Author all
+  three tagged security cases, but defer their discovery and execution to Phase
+  Gate 7. Fix and commit only Harness files.
+- **29D:** from Coderig, use focused default-tag process adapter seams under
+  `./internal/app`; its single RED/GREEN command is `GOWORK=off
+  GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test
+  ./internal/app -run '^TestSecurityProcessUnit'`. Author all three tagged
+  composed-security cases, but defer their discovery and execution to Phase
+  Gate 7. Fix and commit only Coderig files.
 
 **Task 29 combined acceptance**
 
@@ -2510,12 +2461,11 @@ Cover:
 - workspace scoped-write ancestor/descendant races;
 - completion publisher and notifier failures.
 
-After 29A–29D are separately committed and reviewed, run all four repositories'
-tagged integration suites with `-race`, plus 30 seconds of each fuzz target.
-When a new adversarial test already passes, record it as acceptance evidence
-without manufacturing a production change. When it fails, first add the
-smallest focused unit regression in the owning repository, complete and review
-that nested RED/GREEN fix, then rerun the cross-repository suite.
+After 29A–29D are separately committed and reviewed, proceed directly to Task
+30. Phase Gate 7 performs all four repositories' tagged race suites and 30
+seconds of each fuzz target. A gate failure first receives the smallest focused
+unit regression in the owning repository, a reviewed RED/GREEN fix, and then a
+rerun of the affected gate matrix.
 
 ### Task 30: Document the public contract and operations
 
@@ -2541,8 +2491,13 @@ examples match the shipped tool definitions.
 
 **Step 2: Verify RED**
 
-Run Tools example tests and documentation guards. Expected: FAIL before docs and
-examples are updated.
+Run the one focused documentation/example command:
+
+```bash
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test . ./bash ./process -run 'Test(Readme|Example|Schema)'
+```
+
+Expected: FAIL before docs and examples are updated.
 
 **Step 3: Document boundaries and operations**
 
@@ -2562,10 +2517,11 @@ Document:
 
 **Step 4: Verify GREEN and commit**
 
+Re-run the exact focused command from Step 2.
 Commit independently in each repository with
 `docs: document supervised command lifecycle`.
 
-### Task 31: Run the complete release acceptance matrix
+## PHASE GATE 7: Run the complete release acceptance matrix
 
 **Files:**
 
@@ -2590,28 +2546,40 @@ written; modules verify.
 Harness:
 
 ```bash
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -list 'Test(ProcessServicesIntegration|IntegrationProcess|Security)' ./...
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test -tags integration -race ./...
 ```
 
 Tools:
 
 ```bash
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -list 'Test(SupervisorIntegration|Integration|Security)' ./...
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/safetext -run '^$' -fuzz '^FuzzNormalize$' -fuzztime=30s
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run '^$' -fuzz '^FuzzProcessArguments$' -fuzztime=30s
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run '^$' -fuzz '^FuzzProcessManifest$' -fuzztime=30s
+GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run '^$' -fuzz '^FuzzProcessCursor$' -fuzztime=30s
 ```
 
 Sandbox:
 
 ```bash
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -list 'Test(Integration|Security)' ./...
 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./...
 ```
 
 Coderig:
 
 ```bash
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -list 'Test(Integration|Security)' ./...
 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./...
 ```
 
@@ -2619,15 +2587,14 @@ Expected: PASS with zero race reports.
 
 **Step 3: Run builds and static checks**
 
-For every repository:
+For every repository, from its absolute worktree:
 
 ```bash
 CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-REPO-gocache go build -trimpath ./...
-make lint
 make secure
 ```
 
-For Sandbox and Coderig:
+For Harness, Tools, Sandbox, and Coderig where supported:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off go build -trimpath ./...
