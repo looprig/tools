@@ -1,0 +1,733 @@
+# Long-Running Command Supervision Design
+
+**Status:** Approved
+
+**Owners:** Tools, Harness, Sandbox
+
+**Scope:** Supervised foreground, yielded, background, and interactive shell commands
+
+## Summary
+
+Looprig will support long-running shell commands through a session-scoped process
+supervisor owned by Tools, generic lifecycle contracts owned by Harness, and
+enforced process execution owned by Sandbox.
+
+The design combines the strongest properties observed in current coding agents:
+
+- Codex's single command API, bounded initial yield, interactive PTY, incremental
+  output, and explicit stdin continuation;
+- Claude's foreground-to-background handoff, completion notification, and
+  separate output and stop operations;
+- Grok Build's explicit background mode, multi-process waiting, durable output,
+  process ownership, and process-tree cleanup;
+- OpenCode's simple foreground compatibility, streaming output, timeout, and
+  cancellation behavior.
+
+The result remains backward-compatible for existing `Bash` callers while adding
+the lifecycle, durability, isolation, and teardown guarantees required for
+commands that outlive an individual tool invocation.
+
+## Goals
+
+The implementation must:
+
+1. preserve the current synchronous `Bash` behavior for existing arguments;
+2. allow a command to be started in the background immediately;
+3. allow a foreground command to yield after a caller-selected wait budget and
+   continue under supervision;
+4. allow output to be polled or waited on without replaying the entire transcript;
+5. allow stdin, EOF, terminal resize, interrupt, terminate, and kill operations;
+6. support real PTYs on Unix and Windows without silently degrading behavior;
+7. bind every process to its originating session, loop, and tool execution;
+8. prevent process handles from being used across owners;
+9. preserve bounded completed output and metadata across normal session restore;
+10. terminate process trees reliably during explicit stop, session shutdown,
+    workspace restore, supervisor crash, and parent process death;
+11. integrate background filesystem access with workspace mutation and checkpoint
+    coordination for the entire process lifetime;
+12. expose stable, typed failures suitable for model-facing rendering and
+    programmatic callers;
+13. keep output, stdin, and shell-controlled terminal content out of durable
+    model event journals.
+
+## Non-goals
+
+The first implementation will not:
+
+- reattach to an arbitrary local PID after a host or Harness restart;
+- provide daemon management beyond the owning Looprig session;
+- permit unsupervised `nohup`, disowned jobs, or shell backgrounding to escape
+  the supervisor;
+- offer remote execution or container orchestration;
+- provide arbitrary random access to unbounded raw output;
+- persist stdin or full command output in the Harness event journal;
+- silently emulate PTY behavior with ordinary pipes;
+- share a process between sibling delegates or loops;
+- support shell job-control syntax as a substitute for process handles.
+
+## Reference-agent comparison
+
+| Agent | Useful behavior | Limitation to avoid |
+| --- | --- | --- |
+| Codex | One `exec_command` entry point; `tty`; bounded initial yield; process ID when still running; `write_stdin` doubles as poll and input; bounded head-tail output | Primarily in-memory process lifetime and a relatively small process table |
+| Claude | `run_in_background`; automatic foreground handoff; completion notification; durable task output; `TaskOutput` and `TaskStop` | Background Bash is not centered on interactive PTY continuation; tasks are not restorable across session restart |
+| Grok Build | Explicit background mode; auto-background; wait-one/wait-many; task snapshots; durable files; owner cleanup; output-runaway protection; process groups and Windows jobs | Multiple overlapping task abstractions and less uniform interactive control |
+| OpenCode | Straightforward foreground shell streaming, timeout, abort, and force-kill behavior | No complete model-facing long-running process lifecycle |
+
+Looprig deliberately uses one supervised process model rather than separate
+"foreground command", "background task", and "terminal session" models.
+
+## Ownership boundaries
+
+### Tools
+
+Tools owns the behavior visible to a model or direct tool consumer:
+
+- `Bash`;
+- `ProcessOutput`;
+- `ProcessInput`;
+- `ProcessStop`;
+- the session-scoped `Supervisor`;
+- process identity validation and owner matching;
+- state transitions;
+- in-memory output windows;
+- disk spools and process manifests;
+- output cursor semantics;
+- waiters and completion fan-out;
+- quotas and completed-process retention;
+- safe-text normalization;
+- model-facing result and error rendering.
+
+Tools must not import Harness internals or Sandbox directly. It consumes public
+Harness contracts supplied through tool bindings.
+
+### Harness
+
+Harness owns generic orchestration contracts:
+
+- session, loop, and tool-execution identity in bindings;
+- registration of resources that must be closed with a session;
+- the async process runner interface consumed by Tools;
+- durable process lifecycle event types;
+- completion notification delivery;
+- session shutdown and restore ordering;
+- workspace observation invalidation;
+- workspace leases that may outlive one tool invocation.
+
+Harness must not know Bash-specific JSON schemas, output cursor rendering, spool
+formats, or shell semantics.
+
+### Sandbox
+
+Sandbox owns operating-system enforcement:
+
+- asynchronous process spawn;
+- ordinary stdin/stdout/stderr pipes;
+- PTY/ConPTY creation;
+- process group or Job Object membership;
+- signals and graceful-to-forceful termination;
+- parent-death cleanup;
+- confirmation that the process tree has exited;
+- enforcement of the prepared filesystem and network grants for the lifetime of
+  a process.
+
+Sandbox must not know sessions, loops, model tool names, output cursors, or
+Harness event types.
+
+## Identity and authorization
+
+Each process has an immutable internal owner:
+
+```text
+SessionID + LoopID + ToolExecutionID + ProcessID
+```
+
+`ProcessID` is an opaque, cryptographically random handle with at least 128 bits
+of entropy. It must not encode an OS PID, filesystem path, owner identifier, or
+creation timestamp.
+
+Every follow-up operation provides the process handle and receives current
+bindings. Tools resolves the handle and compares the complete owner. A mismatch
+is rendered as `not_found`; callers must not be able to distinguish a nonexistent
+handle from a handle owned by another session, loop, delegate, or tool execution.
+
+The initial Bash gate and Sandbox grants authorize process creation. Follow-up
+operations do not re-run the original Bash gate, but they are restricted to the
+immutable owner and the capabilities of their specific tool:
+
+- `ProcessOutput` is read-only;
+- `ProcessInput` may write only to the process input/terminal;
+- `ProcessStop` may signal only the owned process tree.
+
+## Bash API
+
+The existing Bash definition is extended without changing the meaning of current
+fields:
+
+```json
+{
+  "command": "string, required",
+  "workdir": "string, optional",
+  "timeout": "duration, optional",
+  "background": "boolean, optional, default false",
+  "yield_time_ms": "integer, optional",
+  "tty": "boolean, optional, default false",
+  "max_output_bytes": "integer, optional",
+  "access": "existing prepared-access input, optional"
+}
+```
+
+Semantics:
+
+- A call using only existing fields follows the existing foreground path,
+  including its current default and maximum timeout.
+- `background: true` returns as soon as spawn, manifest persistence, and
+  supervision registration succeed.
+- `yield_time_ms` waits up to the requested initial budget. If the process exits,
+  Bash returns its terminal result. If it is still running, Bash returns the
+  process handle and output observed during the budget.
+- `tty: true` requests a real PTY/ConPTY. Failure to allocate one returns
+  `pty_unavailable`; it never falls back to pipes.
+- `timeout` is a hard process-lifetime deadline, not a per-poll deadline.
+- `timeout: 0` is valid only when `background` or `yield_time_ms` enables
+  supervision and means "until session shutdown".
+- `max_output_bytes` may reduce the per-process disk ceiling but may not exceed
+  the configured supervisor ceiling.
+- Detached shell syntax is rejected when it would escape supervision. Descendants
+  that remain in the supervised process group or job are allowed.
+
+The Bash result has one of two shapes:
+
+```json
+{
+  "status": "exited",
+  "exit_code": 0,
+  "output": "...",
+  "started_at": "...",
+  "finished_at": "...",
+  "duration_ms": 123
+}
+```
+
+or:
+
+```json
+{
+  "status": "running",
+  "process_id": "opaque",
+  "output": "...",
+  "next_cursor": 42,
+  "started_at": "...",
+  "backgrounded": true
+}
+```
+
+`backgrounded` is true for explicit background starts and for yielded foreground
+starts that remain alive.
+
+## ProcessOutput API
+
+`ProcessOutput` supports non-mutating inspection:
+
+```json
+{
+  "process_ids": ["opaque"],
+  "cursor": 0,
+  "limit_bytes": 32768,
+  "wait": "poll | any | all",
+  "timeout_ms": 10000
+}
+```
+
+One process may be supplied as `process_id`; multiple processes use
+`process_ids`. Supplying neither, both, duplicates, or an empty list is invalid.
+
+- `poll` returns immediately.
+- `any` waits until any selected process has new output after its supplied cursor
+  or becomes terminal.
+- `all` waits until every selected process has new output after its supplied
+  cursor or becomes terminal.
+- The wait timeout affects only the output call, never the process.
+- Multi-process results preserve input order.
+- Waiters are notified by output append and terminal-state transitions, not by
+  periodic polling.
+
+Each result includes:
+
+```json
+{
+  "process_id": "opaque",
+  "status": "running",
+  "output": "...",
+  "start_cursor": 0,
+  "next_cursor": 42,
+  "total_bytes": 42,
+  "gap": false,
+  "normalized": false,
+  "binary": false,
+  "artifact": null,
+  "exit_code": null,
+  "reason": null,
+  "started_at": "...",
+  "finished_at": null
+}
+```
+
+Cursors are monotonically increasing byte offsets in the combined process output
+stream. A cursor older than retained/spooled data returns the earliest available
+bytes with `gap: true`. A cursor beyond `total_bytes` returns `cursor_ahead`.
+Calls never silently reset a cursor.
+
+## ProcessInput API
+
+`ProcessInput` writes to an owned live process:
+
+```json
+{
+  "process_id": "opaque",
+  "data": "string, optional",
+  "eof": "boolean, optional",
+  "rows": "integer, optional",
+  "cols": "integer, optional",
+  "yield_time_ms": "integer, optional"
+}
+```
+
+At least one of data, EOF, or resize must be requested. Resize is valid only for
+PTY processes. EOF is idempotent for pipe-backed processes and maps to terminal
+input semantics appropriate to the platform for PTYs. Writes are serialized per
+process and bounded; the tool may not block indefinitely behind a process that
+does not consume input.
+
+After the operation, `yield_time_ms` optionally waits for output or termination
+and returns the same cursor-aware snapshot shape as `ProcessOutput`.
+
+## ProcessStop API
+
+`ProcessStop` controls the whole owned process tree:
+
+```json
+{
+  "process_id": "opaque",
+  "mode": "interrupt | terminate | kill",
+  "grace_ms": 5000
+}
+```
+
+- `interrupt` sends the platform-equivalent interactive interrupt. It does not
+  terminalize the supervisor state unless the process exits.
+- `terminate` requests graceful termination and escalates to kill after
+  `grace_ms`.
+- `kill` immediately force-terminates the process tree.
+- Repeating a stop operation against a terminal process is successful and
+  returns the existing terminal result.
+- A stop result is not successful until Sandbox confirms that the owned process
+  tree has exited or returns a typed teardown failure.
+
+## State machine
+
+The externally visible states are:
+
+```text
+starting
+running
+exited
+failed
+timed_out
+interrupted
+terminated
+killed
+lost_on_restore
+```
+
+Allowed transitions:
+
+```text
+starting -> running
+starting -> failed
+starting -> terminated | killed
+
+running -> exited | failed | timed_out | terminated | killed
+running -> interrupted only when interrupt causes exit
+
+starting | running -> lost_on_restore during restore reconciliation
+```
+
+Terminal states are immutable. Completion is published only after the terminal
+manifest is durably written. Concurrent exit, timeout, stop, output-limit, and
+shutdown paths race through one compare-and-set terminalization path, producing
+at most one terminal state and one completion event.
+
+## Supervisor lifetime
+
+The supervisor is created once per Harness session and registered as a session
+resource. A supervised process is independent of the context of the Bash tool
+invocation. Cancelling a foreground invocation before handoff cancels its start;
+after a process handle has been returned, invocation cancellation does not kill
+the process.
+
+Supervisor shutdown:
+
+1. closes admission to new processes and follow-up writes;
+2. snapshots all running handles;
+3. requests graceful termination concurrently;
+4. force-kills trees that exceed the configured grace period;
+5. confirms all trees have exited;
+6. flushes final output and terminal manifests;
+7. releases workspace leases;
+8. closes waiters and storage handles;
+9. returns any teardown failures to Harness.
+
+Running processes are never silently evicted to satisfy metadata quotas.
+
+## Output capture and storage
+
+Defaults:
+
+| Resource | Default |
+| --- | --- |
+| In-memory rolling window | 1 MiB per process |
+| Disk spool | 64 MiB per process |
+| Inline model result | 32 KiB |
+| Process handle entropy | at least 128 bits |
+| Graceful shutdown period | 5 seconds |
+
+The supervisor writes a combined, ordered output stream. Pipe mode tags source
+chunks internally as stdout or stderr while assigning one global cursor. PTY
+mode naturally exposes one combined terminal stream.
+
+The in-memory window is optimized for recent polling. The spool is the bounded
+source of truth for completed output and cursor recovery. Writes use a single
+per-process append sequence so cursor order is deterministic even when stdout
+and stderr are read concurrently.
+
+Reaching the configured spool ceiling triggers process-tree termination and the
+terminal reason `output_limit`. The supervisor must not keep discarding live
+output while allowing an unbounded producer to run.
+
+Model-visible text passes through safe-text normalization:
+
+- invalid UTF-8 is replaced deterministically;
+- disallowed terminal control sequences are escaped or removed;
+- binary detection is reported;
+- normalization is reported;
+- raw bytes remain only in the bounded spool and may be exposed through an
+  opaque artifact reference authorized to the same owner.
+
+No filesystem path to a spool or manifest is returned to a model.
+
+## Manifests and durability
+
+Before returning a process handle, Tools atomically persists a manifest containing:
+
+- format version;
+- opaque process ID;
+- owner identity;
+- sanitized command metadata;
+- prepared access summary;
+- PTY mode;
+- process state;
+- created and started timestamps;
+- timeout deadline;
+- spool metadata and cursor bounds;
+- OS execution metadata needed only for same-process teardown;
+- terminal result fields when complete;
+- completion-published marker.
+
+Manifest updates use write-new, sync, and atomic replace semantics. State and
+cursor metadata never move backward.
+
+On normal session restore:
+
+- completed manifests and retained output are queryable;
+- a manifest marked running or starting becomes `lost_on_restore`;
+- recorded local PIDs are never trusted or signalled;
+- at most one restored completion notification is emitted, based on the durable
+  completion-published marker.
+
+Authenticated reattachment to an external execution service may be added later;
+local PID reattachment is explicitly excluded.
+
+## Durable events and notifications
+
+Harness defines typed metadata-only lifecycle events:
+
+- `ProcessStarted`;
+- `ProcessBackgrounded`;
+- `ProcessCompleted`;
+- `ProcessStopRequested`;
+- `ProcessLost`.
+
+Events include identity, state, timestamps, exit metadata, reason, and bounded
+non-output diagnostics. Command output and stdin are excluded.
+
+Completion notifications are also metadata-only. They tell the loop that a
+process reached a terminal state and provide its opaque handle. The model must
+call `ProcessOutput` to inspect command-controlled content. This keeps arbitrary
+process output out of trusted notification framing and avoids turning output
+into an unsolicited prompt-injection channel.
+
+## Workspace coordination
+
+Background processes require an enforcement-capable async runner. The prepared
+filesystem access granted at spawn becomes a workspace lease held for the entire
+process lifetime.
+
+Lease compatibility:
+
+| Background access | Compatibility |
+| --- | --- |
+| Read-only | May coexist with reads and structured writes |
+| Scoped write | Blocks overlapping structured writes; disjoint writes may proceed |
+| Broad/workspace write | Blocks all structured writes and checkpoints |
+
+All writable background leases block workspace snapshots. Workspace restore
+first stops all supervised processes, confirms their exit, then performs restore.
+
+Observation caches are invalidated at process spawn, on reported filesystem
+activity when available, and at process completion. A broad writer invalidates
+the entire workspace observation set.
+
+The bare, unenforced runner remains available only for legacy foreground Bash.
+It may not create a background, yielded, or detached process.
+
+## Sandbox process contract
+
+Harness exposes a public, shell-agnostic async runner contract conceptually
+equivalent to:
+
+```go
+type AsyncProcessRunner interface {
+    StartProcess(context.Context, ProcessRequest) (Process, error)
+}
+
+type Process interface {
+    ID() string
+    Stdout() io.ReadCloser
+    Stderr() io.ReadCloser
+    Stdin() io.WriteCloser
+    Wait(context.Context) (ProcessResult, error)
+    Resize(context.Context, rows, cols uint16) error
+    Signal(context.Context, ProcessSignal) error
+    Close(context.Context) error
+}
+```
+
+Exact Go names may follow existing package conventions, but the contract must:
+
+- distinguish pipe and PTY streams;
+- make `Wait` safe to call exactly once through a supervisor-controlled path;
+- define concurrent stdin and signal behavior;
+- return typed spawn, setup, signal, wait, and teardown errors;
+- confirm whole-tree exit;
+- not expose an OS PID as the model-facing identity.
+
+Sandbox's implementation must start the child in its final enforcement and
+process-tree container before executable code can run.
+
+## Cross-platform process trees
+
+### Unix
+
+Each process starts in a dedicated process group. Sandbox signals the group, not
+only its initial child. A lifetime shim holds a parent-death pipe; EOF causes the
+shim to terminate the group. PTY support uses `github.com/creack/pty`, approved
+for this feature.
+
+### Windows
+
+Each process starts suspended, joins a kill-on-close Job Object, attaches the
+configured pipes or ConPTY, then resumes. Existing `golang.org/x/sys/windows`
+support is used. Closing the lifetime handle terminates the job.
+
+### Unsupported PTY environments
+
+If a platform cannot provide a real PTY/ConPTY, `tty: true` fails with
+`pty_unavailable`. Pipe-backed background commands remain supported when
+process-tree enforcement is available.
+
+## Quotas and retention
+
+Configuration includes:
+
+- maximum concurrently running processes per loop;
+- maximum concurrently running processes per session;
+- maximum retained completed processes per session;
+- maximum aggregate in-memory bytes;
+- maximum aggregate spool bytes;
+- maximum process spool bytes;
+- maximum pending waiters;
+- maximum pending input bytes.
+
+Admission reserves quotas before spawn and releases them on failed setup.
+Completed metadata is evicted by least-recently-used order only after the
+retention limit is reached. Eviction deletes the manifest and spool atomically
+from the supervisor's perspective and never affects a running process.
+
+## Stable errors
+
+The public error taxonomy includes:
+
+- `invalid_arguments`;
+- `invalid_settings`;
+- `process_quota_exceeded`;
+- `output_quota_exceeded`;
+- `lifetime_enforcement_unavailable`;
+- `spawn_failed`;
+- `process_setup_failed`;
+- `pty_unavailable`;
+- `not_found`;
+- `stdin_closed`;
+- `input_backpressure`;
+- `cursor_gap`;
+- `cursor_ahead`;
+- `output_limit`;
+- `timed_out`;
+- `interrupted`;
+- `terminated`;
+- `killed`;
+- `supervisor_shutting_down`;
+- `manifest_corrupt`;
+- `spool_corrupt`;
+- `lost_on_restore`;
+- `teardown_failed`.
+
+Errors must support `errors.Is` or typed inspection and render to stable
+model-facing codes without exposing host paths, OS PIDs, or cross-owner details.
+
+## Security invariants
+
+The implementation is unacceptable unless all of these remain true:
+
+1. A process handle grants no authority outside the complete immutable owner.
+2. Cross-owner lookup is indistinguishable from a missing handle.
+3. A background process never outlives its session resource.
+4. A process tree cannot escape through shell backgrounding, grandchildren, or
+   closing inherited standard streams.
+5. Filesystem and network grants cannot expand after spawn.
+6. The model never receives a host path or OS PID as a control handle.
+7. Command output never appears in a trusted completion notification.
+8. Output and input remain bounded in memory and on disk.
+9. Terminal state and completion publication occur at most once.
+10. Restore never signals a PID recovered from persisted metadata.
+
+## Delivery phases
+
+### Phase 1: Harness contracts
+
+Add async process contracts, session-resource registration, typed lifecycle
+events, immutable owner identity, and lifetime workspace lease coordination.
+
+Acceptance gate:
+
+- contract and coordinator tests pass with `-race`;
+- no Bash-specific behavior enters Harness;
+- a spec reviewer approves ownership and lifecycle semantics;
+- a quality/security reviewer approves the API and locking.
+
+### Phase 2: Tools supervisor core
+
+Add process state, IDs, quotas, cursor buffer, spool, atomic manifests, waiters,
+restore reconciliation, and deterministic fakes.
+
+Acceptance gate:
+
+- state-machine, quota, cursor, corruption, and concurrency tests pass with
+  `-race`;
+- terminalization and completion are proven at-most-once;
+- reviewers approve spec compliance, storage safety, and concurrency.
+
+### Phase 3: Sandbox non-PTY execution
+
+Add asynchronous spawn, pipes, process groups/jobs, signals, parent-death
+enforcement, grants, and whole-tree confirmation.
+
+Acceptance gate:
+
+- descendant cleanup, timeout, stop escalation, parent death, and grant tests
+  pass with `-race`;
+- supported OS build checks pass;
+- reviewers approve process-tree and enforcement security.
+
+### Phase 4: Model-facing process tools
+
+Extend Bash and add ProcessOutput, ProcessInput, and ProcessStop using the
+supervisor and Harness bindings.
+
+Acceptance gate:
+
+- legacy Bash compatibility and all new schemas/results are tested;
+- foreground, explicit background, yield, polling, waiting, input, and stop
+  workflows pass;
+- reviewers approve model API behavior and authorization.
+
+### Phase 5: PTY and ConPTY
+
+Add Unix PTY, Windows ConPTY, resize, terminal input, EOF, and interrupt behavior.
+
+Acceptance gate:
+
+- interactive echo, resize, EOF, interrupt, and unsupported-platform tests pass;
+- there is no pipe fallback for `tty: true`;
+- reviewers approve platform behavior and dependency use.
+
+### Phase 6: Session lifecycle integration
+
+Wire session construction, resource shutdown, durable lifecycle events,
+metadata-only completion notifications, workspace restore, and manifest restore.
+
+Acceptance gate:
+
+- shutdown ordering, restore reconciliation, notification deduplication, and
+  workspace lease tests pass;
+- reviewers approve durability, injection boundaries, and teardown.
+
+### Phase 7: Hardening and acceptance
+
+Exercise quotas, runaway output, binary/control output, concurrent stop/exit,
+workspace conflicts, crash recovery, owner isolation, and documentation.
+
+Acceptance gate:
+
+- focused and repository-wide race tests pass;
+- static analysis and platform build checks pass;
+- a final spec review and final code-quality/security review have no unresolved
+  critical or important findings.
+
+## TDD and review policy
+
+Every implementation task follows strict red-green-refactor:
+
+1. write one focused failing test;
+2. run it and confirm the expected failure;
+3. write the minimum production code;
+4. rerun the focused test;
+5. run affected package race tests;
+6. refactor only while green;
+7. commit the task.
+
+At every phase boundary:
+
+1. run focused and affected repository tests with the race detector;
+2. run applicable static and cross-platform checks;
+3. obtain an independent spec-compliance review;
+4. fix every gap and obtain re-review;
+5. obtain an independent code-quality and security review;
+6. fix every critical or important issue and obtain re-review;
+7. record the verified phase before starting the next phase.
+
+## Final acceptance
+
+The feature is complete when a caller can:
+
+1. run a legacy foreground Bash command unchanged;
+2. start a bounded background command and receive an opaque handle;
+3. yield a foreground command into the same supervised lifecycle;
+4. read only new output using cursors;
+5. wait on one or multiple processes;
+6. interact through pipes or a real terminal;
+7. stop the whole process tree predictably;
+8. observe metadata-only completion;
+9. restore completed output without trusting stale PIDs;
+10. shut down a session with no surviving descendants or unreleased workspace
+    leases.
