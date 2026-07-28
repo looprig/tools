@@ -2,7 +2,7 @@
 
 **Status:** Approved
 
-**Owners:** Tools, Harness, Sandbox
+**Owners:** Tools, Harness, Sandbox; Coderig composes the concrete adapters
 
 **Scope:** Supervised foreground, yielded, background, and interactive shell commands
 
@@ -26,6 +26,12 @@ The design combines the strongest properties observed in current coding agents:
 The result remains backward-compatible for existing `Bash` callers while adding
 the lifecycle, durability, isolation, and teardown guarantees required for
 commands that outlive an individual tool invocation.
+
+Tools and Sandbox intentionally remain independent modules. Because Go interface
+method signatures do not permit a Sandbox method returning a Sandbox-named
+process type to implement a Harness method returning a Harness-named process
+interface, Coderig provides the small adapter that imports both modules. Neither
+low-level module gains a reverse dependency.
 
 ## Goals
 
@@ -107,6 +113,8 @@ Harness owns generic orchestration contracts:
 
 - session, loop, and tool-execution identity in bindings;
 - registration of resources that must be closed with a session;
+- keyed, concurrency-safe get-or-create access to shared session resources;
+- a private per-session storage root for resource manifests and spools;
 - the async process runner interface consumed by Tools;
 - durable process lifecycle event types;
 - completion notification delivery;
@@ -134,12 +142,27 @@ Sandbox owns operating-system enforcement:
 Sandbox must not know sessions, loops, model tool names, output cursors, or
 Harness event types.
 
+### Coderig
+
+Coderig is the production composition root. It owns:
+
+- the adapter from Sandbox's public asynchronous process API to Harness's public
+  async runner/process contracts;
+- construction of one Tools supervisor through the Harness session-resource
+  registry;
+- injection of the shared supervisor into Bash, ProcessOutput, ProcessInput, and
+  ProcessStop definitions;
+- integration tests proving the composed path uses Sandbox enforcement.
+
+The adapter contains no supervision policy, output buffering, authorization, or
+process-tree implementation. Those remain in their owning modules.
+
 ## Identity and authorization
 
-Each process has an immutable internal owner:
+Each process has an immutable authority owner:
 
 ```text
-SessionID + LoopID + ToolExecutionID + ProcessID
+SessionID + LoopID + ProcessID
 ```
 
 `ProcessID` is an opaque, cryptographically random handle with at least 128 bits
@@ -147,9 +170,15 @@ of entropy. It must not encode an OS PID, filesystem path, owner identifier, or
 creation timestamp.
 
 Every follow-up operation provides the process handle and receives current
-bindings. Tools resolves the handle and compares the complete owner. A mismatch
+bindings. Tools resolves the handle and compares SessionID and LoopID. A mismatch
 is rendered as `not_found`; callers must not be able to distinguish a nonexistent
-handle from a handle owned by another session, loop, delegate, or tool execution.
+handle from a handle owned by another session, loop, or delegate.
+
+The originating Bash `ToolExecutionID` is stored immutably as audit provenance,
+but it is not compared to the execution ID of ProcessOutput, ProcessInput, or
+ProcessStop: every follow-up tool invocation necessarily has a new execution ID.
+The opaque ProcessID is the stable process capability, attenuated by the current
+session and loop bindings.
 
 The initial Bash gate and Sandbox grants authorize process creation. Follow-up
 operations do not re-run the original Bash gate, but they are restricted to the
@@ -168,7 +197,7 @@ fields:
 {
   "command": "string, required",
   "workdir": "string, optional",
-  "timeout": "duration, optional",
+  "timeout": "integer seconds, optional",
   "background": "boolean, optional, default false",
   "yield_time_ms": "integer, optional",
   "tty": "boolean, optional, default false",
@@ -189,12 +218,16 @@ Semantics:
 - `tty: true` requests a real PTY/ConPTY. Failure to allocate one returns
   `pty_unavailable`; it never falls back to pipes.
 - `timeout` is a hard process-lifetime deadline, not a per-poll deadline.
+- `timeout` remains integer seconds for wire compatibility with existing Bash.
 - `timeout: 0` is valid only when `background` or `yield_time_ms` enables
   supervision and means "until session shutdown".
 - `max_output_bytes` may reduce the per-process disk ceiling but may not exceed
   the configured supervisor ceiling.
 - Detached shell syntax is rejected when it would escape supervision. Descendants
   that remain in the supervised process group or job are allowed.
+- Legacy foreground Bash retains its current shell compatibility. Conservative
+  detached-syntax rejection applies only when a call requests supervision;
+  process-tree containment remains the security boundary.
 
 The Bash result has one of two shapes:
 
@@ -234,6 +267,7 @@ starts that remain alive.
   "process_ids": ["opaque"],
   "cursor": 0,
   "limit_bytes": 32768,
+  "encoding": "safe_text | base64",
   "wait": "poll | any | all",
   "timeout_ms": 10000
 }
@@ -265,7 +299,7 @@ Each result includes:
   "gap": false,
   "normalized": false,
   "binary": false,
-  "artifact": null,
+  "artifact": {"id": "opaque", "encoding": "base64"},
   "exit_code": null,
   "reason": null,
   "started_at": "...",
@@ -278,6 +312,11 @@ stream. A cursor older than retained/spooled data returns the earliest available
 bytes with `gap: true`. A cursor beyond `total_bytes` returns `cursor_ahead`.
 Calls never silently reset a cursor.
 
+`encoding` defaults to `safe_text`. `base64` reads the same owner-authorized raw
+spool bytes without exposing a host path. A result's `artifact` is an opaque
+descriptor for that same bounded process spool; callers retrieve its bytes with
+ProcessOutput and the original process handle, cursor, and `base64` encoding.
+
 ## ProcessInput API
 
 `ProcessInput` writes to an owned live process:
@@ -286,6 +325,7 @@ Calls never silently reset a cursor.
 {
   "process_id": "opaque",
   "data": "string, optional",
+  "cursor": "integer, optional",
   "eof": "boolean, optional",
   "rows": "integer, optional",
   "cols": "integer, optional",
@@ -300,7 +340,9 @@ process and bounded; the tool may not block indefinitely behind a process that
 does not consume input.
 
 After the operation, `yield_time_ms` optionally waits for output or termination
-and returns the same cursor-aware snapshot shape as `ProcessOutput`.
+and returns the same snapshot shape as `ProcessOutput`, beginning at `cursor`
+when supplied and at the current end offset captured before the input operation
+when omitted.
 
 ## ProcessStop API
 
@@ -361,10 +403,21 @@ at most one terminal state and one completion event.
 ## Supervisor lifetime
 
 The supervisor is created once per Harness session and registered as a session
-resource. A supervised process is independent of the context of the Bash tool
-invocation. Cancelling a foreground invocation before handoff cancels its start;
-after a process handle has been returned, invocation cancellation does not kill
-the process.
+resource. Harness bindings expose a keyed session-resource registry; every
+process-tool definition resolves the same supervisor key with atomic
+get-or-create semantics. The registry also supplies a private session storage
+root, never the workspace, for manifests and spools.
+
+New-session and restore construction use the same late-bound session bridge.
+Definitions may be probed before the final Session and event hub exist, so a
+supervisor must not capture an internal `*Session` during bind. Harness activates
+the bridge only after the session, durable publisher, notifier, and restore
+state are ready.
+
+A supervised process is independent of the context of the Bash tool invocation.
+Cancelling a foreground invocation before handoff cancels its start; after a
+process handle has been returned, invocation cancellation does not kill the
+process.
 
 Supervisor shutdown:
 
@@ -411,8 +464,8 @@ Model-visible text passes through safe-text normalization:
 - disallowed terminal control sequences are escaped or removed;
 - binary detection is reported;
 - normalization is reported;
-- raw bytes remain only in the bounded spool and may be exposed through an
-  opaque artifact reference authorized to the same owner.
+- raw bytes remain only in the bounded spool and are exposed only through an
+  opaque artifact descriptor plus owner-authorized ProcessOutput base64 reads.
 
 No filesystem path to a spool or manifest is returned to a model.
 
@@ -473,6 +526,13 @@ Background processes require an enforcement-capable async runner. The prepared
 filesystem access granted at spawn becomes a workspace lease held for the entire
 process lifetime.
 
+Lease classification comes from the enforcing runner's authoritative effective
+access summary, not solely from the model's requested access declaration. The
+Coderig adapter maps the Sandbox executor's normalized profile and approved
+per-spawn deltas to Harness's generic read-only, scoped-write, or broad-write
+lease description. If an async runner cannot truthfully report effective access,
+supervised spawn fails with `lifetime_enforcement_unavailable`.
+
 Lease compatibility:
 
 | Background access | Compatibility |
@@ -522,8 +582,11 @@ Exact Go names may follow existing package conventions, but the contract must:
 - confirm whole-tree exit;
 - not expose an OS PID as the model-facing identity.
 
-Sandbox's implementation must start the child in its final enforcement and
-process-tree container before executable code can run.
+Sandbox exposes its equivalent concrete public API without importing Harness.
+Coderig wraps the Sandbox request and process in the Harness interfaces; the
+adapter is mechanical and is contract-tested in both directions. Sandbox's
+implementation must start the child in its final enforcement and process-tree
+container before executable code can run.
 
 ## Cross-platform process trees
 
@@ -537,8 +600,10 @@ for this feature.
 ### Windows
 
 Each process starts suspended, joins a kill-on-close Job Object, attaches the
-configured pipes or ConPTY, then resumes. Existing `golang.org/x/sys/windows`
-support is used. Closing the lifetime handle terminates the job.
+configured pipes or ConPTY, then resumes. This extends Sandbox's existing,
+reviewed Windows restricted/elevated backends and broker rather than creating an
+unconfined side path. Existing `golang.org/x/sys/windows` support is used.
+Closing the lifetime handle terminates the job.
 
 ### Unsupported PTY environments
 
@@ -599,7 +664,8 @@ model-facing codes without exposing host paths, OS PIDs, or cross-owner details.
 
 The implementation is unacceptable unless all of these remain true:
 
-1. A process handle grants no authority outside the complete immutable owner.
+1. A process handle grants no authority outside its immutable session and loop
+   owner; the originating tool execution remains immutable audit provenance.
 2. Cross-owner lookup is indistinguishable from a missing handle.
 3. A background process never outlives its session resource.
 4. A process tree cannot escape through shell backgrounding, grandchildren, or
@@ -615,8 +681,9 @@ The implementation is unacceptable unless all of these remain true:
 
 ### Phase 1: Harness contracts
 
-Add async process contracts, session-resource registration, typed lifecycle
-events, immutable owner identity, and lifetime workspace lease coordination.
+Add async process contracts, a keyed session-resource registry and private
+storage root, typed lifecycle events, immutable owner/provenance identity, and
+lifetime workspace lease coordination.
 
 Acceptance gate:
 
@@ -674,7 +741,8 @@ Acceptance gate:
 ### Phase 6: Session lifecycle integration
 
 Wire session construction, resource shutdown, durable lifecycle events,
-metadata-only completion notifications, workspace restore, and manifest restore.
+metadata-only completion notifications, workspace restore, manifest restore,
+and Coderig's Sandbox-to-Harness async adapter and process-tool composition.
 
 Acceptance gate:
 
@@ -706,10 +774,18 @@ Every implementation task follows strict red-green-refactor:
 6. refactor only while green;
 7. commit the task.
 
+Unit tests are necessary but insufficient. Each phase that crosses a module or
+OS boundary adds tagged integration coverage. Sandbox integration tests execute
+real descendants, grants, process-tree teardown, and PTY behavior. Coderig
+integration tests exercise the composed Bash-to-Tools-to-Harness-to-Sandbox
+path. Harness integration tests cover shutdown, restore, checked events, and
+workspace leases. Supported repositories run integration tests with `-race`;
+Windows ConPTY and Job behavior also runs on a Windows CI worker.
+
 At every phase boundary:
 
 1. run focused and affected repository tests with the race detector;
-2. run applicable static and cross-platform checks;
+2. run applicable tagged integration, static, and cross-platform checks;
 3. obtain an independent spec-compliance review;
 4. fix every gap and obtain re-review;
 5. obtain an independent code-quality and security review;
