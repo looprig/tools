@@ -343,9 +343,20 @@ type SessionResourceRegistry interface {
 }
 ```
 
-The factory receives its private storage directory. `SessionResourceServices`
-contains generic lifecycle publication and metadata-only notification
-interfaces, not `*sessionruntime.Session`.
+The factory receives its private storage directory. In 2A,
+`SessionResourceServices` is deliberately an empty staged late-binding carrier:
+
+```go
+type SessionResourceServices struct{}
+```
+
+Do not invent `any`, callback, event, command, or opaque publisher payloads in
+this microtask. The exact bounded service DTOs cannot be correct until Task 4
+defines the process lifecycle domain, and `pkg/tool` cannot import `pkg/event`
+without reversing the dependency boundary. The typed-nil tests in 2A apply to
+the `ProcessBinding` registry/runner interfaces. Task 4 completes the carrier
+with privately held, typed lifecycle and completion services and their
+constructor validation.
 
 **2B — registry linearization**
 
@@ -405,7 +416,10 @@ GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go t
 Expected RED: probe and live bindings do not share a bridge. Thread the same
 registry and inert bridge through `planLoops`, `buildRestoredSession`, and
 `attachRestoredLoop`; activate only after the live Session, hub, publisher, and
-notifier exist. Reject process-enabled definitions on non-native engines with
+notifier exist. At this stage activation proves ordering with the empty
+`SessionResourceServices` carrier; Task 4 replaces that staged value with the
+validated typed service set before any real process resource is composed.
+Reject process-enabled definitions on non-native engines with
 `process_notifications_unsupported`; legacy foreground-only Bash retains its
 existing foreign-engine behavior. Never expose `*sessionruntime.Session`
 publicly. Re-run the
@@ -476,6 +490,8 @@ git commit -m "feat(workspace): coordinate background process leases"
 
 **Files:**
 
+- Modify: `../harness/pkg/tool/session_resource.go`
+- Create: `../harness/pkg/tool/session_resource_test.go`
 - Create: `../harness/pkg/event/process.go`
 - Create: `../harness/pkg/event/process_test.go`
 - Modify: `../harness/pkg/event/event.go`
@@ -485,12 +501,97 @@ git commit -m "feat(workspace): coordinate background process leases"
 - Modify: `../harness/pkg/event/marshal_test.go`
 - Modify: `../harness/pkg/event/validate_test.go`
 - Modify: `../harness/pkg/event/header_test.go`
+- Create: `../harness/internal/sessionruntime/process_services.go`
+- Create: `../harness/internal/sessionruntime/process_services_test.go`
+- Modify: `../harness/internal/sessionruntime/session_resources.go`
 - Create: `../harness/internal/sessionruntime/process_services_integration_test.go`
 
 **Step 1: Write failing event tests**
 
 Define `ProcessStarted`, `ProcessBackgrounded`, `ProcessCompleted`,
 `ProcessStopRequested`, and `ProcessLost`.
+
+First add `TestProcessLifecycleMetadataValidation`,
+`TestProcessCompletionNotificationValidation`,
+`TestSessionResourceServicesRejectsTypedNilLifecyclePublisher`, and
+`TestSessionResourceServicesRejectsTypedNilCompletionNotifier` in `pkg/tool`.
+Task 4 replaces 2A's empty staged carrier with a constructor-validated,
+immutable service set. Use this shape (exact enum constant names may follow
+package conventions, but the closed fields and bounds may not be widened):
+
+```go
+const (
+	MaxProcessHandleBytes     = 128
+	MaxProcessDiagnosticBytes = 512
+)
+
+type ProcessLifecycleKind uint8
+type ProcessLifecycleState uint8
+
+type ProcessLifecycleMetadata struct {
+	EventID           uuid.UUID
+	Kind              ProcessLifecycleKind
+	SessionID         uuid.UUID
+	LoopID            uuid.UUID
+	ProcessHandle     string
+	OriginExecutionID uuid.UUID
+	State             ProcessLifecycleState
+	CreatedAt         time.Time
+	StartedAt         time.Time
+	FinishedAt        time.Time
+	HasExitCode       bool
+	ExitCode          int32
+	Reason            ProcessTerminalReason
+	Diagnostic        string
+}
+
+type ProcessCompletionNotification struct {
+	CommandID       uuid.UUID
+	SessionID       uuid.UUID
+	LoopID          uuid.UUID
+	ProcessHandle   string
+	State           ProcessLifecycleState
+	Reason          ProcessTerminalReason
+}
+
+type ProcessLifecyclePublisher interface {
+	PublishProcessLifecycle(context.Context, ProcessLifecycleMetadata) error
+}
+
+type ProcessCompletionNotifier interface {
+	NotifyProcessCompletion(context.Context, ProcessCompletionNotification) error
+}
+```
+
+Use closed constants for started, backgrounded, completed, stop-requested, and
+lost kinds and for starting, running, exited, failed, timed-out, terminated,
+killed, interrupted, and lost-on-restore lifecycle states. Reuse the bounded
+`ProcessTerminalReason` already defined by Task 1 in `pkg/tool/process.go`; do
+not redeclare or shadow it. Extend that existing enum only if a distinct
+lost-on-restore terminal reason is required after state/reason validation is
+specified.
+
+Task 5's Tools-owned supervision state remains an internal explicit string
+enum. Its lifecycle sink maps each value mechanically to
+`pkg/tool.ProcessLifecycleState`; the two types are not aliases and must not be
+conflated across the module boundary.
+
+`NewSessionResourceServices` accepts both interfaces, rejects nil and typed-nil
+implementations, and stores them in unexported fields exposed only through
+read-only accessors. Once Task 4 lands the zero service set is invalid:
+session-runtime activation constructs and validates the value before invoking a
+resource, and resources fail closed if handed an unvalidated zero value. Do not
+use `any` or a generic callback. Process handles
+must be non-empty URL-safe opaque tokens no longer than
+`MaxProcessHandleBytes`; diagnostics must be valid UTF-8 and at most
+`MaxProcessDiagnosticBytes`. No DTO has command, output, stdin, environment,
+host path, spool path, OS PID, or another free-form field. Exit metadata uses
+`HasExitCode` rather than a caller-retained pointer. Validation requires
+non-zero `CreatedAt`; started/backgrounded records require non-zero `StartedAt`
+and zero `FinishedAt`, exit metadata, and terminal reason; completed/lost
+records require non-zero `FinishedAt` not before creation/start and a terminal
+state/reason. `HasExitCode` is valid only for terminal states whose executable
+actually produced an exit status; when false, `ExitCode` must be zero.
 
 Round-trip each event through the existing sealed event codec. Reject:
 
@@ -505,15 +606,30 @@ Round-trip each event through the existing sealed event codec. Reject:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/event ./pkg/journal ./pkg/sessionstore -run 'TestProcess'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/tool ./pkg/event ./pkg/journal ./pkg/sessionstore ./internal/sessionruntime -run 'Test(Process|SessionResourceServices)'
 ```
 
-Expected: FAIL because process events are absent.
+Expected: FAIL because the typed service DTOs and process events are absent.
 
 **Step 3: Implement event types and codec dispatch**
 
-Use bounded enums from `pkg/tool` to avoid import cycles. Keep the journal record
-format unchanged; process events use the existing generic event envelope.
+Complete `SessionResourceServices` with the typed, privately held services
+above. Map `ProcessLifecycleMetadata.Kind` to the five sealed `pkg/event`
+concrete types. Event payload fields use the bounded enums from `pkg/tool`; event
+validation repeats the cross-field invariants and requires Header coordinates
+and EventID to match the neutral DTO rather than replacing them. This dependency
+direction (`pkg/event` imports `pkg/tool`) avoids a cycle. Keep the journal
+record format unchanged; process events use the existing generic event envelope.
+Replace 2D's empty activation value with a session-runtime-owned typed bridge
+that implements both service interfaces, and construct
+`SessionResourceServices` through its validated constructor. Before Task 24
+binds the durable publisher/notifier implementation, method calls on that bridge
+return an explicit unavailable error rather than dropping a lifecycle record or
+notification. The bridge object itself remains stable across probe, restore,
+and live activation. Task 24 attaches checked durable publication/delivery
+behind it; it does not replace the bridge captured by resources. Task 4's
+Harness-local fake resource integration must therefore activate with a fully
+validated service set, never the staged empty value.
 
 **Step 4: Verify GREEN**
 
@@ -522,7 +638,7 @@ Re-run the exact focused command from Step 2. Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add pkg/event
+git add pkg/tool/session_resource.go pkg/tool/session_resource_test.go pkg/event internal/sessionruntime/process_services.go internal/sessionruntime/process_services_test.go internal/sessionruntime/session_resources.go
 git commit -m "feat(event): record process lifecycle metadata"
 ```
 
@@ -1000,13 +1116,23 @@ shutdown authority retention.
 
 ## Phase 3: Sandbox asynchronous pipe execution
 
-**Coordination prerequisite:** Do not begin this phase until the separate
-Sandbox stabilization owner completes its Tasks 1–11 (CI reproducibility,
-Linux writable-root/grant/mount behavior, Windows SID/journal hardening, Gosec,
-full verification, and handoff). Record that handoff SHA, integrate it into this
-Sandbox worktree, rerun its acceptance matrix, and obtain a phase-boundary
-review. This phase then adds async behavior on top; it must not duplicate or
-overwrite stabilization fixes.
+**Coordination prerequisite:** Sandbox stabilization is merged at `2a21dda`
+(`docs: record v0.4.1 stabilization evidence`), with candidate implementation
+through `6343ed1`. The feature worktree must descend from that handoff. Its
+unrestricted host race suite, portable checks, builds, lint/static/gosec, and
+review evidence are recorded, but three stabilization gates remain mandatory:
+native privileged Linux Rung-1/Rung-2 execution, live `windows-restricted` and
+`windows-elevated` runs on their disposable workers with no mandatory skips or
+residue, and the module-pinned vulnerability scan. Obtain and review those
+native run IDs/logs at this phase boundary before Task 10. Cross-builds and
+Docker probes do not replace runtime evidence.
+
+The stabilized implementation is the base architecture, not disposable code.
+Tasks 10–12 must preserve its `executorLifecycle`, delayed cleanup ownership,
+`quarantinedSpawn` and later zero-proof reaper, `ExecutorSet.Close` admission and
+wait ordering, exact grant/path identity checks, Windows release aggregation,
+and existing restricted/elevated Job ownership. This phase adds async behavior
+on top and must not duplicate or overwrite those fixes.
 
 ### Task 10: Add the public pipe-backed process API
 
@@ -1018,6 +1144,11 @@ overwrite stabilization fixes.
 - Create: `../sandbox/internal/exec/process_acceptance_test.go`
 - Modify: `../sandbox/internal/exec/executor.go`
 - Modify: `../sandbox/internal/exec/executor_lifecycle.go`
+- Modify: `../sandbox/internal/enforce/enforce.go`
+- Modify: `../sandbox/internal/windows/elevated_backend_windows.go`
+- Modify: `../sandbox/internal/windows/elevated_execution_bridge_windows.go`
+- Modify: `../sandbox/internal/windows/elevated_runner_launcher_windows.go`
+- Modify: `../sandbox/internal/windows/elevated_runner_launcher_windows_test.go`
 - Modify: `../sandbox/sandbox.go`
 - Modify: `../sandbox/facade_test.go`
 
@@ -1086,6 +1217,11 @@ Execute as three reviewed microtasks:
 - **10C — synchronous compatibility:** refactor `Executor.run` onto the prepared
   path; pre/post characterization tests retain exact RunCommand/RunArgv/granted
   results.
+- **10D — elevated asynchronous ownership:** replace the blocking
+  `enforce.Spec.Launch` result with an internal backend execution handle and
+  transfer the existing `elevatedRunnerExecution` plus stdio bridge to the
+  prepared process; never emulate async by wrapping the blocking launch in a
+  goroutine.
 
 Execute independently:
 
@@ -1114,10 +1250,26 @@ Execute independently:
   ./internal/exec -run 'Test(RunCommand|RunArgv|Granted|ExecutorConformance)'`.
   Implement sync prepare/start/drain/wait adaptation only and commit
   `refactor: share prepared process execution`.
+- **10D:** modify `internal/enforce/enforce.go`,
+  `internal/windows/elevated_backend_windows.go`,
+  `internal/windows/elevated_execution_bridge_windows.go`,
+  `internal/windows/elevated_runner_launcher_windows.go`,
+  `internal/windows/elevated_runner_launcher_windows_test.go`,
+  `internal/exec/process.go`, and their focused tests. Characterize the current
+  protected launch ordering first: token/host validation, suspended creation,
+  Job assignment, resume, Job-empty proof, quarantine on failed proof, and
+  lease release only after proof. Then make the internal enforcement seam
+  return an owned asynchronous execution whose `Wait` is backed directly by the
+  existing `elevatedRunnerExecution`; transfer the stdio bridge and release
+  closure with it. RED/GREEN selector:
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
+  ./internal/windows ./internal/exec -run
+  '^Test(ElevatedAsyncExecutionOwnership|ElevatedRunner.*(Job|Release|Quarantine))$'`.
+  Commit `refactor: expose elevated runner execution ownership`.
 
 **Task 10 combined acceptance**
 
-After 10A–10C are individually committed and reviewed, defer their combined
+After 10A–10D are individually committed and reviewed, defer their combined
 race/conformance suite to Phase Gate 3.
 
 ### Task 11: Retain grants and enforcement resources across two-phase start
@@ -1126,11 +1278,19 @@ race/conformance suite to Phase Gate 3.
 
 - Modify: `../sandbox/internal/exec/executor_lifecycle.go`
 - Modify: `../sandbox/internal/exec/process.go`
+- Modify: `../sandbox/internal/exec/process_quarantine.go`
+- Modify: `../sandbox/internal/exec/process_quarantine_test.go`
+- Modify: `../sandbox/internal/exec/executor_set.go`
+- Modify: `../sandbox/internal/exec/executor_set_test.go`
 - Create: `../sandbox/internal/exec/process_lifecycle_test.go`
 - Create: `../sandbox/internal/exec/process_grant_test.go`
 - Create: `../sandbox/internal/exec/process_grant_integration_test.go`
 - Modify: `../sandbox/internal/exec/grant_path_lifecycle_test.go`
 - Modify: `../sandbox/internal/exec/executor_proxy_backend_test.go`
+- Modify: `../sandbox/internal/policy/pathhandle.go`
+- Modify: `../sandbox/internal/policy/pathhandle_linux.go`
+- Modify: `../sandbox/internal/policy/enumerate_linux.go`
+- Modify: `../sandbox/internal/windows/elevated_execution_bridge_windows.go`
 
 **Step 1: Write failing prepared-resource tests**
 
@@ -1153,6 +1313,11 @@ Test:
 - path handles, compiled backend cleanup, proxy credential, and route remain
   live through terminalization;
 - consumers that never call `Wait` still get cleanup.
+- an uncertain terminal state transfers the entire process/grant/proxy/backend
+  ownership capsule to the existing `quarantinedSpawn`/retrying zero-proof path;
+- `ExecutorSet.Close` closes admission, cancels every live execution, waits for
+  normal and delayed cleanup, aggregates release errors once, and never returns
+  while authority can still be released by an untracked goroutine.
 
 **Step 2: Verify RED**
 
@@ -1170,6 +1335,16 @@ Move grant verification, path handles, route credentials, compiled backend
 resources, and effective-access calculation into the prepared object. `Start`
 transfers them atomically to a process-owned goroutine. Executor/session close
 terminates it and performs wait/cleanup even when the caller abandons the handle.
+
+Preserve the stabilized ownership machinery rather than introducing a second
+cleanup system. Grant redemption plus retained Landlock descriptor acquisition
+is one prepare transaction: a preparation failure releases every descriptor,
+Windows runtime release, proxy route, and compiled resource exactly once, while
+the single-spawn grant remains consumed and cannot become replayable. Successful
+`Start` performs one ownership transfer into `executorLifecycle`; normal Job/
+cgroup zero proof releases it, and an uncertain proof transfers it intact into
+`quarantinedSpawn`. Extend the existing `ExecutorSet.Close` tests to cover live
+prepared and started handles.
 
 **Step 4: Verify GREEN**
 
@@ -1189,6 +1364,10 @@ git commit -m "fix: retain async enforcement through process exit"
 - Modify: `../sandbox/internal/exec/process_tree_unix.go`
 - Modify: `../sandbox/internal/exec/process_tree_windows.go`
 - Modify: `../sandbox/internal/exec/process_tree_other.go`
+- Modify: `../sandbox/internal/linux/backend.go`
+- Modify: `../sandbox/internal/linux/cgroup.go`
+- Modify: `../sandbox/internal/linux/cgroup_test.go`
+- Modify: `../sandbox/internal/linux/init.go`
 - Create: `../sandbox/internal/exec/process_tree_signal_test.go`
 - Create: `../sandbox/internal/exec/process_tree_windows_test.go`
 - Create: `../sandbox/internal/exec/process_parent_death_unix_test.go`
@@ -1198,17 +1377,23 @@ git commit -m "fix: retain async enforcement through process exit"
 - Modify: `../sandbox/init_linux.go`
 - Modify: `../sandbox/init_other.go`
 - Modify: `../sandbox/internal/exec/process.go`
+- Modify: `../sandbox/internal/windows/elevated_execution_bridge_windows.go`
+- Modify: `../sandbox/internal/windows/elevated_runner_launcher_windows.go`
 
 Execute as four reviewed microtasks:
 
 - **12A — signal state machine:** interrupt, terminate/grace/escalate, kill,
   idempotence, and natural-exit races with a fake process tree.
-- **12B — Unix lifetime shim and Linux containment:** real parent-death,
-  grandchild, double-fork, and `setsid` integration tests.
-- **12C — Darwin guarantee probe:** prove a concrete containment capability or
-  return `lifetime_enforcement_unavailable` before spawn.
-- **12D — Windows Job confirmation:** suspended-create, Job assignment before
-  resume, signal mapping, close, and job-empty confirmation.
+- **12B — Unix lifetime shim and mandatory Linux containment:** real
+  parent-death, grandchild, double-fork, and `setsid` integration tests; every
+  supervised spawn must select Rung-1 PID namespace or a delegated cgroup with
+  exact empty proof.
+- **12C — Darwin fail-closed contract:** return
+  `lifetime_enforcement_unavailable` before spawn until a real containment
+  primitive exists; this phase does not claim Darwin async execution.
+- **12D — existing Windows Job paths:** characterize both restricted and
+  elevated suspended-create/Job-before-resume paths, then add signal mapping,
+  close, and job-empty confirmation without bypassing either backend.
 
 Execute independently:
 
@@ -1223,34 +1408,48 @@ Execute independently:
   `internal/exec/lifetime_unix.go`,
   `internal/exec/process_parent_death_unix_test.go`,
   `internal/exec/process_parent_death_integration_unix_test.go`, and
-  `init_linux.go`. RED/GREEN:
+  `internal/linux/backend.go`, `internal/linux/cgroup.go`,
+  `internal/linux/cgroup_test.go`, `internal/linux/init.go`, and
+  `init_linux.go`.
+  RED/GREEN:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^TestProcessTreeLinuxContainmentPlan$'`. Phase Gate 3
   requires its list output to contain
   `TestIntegrationProcessTreeParentDeath`,
   `TestIntegrationProcessTreeDoubleFork`, and
   `TestIntegrationProcessTreeSetsidEscape`, then runs those tagged tests on the
-  approved Linux worker. During the microtask, implement the lifetime shim plus
-  proven Linux containment only; commit
+  approved Linux worker. The plan test must reject supervised Rung-2 when
+  delegated cgroup v2 is unavailable, select PID namespace for Rung 1, select
+  and retain a delegated cgroup otherwise, and require `cgroup.kill` plus an
+  exact empty proof before release. The existing optional/best-effort resource
+  cgroup behavior is not a lifetime guarantee. During the microtask, implement
+  the lifetime shim plus proven Linux containment only; commit
   `feat: contain Unix process descendants`.
 - **12C:** files `internal/exec/lifetime_unix.go`,
   `internal/exec/process_parent_death_integration_unix_test.go`, and
   `init_other.go`. RED/GREEN:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^TestDarwinLifetimeCapabilityFailsClosed$'`. Phase Gate
-  3 runs
-  `TestIntegrationProcessTreeDarwinSetsidGuarantee` on the approved Darwin
-  worker. Implement a concrete proof or fail before spawn with
-  `lifetime_enforcement_unavailable`; commit
+  3 runs `TestIntegrationProcessTreeDarwinSetsidFailsClosed` on the approved
+  Darwin worker and proves no child or delayed marker exists. Implement the
+  pre-spawn failure with `lifetime_enforcement_unavailable`; do not add a
+  success path until a separately specified concrete containment primitive
+  exists. Commit
   `fix: fail closed without Darwin lifetime containment`.
 - **12D:** files `internal/exec/process_tree_windows.go`,
-  `internal/exec/process.go`, and
+  `internal/exec/process.go`,
+  `internal/windows/elevated_execution_bridge_windows.go`,
+  `internal/windows/elevated_runner_launcher_windows.go`, and
   `internal/exec/process_tree_windows_test.go`. A focused non-race Windows
   RED/GREEN command is `GOWORK=off
   GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run
   '^TestProcessTreeWindows(JobBeforeResume|JobEmptyOnClose)$'`. Phase Gate 3
-  records discovery and full race coverage. Implement Job
-  assignment/confirmation and signal mapping only; commit
+  records discovery and full race coverage. Before changing behavior,
+  characterize the stabilized restricted backend and the existing elevated
+  `elevatedRunnerExecution`: both create suspended, assign before resume,
+  retain authority through Job-empty proof, and quarantine delayed proof.
+  Implement signal/close mapping on those owned paths and their shared
+  confirmation seam only; commit
   `feat: confirm Windows process job teardown`.
 
 **Task 12 combined acceptance**
@@ -1269,11 +1468,11 @@ Add deliberate Unix escape tests:
 - descendant PID disappears;
 - delayed marker is never written.
 
-On Darwin, add a capability test that deliberately calls `setsid`. Unless the
-backend supplies a concrete containment primitive that proves the escaped
-descendant is still owned, `PrepareProcess` must fail before spawn with
+On Darwin, the test deliberately requests a command that would call `setsid`,
+but `PrepareProcess` must fail before any helper or target spawn with
 `lifetime_enforcement_unavailable`. Process-group polling or best-effort
-descendant enumeration is not sufficient evidence.
+descendant enumeration is not sufficient evidence, and Task 13 must not list a
+successful Darwin async lifecycle test.
 
 On Windows, assert the target and helper join the kill-on-close Job before resume
 and that close empties the Job.
@@ -1297,32 +1496,37 @@ path. `Pdeathsig` alone is insufficient.
 **Step 1: Verify feature integration tests already exist**
 
 and fail this task if the exact pipe, grant, and tree tests from Tasks 10–12 are
-not listed. Those tests already exercise real commands under:
+not listed. The success-path tests exercise real commands under:
 
 - unconfined test profile;
 - scoped filesystem grant;
 - network proxy grant lifetime;
 - Linux enforced backend;
-- Darwin Seatbelt backend;
 - Windows restricted and elevated broker backends.
 
-Verify output streaming, stdin, timeout, all stop modes, grandchildren, grant
-denial, executor close, and no resource leaks.
+The Darwin test separately proves the Seatbelt-backed supervised request fails
+before spawn because lifetime containment is unavailable. On applicable success
+platforms, verify output streaming, stdin, timeout, all stop modes,
+grandchildren, grant denial, executor close, and no resource leaks.
 
 **Step 2: Verify CI RED**
 
 Create `scripts/test-async-ci-workflow.sh`. It parses
-`.github/workflows/ci.yml` and requires exact job keys
-`async-process-linux`, `async-process-darwin`, and
-`async-process-windows`, the integration tag, race mode, exact
-`TestIntegrationProcess` selectors, and a Windows runtime invocation. Run:
+`.github/workflows/ci.yml` and extends the existing platform jobs rather than
+requiring invented replacement job keys. Require async selectors in
+`test-linux-rung1`/`test-linux-rung2`, the Darwin pre-spawn fail-closed selector
+in `test-macos`, and live restricted/elevated Job selectors in
+`windows-restricted` and `windows-elevated`. Require the integration tag, race
+mode, exact applicable `TestIntegrationProcess` selectors, and Windows runtime
+invocation. Run:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
 sh scripts/test-async-ci-workflow.sh
 ```
 
-Expected: FAIL because those jobs/commands are absent. The script must not make
+Expected: FAIL because those commands are absent from the existing jobs. The
+script must not make
 a network call or silently accept missing YAML.
 
 **Step 3: Add fixtures/CI targets without weakening checks**
@@ -1331,6 +1535,10 @@ Wire existing tests into platform jobs. Use capability-aware skips only when an
 OS feature is genuinely unavailable.
 Windows runtime tests must execute on Windows CI; cross-build success is not a
 substitute.
+The macOS job executes the Darwin fail-before-spawn integration test only; it
+does not advertise pipe-process support. Preserve all stabilization steps,
+worker labels, artifacts, skip guards, and residue cleanup while appending the
+new selectors.
 Add a `test-async-ci` Makefile target that invokes the same guard.
 
 **Step 4: Verify GREEN**
@@ -1363,12 +1571,16 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-
 
 No new fuzz target is owned by this phase. The approved Linux, Darwin, and
 Windows jobs must execute their applicable listed integration tests; cross-build
-success is not runtime evidence. `make secure` batches Sandbox format checks,
-Vet, Staticcheck, Gosec, and Govulncheck.
+success is not runtime evidence. Darwin's applicable evidence is the
+pre-spawn `lifetime_enforcement_unavailable` contract, not successful async
+execution. `make secure` batches Sandbox format checks, Vet, Staticcheck, Gosec,
+and Govulncheck.
 
 Phase reviewers must trace every per-spawn cleanup resource through terminal
-exit, verify context separation, inspect real parent-death evidence, and confirm
-that Sandbox still imports neither Harness nor Tools.
+exit and any quarantined zero-proof retry, verify context separation, inspect
+real parent-death evidence, characterize both Windows Job paths, confirm
+Landlock/Windows releases remain retained through proof, and confirm that
+Sandbox still imports neither Harness nor Tools.
 
 ## Phase 4: Model-facing Bash and process tools
 
@@ -1747,7 +1959,11 @@ allocation failure, and no pipe fallback.
 Add a test proving PTY `Setsid`/`Setctty` setup does not conflict with the
 existing `Setpgid` process-tree configuration.
 `process_pty_integration_unix_test.go` begins with `//go:build integration` and
-defines the exact live test `TestIntegrationProcessPTYLifecycle`.
+defines the exact live Linux test `TestIntegrationProcessPTYLifecycle`. Add
+`TestIntegrationProcessPTYDarwinLifetimeUnavailable` to prove Darwin rejects
+before PTY allocation or child spawn. Do not treat the `_unix.go` build
+selection as evidence that Darwin can provide supervised process-tree
+containment.
 
 **Step 2: Verify RED**
 
@@ -1927,9 +2143,9 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-
 ```
 
 The approved Darwin worker must record
-`TestIntegrationProcessPTYLifecycle`; the required Windows workflow jobs
-`async-process-windows` and `conpty-integration-windows` must record the list
-output plus passing `TestProcessConPTYInteractive`,
+`TestIntegrationProcessPTYDarwinLifetimeUnavailable`; the existing
+`windows-restricted` and `windows-elevated` jobs must record the list output
+plus passing `TestProcessConPTYInteractive`,
 `TestIntegrationConPTYRestricted`, and
 `TestIntegrationConPTYElevated`. Cross-build output is not runtime evidence.
 
@@ -2027,9 +2243,10 @@ appender reports `Appended=true`. RED/GREEN:
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run '^TestProcessLifecycle'
 ```
 
-Implement the late-bound service by stamping bounded metadata without replacing
-the Tools ID, durably appending, and publishing live only on a new append. Run
-the focused non-race commit checks and commit
+Attach the checked implementation behind Task 4's stable late-bound lifecycle
+bridge; do not replace the bridge already captured by a resource. Stamp bounded
+metadata without replacing the Tools ID, durably append, and publish live only
+on a new append. Run the focused non-race commit checks and commit
 `feat(session): publish process lifecycle metadata`.
 
 **24C — metadata-only notification and restored live dedupe**
@@ -2085,8 +2302,10 @@ Implement only the sealed command codec, restored projection, and owning-loop
 delivery. Queue backpressure cannot grow the inbox beyond its bound or block
 terminalization: the retained pending reservation returns retryable-full and
 the supervisor retries with the same CommandID. Remove an unresolved entry only
-after an enduring loop causality event commits. Foreign engines reject process
-notifications; they do not silently drop them.
+after an enduring loop causality event commits. Attach this implementation
+behind Task 4's stable completion-notifier bridge rather than rebinding captured
+resources. Foreign engines reject process notifications; they do not silently
+drop them.
 Verify with the focused non-race command, and commit
 `feat(session): deliver idempotent process notifications`.
 
@@ -2316,9 +2535,11 @@ The fixture is explicit:
 - use a separate `t.TempDir()` workspace;
 - use the real Harness Rig/session registry and real Tools definitions;
 - use Sandbox's unconfined profile only for portable local pipe tests;
-- put enforced Linux/Darwin/Windows tests behind `//go:build integration` and
-  runtime capability probes that skip only when the documented backend is
-  unavailable;
+- put enforced Linux/Windows tests behind `//go:build integration` and runtime
+  capability probes that skip only when the documented backend is unavailable;
+- on Darwin, require the typed pre-spawn
+  `lifetime_enforcement_unavailable` integration path and prove that neither a
+  target nor delayed marker was created; do not claim a supervised success path;
 - require restricted and elevated Windows cases on separate live CI jobs, where
   a capability skip is a job failure.
 

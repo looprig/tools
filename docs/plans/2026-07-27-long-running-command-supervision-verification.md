@@ -73,3 +73,26 @@ The proposed post-task Harness Govulncheck was not run and is not reported as
 passing; it is deferred to the complete Phase Gate 1 `make secure` invocation,
 alongside the phase race suite, tagged integration listing/execution, and
 trimpath builds.
+
+## Phase 3 — Sandbox stabilization coordination note
+
+The long-running-command Sandbox worktree now points at stabilization handoff
+`2a21dda` (`docs: record v0.4.1 stabilization evidence`), with candidate
+implementation through `6343ed1`. The handoff records an unrestricted-host
+`go test -race -count=1 ./...`, Linux and Windows builds, lint/Staticcheck/Gosec,
+module verification, focused portable tests, and completed phase/final reviews.
+
+This is not Phase Gate 3 acceptance. The stabilization document explicitly
+leaves three required checks pending:
+
+- live Rung-1/Rung-2 tests on a prepared privileged Linux worker, with the
+  capability-dependent tests executing rather than skipping;
+- the unchanged `windows-restricted` and `windows-elevated` jobs on matching
+  disposable workers, with no mandatory skips and empty residue;
+- the module-pinned vulnerability query in an environment authorized to reach
+  `vuln.go.dev`.
+
+Those native run IDs/logs and the vulnerability result remain a hard
+coordination prerequisite before Sandbox async implementation begins. Local
+cross-builds, portable subsets, and Docker probes are useful diagnostics but
+are not reported as native runtime evidence.

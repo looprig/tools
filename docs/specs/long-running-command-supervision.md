@@ -425,6 +425,19 @@ supervisor must not capture an internal `*Session` during bind. Harness activate
 the bridge only after the session, durable publisher, notifier, and restore
 state are ready.
 
+The bridge contract lives in `pkg/tool`, below both `pkg/event` and
+`pkg/command`, so it cannot import either concrete journal payload package.
+`SessionResourceServices` carries two narrow, typed services: lifecycle
+publication and completion notification. Their request DTOs contain only
+closed lifecycle/state/reason enums, stable UUIDs, a grammar- and length-bounded
+opaque process handle, timestamps, exit metadata, and a 512-byte-bounded
+diagnostic. They have no `any` payload, command text, output, stdin, host path,
+OS PID, environment, or other unbounded string field. `pkg/event` and
+`pkg/command` map those neutral DTOs into their sealed durable types and validate
+that the DTO coordinates and stable IDs match the enclosing record. Service
+construction rejects nil and typed-nil implementations before activation; the
+post-contract zero service set is invalid and activation fails closed.
+
 A supervised process is independent of the context of the Bash tool invocation.
 Cancelling a foreground invocation before handoff cancels its start; after a
 process handle has been returned, invocation cancellation does not kill the
@@ -529,6 +542,14 @@ Harness defines typed metadata-only lifecycle events:
 
 Events include identity, state, timestamps, exit metadata, reason, and bounded
 non-output diagnostics. Command output and stdin are excluded.
+
+The public late-bound service DTOs are defined in `pkg/tool`; the concrete
+events use the same bounded `pkg/tool` enums rather than making `pkg/tool`
+depend on `pkg/event`. Completion notifications use a separate DTO containing
+only the stable CommandID, target session/loop coordinates, bounded process
+handle, terminal state, and enum reason. This leaf-package split is
+load-bearing: a generic resource may publish and notify without importing
+Harness runtime internals or accepting an opaque payload.
 
 Tools allocates and persists the stable lifecycle/notification IDs before a
 transition can be published. Harness uses those IDs as the EventID/CommandID
@@ -716,11 +737,20 @@ only its initial child. A lifetime shim holds a parent-death pipe; EOF causes th
 shim to terminate the group. PTY support uses `github.com/creack/pty`, approved
 for this feature.
 
-On Linux, cgroup/PID-namespace capabilities are used where required to prevent
-session escape. A Unix backend that cannot prove descendant containment,
-including a Darwin configuration vulnerable to `setsid` escape, reports
-`lifetime_enforcement_unavailable` for supervised execution. It must not claim
-the guarantee based only on process groups or polling.
+Every supervised Linux spawn must enter a mandatory descendant-containment
+primitive before executable code runs: either the Rung-1 PID-namespace path or
+a delegated cgroup v2 scope retained through terminalization and emptied with
+`cgroup.kill` plus an exact zero-process proof. The existing optional
+cost-limiting cgroup behavior is insufficient by itself; supervised Rung-2
+execution without usable delegation fails before spawn. Retained Landlock path
+descriptors and their cleanup remain live across prepare, start, and the final
+zero proof.
+
+Darwin currently has no primitive in Sandbox that contains a descendant after
+`setsid`. Until a concrete backend supplies and proves one, supervised
+execution on Darwin reports `lifetime_enforcement_unavailable` before spawn.
+Process groups, PID enumeration, or polling are not substitutes. Legacy
+synchronous execution remains governed by its existing contract.
 
 ### Windows
 
@@ -729,6 +759,14 @@ configured pipes or ConPTY, then resumes. This extends Sandbox's existing,
 reviewed Windows restricted/elevated backends and broker rather than creating an
 unconfined side path. Existing `golang.org/x/sys/windows` support is used.
 Closing the lifetime handle terminates the job.
+
+The elevated backend's current blocking `enforce.Spec.Launch` bridge must be
+split at its existing asynchronous ownership boundary: the protected launcher
+returns and transfers its `elevatedRunnerExecution`, and the public process
+handle waits or stops that owned execution. It must not place a goroutine around
+the blocking `Launch` call. Both restricted and elevated Job paths retain
+broker/ACL authority until Job-empty proof and preserve their existing
+quarantine behavior when that proof is delayed.
 
 ### Unsupported PTY environments
 
@@ -899,8 +937,8 @@ Every implementation task follows strict red-green-refactor:
 2. run it and confirm the expected failure;
 3. write the minimum production code;
 4. rerun the focused test;
-5. run affected package race tests;
-6. refactor only while green;
+5. refactor only while the focused non-race test remains green;
+6. run `gofmt` on changed Go files and `git diff --check`;
 7. commit the task.
 
 Unit tests are necessary but insufficient. Each phase that crosses a module or
@@ -908,18 +946,23 @@ OS boundary adds tagged integration coverage. Sandbox integration tests execute
 real descendants, grants, process-tree teardown, and PTY behavior. Coderig
 integration tests exercise the composed Bash-to-Tools-to-Harness-to-Sandbox
 path. Harness integration tests cover shutdown, restore, checked events, and
-workspace leases. Supported repositories run integration tests with `-race`;
-Windows ConPTY and Job behavior also runs on a Windows CI worker.
+workspace leases. Race tests, tagged integration discovery/execution, fuzzing,
+repeated stress, static analysis, vulnerability checks, and trimpath builds run
+only at phase boundaries. Supported repositories run integration tests with
+`-race`; Windows ConPTY and Job behavior also runs on a Windows CI worker.
 
 At every phase boundary:
 
-1. run focused and affected repository tests with the race detector;
-2. run applicable tagged integration, static, and cross-platform checks;
-3. obtain an independent spec-compliance review;
-4. fix every gap and obtain re-review;
-5. obtain an independent code-quality and security review;
-6. fix every critical or important issue and obtain re-review;
-7. record the verified phase before starting the next phase.
+1. run the full relevant repository tests with the race detector;
+2. list and run applicable tagged integration tests with `-race`;
+3. run every fuzz target accumulated through the phase;
+4. run repository format, Vet, Staticcheck, Gosec, and vulnerability checks;
+5. run native and relevant cross-platform `CGO_ENABLED=0 -trimpath` builds;
+6. obtain an independent spec-compliance review;
+7. fix every gap and obtain re-review;
+8. obtain an independent code-quality and security review;
+9. fix every critical or important issue and obtain re-review;
+10. record the verified phase before starting the next phase.
 
 ## Final acceptance
 
