@@ -65,14 +65,86 @@ rerun is required and will be recorded here before Phase 3 begins.
 - Live Sandbox evidence remains an explicit Phase 3 blocker; it is not reported
   as passing or silently skipped.
 
-## Phase 1 — Verification scheduling note
+## Phase 1 — Harness contracts and session coordination
 
-On 2026-07-28 the user directed that expensive verification run only at phase
-boundaries. Task 1's focused non-race tests and review evidence remain valid.
-The proposed post-task Harness Govulncheck was not run and is not reported as
-passing; it is deferred to the complete Phase Gate 1 `make secure` invocation,
-alongside the phase race suite, tagged integration listing/execution, and
-trimpath builds.
+**Decision:** Pending only the authorized Govulncheck result. The implementation,
+functional verification, static/security analysis, builds, and independent
+reviews are accepted. Govulncheck is not reported as passing because contacting
+`vuln.go.dev` would disclose this private repository's module/package names and
+dependency versions, and that disclosure has not been explicitly authorized.
+
+**Repository head**
+
+- Harness: `d8f8d4292e27c6de164e8c30318e127a5ecc4b19`
+
+The Harness worktree was clean at the final gate.
+
+**Implemented scope**
+
+- public asynchronous process, preparation, workspace-access, terminal-reason,
+  and process-service contracts;
+- registry-only process bindings, public session resources, stable
+  new/restore storage resolution, durable identity anchors, foreign-engine
+  rejection before binding, and one shared session registry;
+- conflict-aware FIFO lifetime workspace leases and checkpoint coordination;
+- sealed metadata-only process lifecycle events and validated process-service
+  activation;
+- public Rig integration for new/restore resource identity and a scoped-write
+  lifetime lease conflicting with checkpoint/restore coordination.
+
+**Phase-gate RED and repair evidence**
+
+- The first full race run exposed a test fixture whose `t.TempDir` child was
+  `0755`; the fixture now passes a missing child root so production creates it
+  privately.
+- Gosec found dynamic-open and ignored-cleanup findings. Directory/anchor opens
+  now use `os.OpenRoot`, and activation cleanup errors are returned.
+- `FuzzCompactionEventDecode` and `FuzzEphemeralFrameDecode` found that their
+  typed-error classifiers omitted `UnsupportedSchemaError`. Both classifiers
+  and saved-corpus regressions were corrected before the complete fuzz matrix
+  was rerun.
+- Boundary review found Windows POSIX-mode rejection, case-alias workspace
+  overlap, a cancellation/grant race, permissive process-event decoding, an
+  internal-only unsupported-notifications error, and broad-write-only
+  integration coverage. The fixes use platform-specific private storage,
+  filesystem-identity overlap checks, raced-grant release, strict process
+  envelopes, a public Rig lifecycle kind, and scoped-write integration.
+- Re-review found that existing Windows roots also needed inheritable
+  protection. Directory ACE validation now requires exact object/container
+  inheritance, file ACEs reject inheritance flags, and native Windows tests
+  reject a protected but non-inheritable root.
+
+**Final GREEN evidence**
+
+- `GOWORK=off ... go test -race ./...`: exit 0.
+- `GOWORK=off ... go test -tags integration -race ./...`: exit 0, including
+  `TestProcessServicesIntegrationNewRestoreAndLease`.
+- All 19 repository fuzz targets completed successfully at the final head with
+  four fuzz workers each. Eighteen ran for three seconds; the larger
+  `FuzzEphemeralFrameDecode` corpus ran for six seconds and completed 326,426
+  executions after baseline collection.
+- `GOWORK=off ... make lint`: exit 0. Vet and Staticcheck passed; Gosec scanned
+  217 files / 50,555 lines and reported zero issues.
+- `GOWORK=off ... go mod verify`: `all modules verified`.
+- Native, `linux/amd64`, and `windows/amd64`
+  `go build -trimpath ./...`: exit 0.
+- The Windows `internal/sessionruntime` test binary cross-compiled at the final
+  head. Its ACL new/restore and hostile-DACL tests are native Windows tests and
+  remain scheduled for execution by Windows CI; cross-compilation is not
+  represented as native runtime evidence.
+- `golang.org/x/sys/windows` is an explicitly user-approved direct dependency
+  for Windows security-descriptor and DACL APIs and is recorded in Harness
+  dependency policy.
+
+**Review disposition**
+
+- Final spec re-review: approved with no remaining Critical or Important
+  findings.
+- Final quality/security re-review: approved with no remaining Critical,
+  Important, or Minor findings.
+- The only open Phase Gate 1 item is the networked Govulncheck authorization and
+  result. No alternate database, stale cache, or metadata-disclosure workaround
+  was used.
 
 ## Phase 3 — Sandbox stabilization coordination note
 
