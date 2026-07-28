@@ -163,8 +163,11 @@ GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go
 
 Expected: PASS. Separately run Sandbox's existing live `./internal/exec` suite
 on an approved host/CI worker; the managed workspace may deny `sandbox_apply`
-and loopback listener creation before repository code can execute. If a code
-test fails, stop and diagnose it with
+and loopback listener creation before repository code can execute. When the
+separate Sandbox stabilization owner is still active, record the local denial
+and defer the live rerun to the Phase 3 coordination prerequisite. That deferred
+evidence blocks Phase 3, but not the independent Harness and Tools phases. If a
+code test fails, stop and diagnose it with
 `superpowers:systematic-debugging`; do not classify it as module hygiene.
 
 **Step 4: Commit each repository independently**
