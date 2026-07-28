@@ -362,10 +362,12 @@ the `ProcessBinding.Registry` interface only. `ProcessBinding` has no Runner
 field. Task 4 completes the carrier with privately held, typed lifecycle and
 completion services and their constructor validation.
 
-Task 1's `AsyncProcessRunner` remains the public adapter contract. It is
-captured immutably by Coderig-constructed Tools definitions in Tasks 19/26/27;
-it is not injected through Harness `Bindings`, a Rig option, or a session
-lifecycle provider.
+Task 1's `AsyncProcessRunner` remains the public adapter contract. It is not
+injected through Harness `Bindings`, a Rig option, or a session lifecycle
+provider. Tasks 19/26/27 add a Tools-owned narrow resolver captured only by the
+process-enabled Bash definition; at Build it resolves the concrete adapter from
+the validated bound LoopID. The supervisor and companion process definitions
+remain runner-free.
 
 **2B — registry linearization**
 
@@ -441,13 +443,16 @@ commit these files as
 
 **2D — restore late binding**
 
-Files: `pkg/rig/definition.go`,
+Files: `pkg/loop/definition.go`,
+`pkg/loop/definition_test.go`,
+`pkg/rig/definition.go`,
 `pkg/rig/session_resource_storage_test.go`,
 `internal/sessionruntime/lifecycle.go`,
 `internal/sessionruntime/session.go`,
 `internal/sessionruntime/restore_constructor.go`,
 `internal/sessionruntime/session_resources.go`, and
 `internal/sessionruntime/session_resources_test.go`. First add
+`TestDefinitionEngine`,
 `TestResourceStorageStableAcrossRestore`,
 `TestResourceStorageRejectsIdentityMismatch`,
 `TestResourceStorageUnavailableFailsConstruction`,
@@ -456,11 +461,12 @@ Files: `pkg/rig/definition.go`,
 `TestForeignLoopRejectsProcessServices`, then run:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/rig ./internal/sessionruntime -run 'Test(ResourceStorage|Restore.*Resource|ForeignLoopRejectsProcessServices)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/loop ./pkg/rig ./internal/sessionruntime -run 'Test(DefinitionEngine|ResourceStorage|Restore.*Resource|ForeignLoopRejectsProcessServices)'
 ```
 
 Expected RED: storage is not resolved at a lifecycle point with a known
-SessionID, and probe/live bindings do not share a bridge.
+SessionID, probe/live bindings do not share a bridge, and Rig cannot inspect a
+loop definition's engine until after binding.
 
 For a new session, mint the SessionID first, resolve
 `StorageForSession(ctx, sessionID)`, canonicalize and validate the returned root
@@ -483,10 +489,14 @@ activation proves ordering with the empty
 validated typed service set before any real process resource is composed.
 Every probe/live `ProcessBinding` contains that registry only; Task 2D does not
 look up, synthesize, or attach an async runner.
-Reject process-enabled definitions on non-native engines with
-`process_notifications_unsupported`; legacy foreground-only Bash retains its
-existing foreign-engine behavior. Never expose `*sessionruntime.Session`
-publicly. Re-run the
+Add the immutable, read-only `Definition.Engine() loop.Engine` seam; it returns
+the frozen definition engine without binding or executing any factory.
+Rig/session construction uses that seam to reject process-enabled definitions
+on non-native engines with `process_notifications_unsupported` before calling
+`Definition.Bind` or any tool factory. `TestForeignLoopRejectsProcessServices`
+uses a recording factory and proves its call count remains zero. Legacy
+foreground-only Bash retains its existing foreign-engine behavior. Never expose
+`*sessionruntime.Session` publicly. Re-run the
 focused command. Run the standard focused non-race commit checks and commit
 these files as
 `feat(session): activate process resources after restore`.
@@ -1012,12 +1022,12 @@ git commit -m "feat(process): render cursor-safe bounded output"
 - Create: `process/entry_test.go`
 - Create: `process/supervisor.go`
 - Create: `process/supervisor_test.go`
-- Create: `process/fake_runner_test.go`
+- Create: `process/fake_process_test.go`
 
 Execute as four reviewed microtasks:
 
-- **8A — admission and quotas:** `TestSupervisorReservesQuotaBeforePrepare`,
-  `TestSupervisorPrepareFailureReleasesQuota`, and
+- **8A — admission and quotas:** `TestSupervisorReservesQuotaBeforeStart`,
+  `TestSupervisorStartFailureReleasesQuota`, and
   `TestSupervisorRejectsSessionAndLoopQuota`.
 - **8B — durable handoff and stream drain:**
   `TestSupervisorPersistsBeforeReturningHandle`,
@@ -1037,10 +1047,11 @@ Run the microtasks as follows; the broader steps below are phase acceptance,
 not a consolidated implementation assignment:
 
 - **8A:** edit `process/supervisor.go`, `process/supervisor_test.go`, and
-  `process/fake_runner_test.go`; RED/GREEN command
-  `go test ./process -run '^TestSupervisor(ReservesQuotaBeforePrepare|PrepareFailureReleasesQuota|RejectsSessionAndLoopQuota)$'`;
+  `process/fake_process_test.go`; RED/GREEN command
+  `go test ./process -run '^TestSupervisor(ReservesQuotaBeforeStart|StartFailureReleasesQuota|RejectsSessionAndLoopQuota)$'`;
   RED is missing admission/quota reservation. Implement reservation and rollback
-  only, and commit `feat(process): reserve supervisor admission`.
+  around consumption of the caller-supplied `PreparedProcess` only, and commit
+  `feat(process): reserve supervisor admission`.
 - **8B:** edit `process/entry.go`, `process/entry_test.go`,
   `process/supervisor.go`, and `process/supervisor_test.go`; RED/GREEN command
   `go test ./process -run '^TestSupervisor(PersistsBeforeReturningHandle|DrainsOrderedStreams|OutputLimitStopsProcess)$'`;
@@ -1064,10 +1075,14 @@ not a consolidated implementation assignment:
 
 **Task 8 combined acceptance**
 
-Use deterministic Harness async-runner/process fakes. Test:
+Use deterministic Harness prepared-process/process fakes. The supervisor is
+runner-free: it never calls `PrepareProcess`, and its factory accepts lifecycle,
+storage, notification, quota, and retention dependencies only. Test:
 
-- reserve process, loop, session, memory, and spool quotas before spawn;
-- failed setup releases every reservation and lease;
+- reserve process, loop, session, memory, and spool quotas before consuming
+  `PreparedProcess.Start`;
+- failed prepared start releases every reservation and the caller-supplied
+  lease, and invokes the preparation's idempotent `Close` cleanup;
 - manifest reaches durable `starting` before a handle can be returned;
 - lifecycle sink receives the pre-persisted started EventID exactly once;
 - `running` follows successful spawn;
@@ -1086,10 +1101,12 @@ Use deterministic Harness async-runner/process fakes. Test:
 - shutting down rejects admission and input.
 
 After 8A–8D are individually committed and reviewed, defer their combined race
-suite to Phase Gate 2. `Start` must accept the bound owner, origin, prepared process,
-workspace lease, lifecycle sink, observation capability, storage ceiling, and
-initial yield settings. One entry goroutine owns wait, activity, and stream
-drain; terminalization is idempotent.
+suite to Phase Gate 2. `Start` must accept the bound owner, origin,
+`PreparedProcess`, workspace lease, lifecycle sink, observation capability,
+storage ceiling, and initial yield settings. It reserves supervisor quotas
+before calling the preparation's single-use `Start`; preparation itself belongs
+only to Bash. One entry goroutine owns wait, activity, and stream drain;
+terminalization is idempotent.
 
 ### Task 9: Add waiters, restore reconciliation, and shutdown
 
@@ -1790,10 +1807,10 @@ Expected: new field tests fail; legacy tests pass.
 
 **Step 3: Implement parsing only**
 
-Keep exported `Factory` and `NewFactory` unchanged. Add a separate binding-aware
-factory used by root definitions. That factory accepts and immutably captures
-the Task 1 `AsyncProcessRunner` as a Tools construction dependency; it does not
-read a runner from Harness bindings. Do not route to the supervisor yet.
+Keep exported `Factory` and `NewFactory` unchanged. This task adds no runner,
+runner resolver, supervisor factory dependency, or Harness binding: it only
+normalizes and freezes the new model-facing arguments. Do not route to the
+supervisor yet.
 
 **Step 4: Verify GREEN**
 
@@ -1835,6 +1852,10 @@ Test:
   reservation/lease;
 - missing async runner/access summary returns
   `lifetime_enforcement_unavailable`;
+- runner selection is already complete when the concrete Bash tool is built;
+  invoking Bash does not consult loop provenance merely to choose a runner;
+- the prepared call's ToolExecutionID and grants still reach `ProcessRequest`
+  exactly;
 - spawn and completion invalidate the bound loop observations; optional runner
   activity triggers intermediate invalidation;
 - invocation cancellation after returned handle does not kill;
@@ -1851,11 +1872,17 @@ Expected: FAIL because supervisor routing is absent.
 **Step 3: Implement minimal routing**
 
 Legacy calls execute the unchanged function. Supervised calls obtain the
-session resource registry, owner, origin, workspace coordination, and
-observation capability from Harness bindings/context. They use the async runner
-captured by the definition/factory closure, prepare through it, acquire the
-exact lifetime lease, then hand the prepared process to `Supervisor.Start`.
-Never add a Runner field to `tool.ProcessBinding`.
+session resource registry, owner, workspace coordination, and observation
+capability from the concrete tool's bound construction data. The concrete Bash
+tool owns the async runner resolved by its definition at Build; it does not look
+up invocation provenance to select one. The prepared call context supplies the
+origin ToolExecutionID and approved grants. Bash prepares through that runner,
+acquires the exact lifetime lease, then hands the `PreparedProcess` to the
+runner-free `Supervisor.Start`. Add a supervised Bash factory that resolves
+caller options once and accepts a validated concrete
+`tool.AsyncProcessRunner` as a per-Build input; Task 19's root definition owns
+the LoopID resolver. Never add a Runner field to `tool.ProcessBinding` or a
+runner parameter to the supervisor factory.
 
 **Step 4: Verify GREEN**
 
@@ -1993,18 +2020,30 @@ Before committing, re-run the exact focused command from Step 2.
 
 Require:
 
-- `Bash(..., bash.WithAsyncProcessRunner(runner))`;
-- `ProcessOutputDefinition(runner)`;
-- `ProcessInputDefinition(runner)`;
-- `ProcessStopDefinition(runner)`.
+- unchanged foreground-only `Bash(options ...bash.BashOption)`;
+- `BashDefinition(resolver, options ...bash.BashOption)`;
+- `ProcessOutputDefinition()`;
+- `ProcessInputDefinition()`;
+- `ProcessStopDefinition()`.
+
+Use this Tools-owned public resolver shape in the root package:
+
+```go
+type AsyncProcessRunnerResolver func(context.Context, uuid.UUID) (tool.AsyncProcessRunner, error)
+```
 
 Each definition produces one tool with the exact name. All require workspace
 and process services as appropriate. Separately built definitions in one
 session obtain the same supervisor registry entry. Different sessions obtain
-different supervisors. Every definition captures its non-nil/non-typed-nil
-`tool.AsyncProcessRunner` immutably so whichever definition first resolves the
-registry key can construct the supervisor; tests pass the same runner fixture
-to all four. Options resolve once and concurrent builds remain safe.
+different supervisors. The supervisor factory is runner-free, so any of the
+four definitions may win get-or-create. Only `BashDefinition` captures a
+non-nil resolver. At each Build it calls the resolver exactly once with the
+validated `bindings.LoopID`, rejects resolver error or nil/typed-nil returned
+runner without producing a tool, and passes the concrete runner into Task 15's
+supervised Bash factory. It never derives runner selection from the Build
+context. Test the exact LoopID, zero factory calls after resolver failure,
+runner-free companion construction, unchanged legacy Bash, single option
+resolution, and concurrent Build safety.
 
 **Step 2: Verify RED**
 
@@ -2018,11 +2057,11 @@ Expected: FAIL because companion definitions are absent.
 
 Permit Bash to import shared public `process`, analogous to `permission`.
 Continue forbidding Sandbox and Harness internal imports. Use the keyed registry,
-never a package global. Add a Tools/bash construction option for the async
-runner and explicit runner arguments to the three companion definition
-constructors. These are definition-construction dependencies, not Harness
-binding fields. Do not add a Harness Rig/lifecycle runner option or runner
-provider.
+never a package global. Add the root `AsyncProcessRunnerResolver` and
+`BashDefinition`; seal the resolver in the immutable definition and resolve it
+only inside Build after Harness validates bindings. Keep all three companion
+constructors argument-free and the supervisor factory runner-free. Do not add a
+Harness Rig/lifecycle runner option, runner provider, or ProcessBinding field.
 
 **Step 4: Verify GREEN and commit**
 
@@ -2043,12 +2082,15 @@ Before committing, re-run the exact focused command from Step 2.
 **Step 1: Write tagged integration acceptance tests**
 
 Compose public Harness binding contracts with a contract-faithful Tools test
-registry. Pass a deterministic async runner fixture into each Tools definition
-constructor; the fake Harness `ProcessBinding` contains only the registry.
-Tools cannot import Harness `internal/sessionruntime`; real registry composition
-is reserved for Coderig Task 28. Cover foreground compatibility, background
-start, yield, incremental output, wait-many, input, stop, output limit, owner
-isolation, resource shutdown, and manifest restore.
+registry. Pass a deterministic resolver only to `BashDefinition`; assert it
+receives the bound LoopID and returns the concrete async runner. Construct
+ProcessOutput, ProcessInput, and ProcessStop without a runner. The fake Harness
+`ProcessBinding` contains only the registry, and a companion definition may
+create the same runner-free supervisor before Bash is built. Tools cannot import
+Harness `internal/sessionruntime`; real registry composition is reserved for
+Coderig Task 28. Cover foreground compatibility, background start, yield,
+incremental output, wait-many, input, stop, output limit, owner isolation,
+resource shutdown, and manifest restore.
 
 Both files begin with:
 
@@ -2610,6 +2652,9 @@ Test:
 - Sandbox error codes map to Harness codes without losing causes;
 - no OS PID crosses the adapter;
 - adapter satisfies `tool.AsyncProcessRunner`;
+- the Coderig resolver captures one role `*sandbox.ExecutorSet`, calls
+  `set.For(loopID.String())` exactly, wraps the returned executor, and preserves
+  lookup failures;
 - no Harness `ProcessBinding`, Rig option, lifecycle option, or provider is used
   to transport the adapter.
 
@@ -2626,10 +2671,13 @@ Expected: FAIL.
 
 Follow the existing `grantedExecutor` composition pattern. Put no buffering,
 authorization, event, or supervisor policy in Coderig. Expose a Coderig-local
-constructor that wraps the selected Sandbox executor as
-`tool.AsyncProcessRunner`; Task 27 passes that returned adapter directly into
-Tools definition constructors. Do not register it with Harness lifecycle or
-place it in `tool.ProcessBinding`.
+resolver constructor that captures the role's `*sandbox.ExecutorSet` and
+returns a `tools.AsyncProcessRunnerResolver`. Each resolver call uses
+`set.For(loopID.String())` and mechanically wraps that loop-bound executor as a
+`tool.AsyncProcessRunner`; no concrete per-loop adapter is constructed before
+Harness Bind supplies the LoopID. Task 27 passes the resolver only to the role's
+Bash definition. Do not register it with Harness lifecycle, place it in
+`tool.ProcessBinding`, or add it to the supervisor/companion constructors.
 
 **Step 4: Verify GREEN and commit**
 
@@ -2652,12 +2700,18 @@ Before committing, re-run the exact focused command from Step 2.
 
 Test operator and reviewer rosters contain Bash, ProcessOutput, ProcessInput, and
 ProcessStop exactly once. Bind the same per-loop Sandbox executor used by the
-gate. Construct one Task 26B async adapter for that executor and capture the
-same adapter instance in all four Tools definitions before Harness binding.
-Verify Harness `ProcessBinding` supplies only the shared session registry, all
-definitions share one session supervisor, and sibling loops cannot access one
-another's handles. Verify Coderig does not install the process-enabled roster on
-a foreign-engine loop and reports
+gate. Construct one Task 26B resolver over each role's existing `ExecutorSet`
+and pass it only to that role's Bash definition. At Bash Build, verify the
+resolver receives exactly `bindings.LoopID` and that its
+`set.For(bindings.LoopID.String())` result is the identical executor returned
+by the existing synchronous Bash lookup and by `roleGate` for invocation
+provenance carrying the same LoopID. ProcessOutput, ProcessInput, and
+ProcessStop carry no resolver or runner and may create the shared runner-free
+supervisor first. Verify Harness `ProcessBinding` supplies only the shared
+session registry, sibling loops cannot access one another's handles, resolver
+failure aborts Build without producing Bash, and zero/missing LoopID is rejected
+by Harness binding before the factory/resolver is called. Verify Coderig does
+not install the process-enabled roster on a foreign-engine loop and reports
 `process_notifications_unsupported` for an attempted explicit bind.
 
 **Step 2: Verify RED**
@@ -2670,12 +2724,18 @@ Expected: FAIL.
 
 **Step 3: Wire definitions**
 
-Construct the Bash definition with its existing synchronous adapter plus
-`bash.WithAsyncProcessRunner(processAdapter)`. Pass the same `processAdapter`
-explicitly to `ProcessOutputDefinition`, `ProcessInputDefinition`, and
-`ProcessStopDefinition`, then append the definitions to both allowed rosters.
-Preserve reviewer access restrictions. Do not introduce a Harness runner
-provider or Rig/lifecycle option.
+Construct the operator and reviewer process resolvers from their respective role
+executor sets. Extend Coderig's existing `bashDefinition` to capture its role
+resolver; inside its Build factory, retain the synchronous
+`set.For(bindings.LoopID.String())` lookup and invoke the async resolver with the
+same explicit `bindings.LoopID`, then pass the concrete adapter into Task 15's
+supervised Bash factory. Append argument-free `ProcessOutputDefinition()`,
+`ProcessInputDefinition()`, and `ProcessStopDefinition()` to both allowed
+rosters. Preserve reviewer access restrictions. Do not use invocation-context
+provenance merely for Build-time runner selection; the PreparedCall context
+still supplies execution ID and grants at invocation. Do not introduce a
+Harness runner provider, Rig/lifecycle option, supervisor runner, or companion
+runner.
 
 **Step 4: Verify GREEN and commit**
 

@@ -106,8 +106,10 @@ Tools owns the behavior visible to a model or direct tool consumer:
 
 Tools must not import Harness internals or Sandbox directly. It consumes public
 Harness identity, workspace, and session-resource contracts through tool
-bindings. The public `AsyncProcessRunner` contract is instead an immutable
-definition-construction dependency captured by Tools definitions.
+bindings. A process-enabled Bash definition captures a Tools-owned, narrow
+runner resolver as an immutable construction dependency and resolves the
+concrete `AsyncProcessRunner` from the validated bound LoopID. ProcessOutput,
+ProcessInput, ProcessStop, and the session supervisor never receive a runner.
 
 ### Harness
 
@@ -130,8 +132,8 @@ formats, or shell semantics.
 
 Harness does not provision an async runner through Rig/session lifecycle
 options, and `ProcessBinding` contains only the session resource registry.
-Coderig constructs the Sandbox-to-Harness adapter and passes it into the Tools
-definition constructors; the definitions capture that adapter immutably.
+Coderig constructs a role-local Sandbox-to-Harness resolver over its
+`ExecutorSet` and passes it only to the role's process-enabled Bash definition.
 
 ### Sandbox
 
@@ -158,10 +160,13 @@ Coderig is the production composition root. It owns:
   async runner/process contracts;
 - configuration of the durable resource root beneath Coderig's data directory
   for persisted sessions and an isolated temporary root for headless sessions;
-- construction of one Tools supervisor through the Harness session-resource
-  registry;
-- injection of the shared supervisor into Bash, ProcessOutput, ProcessInput, and
-  ProcessStop definitions;
+- construction of one runner-free Tools supervisor through the Harness
+  session-resource registry, regardless of which process definition first
+  resolves it;
+- role-specific Bash runner resolution from the same per-loop Sandbox
+  `ExecutorSet` used by the access gate;
+- installation of runner-free ProcessOutput, ProcessInput, and ProcessStop
+  definitions;
 - integration tests proving the composed path uses Sandbox enforcement.
 
 The adapter contains no supervision policy, output buffering, authorization, or
@@ -657,11 +662,13 @@ append-before-dispatch and dispatch-before-crash windows without making the
 ordinary audit-only command path strict.
 
 Process-enabled definitions are supported only by native Harness loops in this
-release. Bind/restore validation rejects `RequiresProcessServices` on a foreign
-engine with `process_notifications_unsupported`; it must not silently start a
-process that cannot receive completion. Legacy foreground Bash remains
-available under its existing engine rules. A future backend-neutral foreign
-notification contract may widen this scope.
+release. The immutable loop definition exposes a read-only `Engine()` view so
+Rig/session validation can reject `RequiresProcessServices` on a foreign engine
+with `process_notifications_unsupported` before `Bind` or any tool factory is
+called; rejection must not silently start a process that cannot receive
+completion. Legacy foreground Bash remains available under its existing engine
+rules. A future backend-neutral foreign notification contract may widen this
+scope.
 
 Completion notifications are also metadata-only. They tell the loop that a
 process reached a terminal state and provide its opaque handle. The model must
@@ -689,12 +696,31 @@ generic read-only, scoped-write, or broad-write description. If the runner
 cannot truthfully prepare access or prove lifetime containment, supervised spawn
 fails with `lifetime_enforcement_unavailable`.
 
-This adapter is not a per-session Harness binding. Coderig constructs it from
-the same Sandbox executor used for gated execution and captures it in each
-process-enabled Tools definition. Harness binds only the shared
-`SessionResourceRegistry`; whichever captured definition first resolves the
-key creates the one session supervisor with its captured runner. Coderig passes
-the same adapter instance to all four definitions.
+This adapter is not a per-session Harness binding and is not a supervisor
+dependency. Coderig captures a narrow resolver over each role's
+`ExecutorSet` in that role's process-enabled Bash definition. At definition
+Build, Tools invokes the resolver with the validated `bindings.LoopID`; the
+resolver calls the same `ExecutorSet.For(bindings.LoopID.String())` key/path
+that `roleGate` calls with the authorized invocation's provenance LoopID and
+wraps that exact executor as an `AsyncProcessRunner`. A resolver error aborts
+Build without producing a Bash tool.
+
+The Tools-owned resolver contract is conceptually:
+
+```go
+type AsyncProcessRunnerResolver func(context.Context, LoopID) (AsyncProcessRunner, error)
+```
+
+Harness rejects a missing or zero LoopID before calling a definition factory.
+Runner selection therefore needs no invocation-context provenance lookup.
+Invocation context remains authoritative later: the prepared Bash call supplies
+its ToolExecutionID and approved grants to `ProcessRequest`.
+
+Harness binds only the shared `SessionResourceRegistry`. Bash, ProcessOutput,
+ProcessInput, and ProcessStop can each win the registry's get-or-create race
+because the supervisor contains no runner. Only Bash owns execution authority:
+it prepares through its resolved runner, acquires the matching workspace lease,
+and passes the resulting `PreparedProcess` to `Supervisor.Start`.
 
 Lease compatibility:
 
@@ -764,9 +790,10 @@ type Process interface {
 ```
 
 Harness owns these public types but does not manufacture or bind an
-implementation. Coderig's Sandbox adapter implements `AsyncProcessRunner` and
-is captured by Tools definitions at construction; `ProcessBinding` remains
-registry-only.
+implementation. A Coderig resolver constructs the Sandbox adapter for the
+validated loop-bound executor at Bash definition Build; `ProcessBinding`
+remains registry-only. The runner is absent from supervisor construction and
+from all three companion definitions.
 
 Exact Go names may follow existing package conventions, but the contract must:
 

@@ -146,9 +146,29 @@ documentation-only; no heavy verification was run outside a phase gate.
 
 `ProcessBinding` is now registry-only; Task 2A's typed-nil assertion applies
 only to `SessionResourceRegistry`, and Task 2D threads no runner. Task 1's
-`AsyncProcessRunner` remains the public adapter contract. Coderig constructs the
-Sandbox adapter and captures the same instance in the four Tools definitions,
-as reconciled across Tasks 14/15/19/20/26/27. No Harness Rig option, lifecycle
-provider, or session binding for a runner is introduced. This is
-documentation-only, and the phase-gate-only heavy verification policy is
-unchanged.
+`AsyncProcessRunner` remains the public adapter contract. No Harness Rig option,
+lifecycle provider, or session binding for a runner is introduced.
+
+Follow-up architectural review found that the first correction still resolved a
+concrete per-loop runner too early and incorrectly made it a supervisor and
+companion-definition dependency. The plan now matches current Coderig
+composition:
+
+- only process-enabled Bash receives execution authority;
+- its Tools-owned resolver is captured at definition construction and invoked at
+  Build with the validated `bindings.LoopID`;
+- the Coderig resolver calls the same role `ExecutorSet.For(loopID.String())`
+  path as the existing Bash definition and access gate;
+- resolver failure aborts Build, while missing/zero LoopID is rejected by
+  Harness before the factory;
+- PreparedCall context remains the source of ToolExecutionID and grants, but is
+  not needed merely to select the loop runner;
+- the supervisor accepts a `PreparedProcess` and is runner-free;
+- ProcessOutput, ProcessInput, and ProcessStop are runner-free and may each win
+  shared-supervisor creation.
+
+Task 2D also now adds an immutable `loop.Definition.Engine()` seam so foreign
+process-enabled definitions are rejected before Bind or factory execution, with
+a recording-factory zero-call assertion. These changes reconcile Tasks
+2D/8/14/15/19/20/26/27. They are documentation-only, and the phase-gate-only
+heavy verification policy is unchanged.
