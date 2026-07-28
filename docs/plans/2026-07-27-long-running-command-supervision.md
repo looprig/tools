@@ -382,11 +382,12 @@ non-race command, then commit these two files as
 **2C — durable storage provider**
 
 Files: `pkg/rig/session_resource_storage.go`,
-`pkg/rig/session_resource_storage_test.go`, `pkg/rig/options.go`, and
-`pkg/rig/definition.go`. First add
+`pkg/rig/session_resource_storage_test.go`, `pkg/rig/options.go`,
+`pkg/rig/definition.go`, and `pkg/rig/errors.go`. First add
 `TestRigRequiresResourceStorageForProcessDefinitions`,
 `TestRigRejectsNilResourceStorageProvider`,
 `TestRigRejectsTypedNilResourceStorageProvider`, and
+`TestRigRejectsDuplicateResourceStorageProvider`, plus
 `TestRigDefinitionCapturesResourceStorageProviderImmutably`, then run:
 
 ```bash
@@ -409,8 +410,22 @@ type SessionResourceStorageProvider interface {
 
 The Rig definition requires the provider when any definition declares
 `RequiresProcessServices`, rejects nil and typed-nil providers, and captures the
-selected provider immutably. It does not call the provider, mint a SessionID,
-create a directory, or decide new-versus-restore identity in `pkg/rig`.
+selected provider immutably. Extend `DefinitionErrorKind` in `pkg/rig/errors.go`
+with:
+
+```go
+DefinitionMissingResourceStorage DefinitionErrorKind = "missing_resource_storage"
+DefinitionInvalidResourceStorage DefinitionErrorKind = "invalid_resource_storage"
+```
+
+The missing-provider test asserts `DefinitionMissingResourceStorage`; nil and
+typed-nil tests assert `DefinitionInvalidResourceStorage`. A second provider
+option remains the existing duplicate-option contract and asserts
+`DefinitionDuplicateOption`; do not add a storage-specific duplicate kind. The
+immutable-capture success test must not report any of these errors.
+
+This microtask does not call the provider, mint a SessionID, create a directory,
+or decide new-versus-restore identity in `pkg/rig`.
 Re-run the exact command, run the commit-boundary `gofmt` and diff checks, then
 commit these files as
 `feat(rig): provide durable session resource storage`.

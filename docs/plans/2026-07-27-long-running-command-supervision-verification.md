@@ -130,3 +130,12 @@ atomically releases or transfers both. The focused plan test covers suspended
 creation, assignment, and resume failure and proves `Spec.Release` is neither
 early nor permanently blocked. This is also documentation-only; the
 phase-boundary verification schedule is unchanged.
+
+### Residual Task 2C typed-error feasibility clarification
+
+Task 2C now includes `pkg/rig/errors.go`. Missing storage uses
+`DefinitionMissingResourceStorage`, nil/typed-nil storage uses
+`DefinitionInvalidResourceStorage`, and a duplicate provider option preserves
+the existing `DefinitionDuplicateOption` contract. Its focused tests assert
+those exact typed kinds. This is documentation-only; no heavy verification was
+run outside a phase gate.
