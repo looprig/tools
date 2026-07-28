@@ -419,6 +419,15 @@ actual Coderig restart forfeits headless restore.
 Unavailable or identity-mismatched durable storage fails session construction.
 The resource root is never the workspace.
 
+Storage resolution belongs to session construction, not Rig definition
+assembly. A new session mints its SessionID, resolves the configured provider,
+and creates or validates an owner-only, versioned durable identity anchor
+binding that SessionID and the provider identity in the private resource root
+before any process-enabled definition is bound. Restore resolves and validates
+that same root/anchor before restore planning begins. Missing, unavailable,
+corrupt, or identity-mismatched storage aborts construction before process
+binding or resource creation.
+
 New-session and restore construction use the same late-bound session bridge.
 Definitions may be probed before the final Session and event hub exist, so a
 supervisor must not capture an internal `*Session` during bind. Harness activates
@@ -504,7 +513,7 @@ Before returning a process handle, Tools atomically persists a manifest containi
 - prepared access summary;
 - PTY mode;
 - process state;
-- created and started timestamps;
+- created and started timestamps, plus the finished timestamp when terminal;
 - timeout deadline;
 - spool metadata and cursor bounds;
 - OS execution metadata needed only for same-process teardown;
@@ -542,6 +551,37 @@ Harness defines typed metadata-only lifecycle events:
 
 Events include identity, state, timestamps, exit metadata, reason, and bounded
 non-output diagnostics. Command output and stdin are excluded.
+
+Tools owns and durably persists the lifecycle timestamps before publication.
+Harness validates and preserves the supplied ProcessCreatedAt,
+ProcessStartedAt, and ProcessFinishedAt in the event payload. These names
+deliberately distinguish process lifecycle clocks from the Harness event
+Header's envelope CreatedAt. Harness adds only envelope metadata absent from the
+neutral DTO and never substitutes its publication clock for a process clock.
+
+The closed lifecycle matrix is:
+
+| Kind | State | Reason |
+| --- | --- | --- |
+| started | running | none |
+| backgrounded | running | none |
+| stop-requested | starting or running | interrupted, terminated, or killed |
+| completed | exited | exited |
+| completed | failed | failed |
+| completed | timed-out | timed-out |
+| completed | interrupted | interrupted |
+| completed | terminated | terminated, runner-shutdown, or output-limit |
+| completed | killed | killed, runner-shutdown, or output-limit |
+| lost | lost-on-restore | lost-on-restore |
+
+Started/backgrounded are nonterminal and require creation/start times.
+Stop-requested is nonterminal, carries no finish/exit metadata, and names only
+the requested portable signal. Completed/lost require a finish time; only
+completed/exited requires an exit code, and failed/lost alone may carry the
+bounded diagnostic. Every unlisted kind/state/reason combination is invalid.
+Task 4 extends the existing `pkg/tool.ProcessTerminalReason` for failed,
+output-limit, and lost-on-restore by appending values without renumbering the
+Task 1 constants; it does not define a second reason type.
 
 The public late-bound service DTOs are defined in `pkg/tool`; the concrete
 events use the same bounded `pkg/tool` enums rather than making `pkg/tool`
@@ -744,7 +784,12 @@ a delegated cgroup v2 scope retained through terminalization and emptied with
 cost-limiting cgroup behavior is insufficient by itself; supervised Rung-2
 execution without usable delegation fails before spawn. Retained Landlock path
 descriptors and their cleanup remain live across prepare, start, and the final
-zero proof.
+zero proof. The backend lifetime handle is result-bearing: a kill error,
+timeout, non-empty `cgroup.procs`, read/open failure, or scope-removal failure is
+failed or indeterminate proof, never success. In particular, inability to read
+`cgroup.procs` is not evidence that it is empty. `Wait` retains the whole
+authority/lifecycle capsule and transfers it to process-level quarantine until
+an exact retry succeeds.
 
 Darwin currently has no primitive in Sandbox that contains a descendant after
 `setsid`. Until a concrete backend supplies and proves one, supervised
@@ -764,9 +809,13 @@ The elevated backend's current blocking `enforce.Spec.Launch` bridge must be
 split at its existing asynchronous ownership boundary: the protected launcher
 returns and transfers its `elevatedRunnerExecution`, and the public process
 handle waits or stops that owned execution. It must not place a goroutine around
-the blocking `Launch` call. Both restricted and elevated Job paths retain
-broker/ACL authority until Job-empty proof and preserve their existing
-quarantine behavior when that proof is delayed.
+the blocking `Launch` call. The transfer owns both the per-execution broker
+release and the compiled elevated-spec `active.Done` retirement obligation;
+compiled-spec release continues waiting for that execution. Both restricted
+and elevated Job paths retain broker/ACL, grant/path, proxy, and backend
+authority until Job-empty proof. If proof is delayed, the whole ownership
+capsule moves to process-level quarantine; no authority or lifecycle callback
+is released from the returned launch stack.
 
 ### Unsupported PTY environments
 

@@ -385,38 +385,76 @@ Files: `pkg/rig/session_resource_storage.go`,
 `pkg/rig/session_resource_storage_test.go`, `pkg/rig/options.go`, and
 `pkg/rig/definition.go`. First add
 `TestRigRequiresResourceStorageForProcessDefinitions`,
-`TestResourceStorageStableAcrossRestore`,
-`TestResourceStorageRejectsIdentityMismatch`, and
-`TestResourceStorageUnavailableFailsConstruction`, then run:
+`TestRigRejectsNilResourceStorageProvider`,
+`TestRigRejectsTypedNilResourceStorageProvider`, and
+`TestRigDefinitionCapturesResourceStorageProviderImmutably`, then run:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/rig -run 'Test(RigRequiresResourceStorage|ResourceStorage)'
 ```
 
-Expected RED: no provider option. Add a provider returning `{Path, Identity}`
-for a SessionID. Require a stable root outside the workspace and reject
-unavailable or identity-mismatched restore. Re-run the exact command, run
-the commit-boundary `gofmt` and diff checks, then commit these files as
+Expected RED: no provider option. Add only the public definition-time provider
+contract and option capture in this microtask:
+
+```go
+type SessionResourceStorage struct {
+	Path     string
+	Identity string
+}
+
+type SessionResourceStorageProvider interface {
+	StorageForSession(context.Context, uuid.UUID) (SessionResourceStorage, error)
+}
+```
+
+The Rig definition requires the provider when any definition declares
+`RequiresProcessServices`, rejects nil and typed-nil providers, and captures the
+selected provider immutably. It does not call the provider, mint a SessionID,
+create a directory, or decide new-versus-restore identity in `pkg/rig`.
+Re-run the exact command, run the commit-boundary `gofmt` and diff checks, then
+commit these files as
 `feat(rig): provide durable session resource storage`.
 
 **2D — restore late binding**
 
-Files: `internal/sessionruntime/session.go`,
+Files: `pkg/rig/definition.go`,
+`pkg/rig/session_resource_storage_test.go`,
+`internal/sessionruntime/lifecycle.go`,
+`internal/sessionruntime/session.go`,
 `internal/sessionruntime/restore_constructor.go`,
 `internal/sessionruntime/session_resources.go`, and
 `internal/sessionruntime/session_resources_test.go`. First add
+`TestResourceStorageStableAcrossRestore`,
+`TestResourceStorageRejectsIdentityMismatch`,
+`TestResourceStorageUnavailableFailsConstruction`,
 `TestRestorePlanningAndLiveBindingsShareResourceRegistry` and
 `TestRestoreDoesNotPublishBeforeResourceBridgeActivation`, plus
 `TestForeignLoopRejectsProcessServices`, then run:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run 'Test(Restore.*Resource|ForeignLoopRejectsProcessServices)'
+GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/rig ./internal/sessionruntime -run 'Test(ResourceStorage|Restore.*Resource|ForeignLoopRejectsProcessServices)'
 ```
 
-Expected RED: probe and live bindings do not share a bridge. Thread the same
-registry and inert bridge through `planLoops`, `buildRestoredSession`, and
-`attachRestoredLoop`; activate only after the live Session, hub, publisher, and
-notifier exist. At this stage activation proves ordering with the empty
+Expected RED: storage is not resolved at a lifecycle point with a known
+SessionID, and probe/live bindings do not share a bridge.
+
+For a new session, mint the SessionID first, resolve
+`StorageForSession(ctx, sessionID)`, canonicalize and validate the returned root
+outside the workspace, then atomically create or validate a durable identity
+anchor inside that private resource root (or equivalently in the session's
+durable journal) before binding any process-enabled definition. The anchor is
+owner-only, versioned, and binds the exact SessionID plus provider-supplied
+Identity; write-new/sync/atomic-replace rules apply. For restore,
+resolve and validate the same provider result and identity anchor before
+`planLoops`; never create a fresh identity over an existing mismatched root.
+An unavailable provider, invalid path, missing/corrupt restore anchor, or
+identity mismatch aborts construction before process binding, resource factory
+execution, or bridge activation.
+
+Thread the resolved storage, same registry, and inert bridge through
+`planLoops`, `buildRestoredSession`, and `attachRestoredLoop`; activate only
+after the live Session, hub, publisher, and notifier exist. At this stage
+activation proves ordering with the empty
 `SessionResourceServices` carrier; Task 4 replaces that staged value with the
 validated typed service set before any real process resource is composed.
 Reject process-enabled definitions on non-native engines with
@@ -492,6 +530,8 @@ git commit -m "feat(workspace): coordinate background process leases"
 
 - Modify: `../harness/pkg/tool/session_resource.go`
 - Create: `../harness/pkg/tool/session_resource_test.go`
+- Modify: `../harness/pkg/tool/process.go`
+- Modify: `../harness/pkg/tool/process_test.go`
 - Create: `../harness/pkg/event/process.go`
 - Create: `../harness/pkg/event/process_test.go`
 - Modify: `../harness/pkg/event/event.go`
@@ -512,6 +552,9 @@ Define `ProcessStarted`, `ProcessBackgrounded`, `ProcessCompleted`,
 `ProcessStopRequested`, and `ProcessLost`.
 
 First add `TestProcessLifecycleMetadataValidation`,
+`TestProcessLifecycleKindStateReasonMatrix`,
+`TestProcessLifecycleStopRequestedInvariants`,
+`TestProcessLifecycleTimestampsPreserved`,
 `TestProcessCompletionNotificationValidation`,
 `TestSessionResourceServicesRejectsTypedNilLifecyclePublisher`, and
 `TestSessionResourceServicesRejectsTypedNilCompletionNotifier` in `pkg/tool`.
@@ -536,9 +579,9 @@ type ProcessLifecycleMetadata struct {
 	ProcessHandle     string
 	OriginExecutionID uuid.UUID
 	State             ProcessLifecycleState
-	CreatedAt         time.Time
-	StartedAt         time.Time
-	FinishedAt        time.Time
+	ProcessCreatedAt  time.Time
+	ProcessStartedAt  time.Time
+	ProcessFinishedAt time.Time
 	HasExitCode       bool
 	ExitCode          int32
 	Reason            ProcessTerminalReason
@@ -563,13 +606,43 @@ type ProcessCompletionNotifier interface {
 }
 ```
 
-Use closed constants for started, backgrounded, completed, stop-requested, and
-lost kinds and for starting, running, exited, failed, timed-out, terminated,
-killed, interrupted, and lost-on-restore lifecycle states. Reuse the bounded
-`ProcessTerminalReason` already defined by Task 1 in `pkg/tool/process.go`; do
-not redeclare or shadow it. Extend that existing enum only if a distinct
-lost-on-restore terminal reason is required after state/reason validation is
-specified.
+Define exactly these closed lifecycle kinds:
+`ProcessLifecycleStarted`, `ProcessLifecycleBackgrounded`,
+`ProcessLifecycleCompleted`, `ProcessLifecycleStopRequested`, and
+`ProcessLifecycleLost`. Define exactly these closed lifecycle states:
+`ProcessLifecycleStarting`, `ProcessLifecycleRunning`,
+`ProcessLifecycleExited`, `ProcessLifecycleFailed`,
+`ProcessLifecycleTimedOut`, `ProcessLifecycleInterrupted`,
+`ProcessLifecycleTerminated`, `ProcessLifecycleKilled`, and
+`ProcessLifecycleLostOnRestore`.
+
+Reuse the bounded `ProcessTerminalReason` already defined by Task 1 in
+`pkg/tool/process.go`; never redeclare or shadow it. Extend that existing enum
+with `ProcessTerminalFailed`, `ProcessTerminalOutputLimit`, and
+`ProcessTerminalLostOnRestore`, appended after the existing constants without
+renumbering them, and extend its `Valid` method accordingly. Its complete
+lifecycle matrix is:
+
+| Kind | State | Allowed reason | Timestamp/exit invariants |
+| --- | --- | --- | --- |
+| started | running | zero | created/start required; finished/exit absent |
+| backgrounded | running | zero | created/start required; finished/exit absent |
+| stop-requested | starting or running | interrupted, terminated, or killed | created required; start required iff running; finished/exit absent |
+| completed | exited | exited | created/start/finished required; exit required |
+| completed | failed | failed | created/finished required; start optional; exit absent |
+| completed | timed-out | timed-out | created/start/finished required; exit absent |
+| completed | interrupted | interrupted | created/start/finished required; exit absent |
+| completed | terminated | terminated, runner-shutdown, or output-limit | created/start/finished required; exit absent |
+| completed | killed | killed, runner-shutdown, or output-limit | created/start/finished required; exit absent |
+| lost | lost-on-restore | lost-on-restore | created/finished required; start optional; exit absent |
+
+Every combination not listed is invalid. A stop-requested record is
+nonterminal: it carries the requested portable signal as its reason, never
+`ProcessFinishedAt`, an exit code, `runner-shutdown`, `output-limit`, `failed`, or
+`lost-on-restore`. `Diagnostic` must be empty except for failed or lost records.
+`ProcessCompletionNotification` accepts only the terminal state/reason pairs
+from the completed and lost rows; starting/running and stop-request semantics
+are invalid for a completion notification.
 
 Task 5's Tools-owned supervision state remains an internal explicit string
 enum. Its lifecycle sink maps each value mechanically to
@@ -587,11 +660,19 @@ must be non-empty URL-safe opaque tokens no longer than
 `MaxProcessDiagnosticBytes`. No DTO has command, output, stdin, environment,
 host path, spool path, OS PID, or another free-form field. Exit metadata uses
 `HasExitCode` rather than a caller-retained pointer. Validation requires
-non-zero `CreatedAt`; started/backgrounded records require non-zero `StartedAt`
-and zero `FinishedAt`, exit metadata, and terminal reason; completed/lost
-records require non-zero `FinishedAt` not before creation/start and a terminal
-state/reason. `HasExitCode` is valid only for terminal states whose executable
-actually produced an exit status; when false, `ExitCode` must be zero.
+non-zero `ProcessCreatedAt` and applies the matrix above; every non-zero
+`ProcessStartedAt` must be at or after creation, and every non-zero
+`ProcessFinishedAt` must be at or after both creation and start.
+`HasExitCode` is valid only for completed/exited; when false, `ExitCode` must be
+zero.
+
+Tools owns and atomically persists `ProcessCreatedAt`, `ProcessStartedAt`, and
+`ProcessFinishedAt` with the process manifest before it invokes this service.
+Harness validates and preserves those exact values in the concrete event
+payload. The `Process` prefix distinguishes these lifecycle clocks from the
+Harness event Header's envelope `CreatedAt`; Task 24 must never replace the
+process clocks. Harness adds only event-envelope metadata that is not
+represented by this DTO.
 
 Round-trip each event through the existing sealed event codec. Reject:
 
@@ -638,7 +719,7 @@ Re-run the exact focused command from Step 2. Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add pkg/tool/session_resource.go pkg/tool/session_resource_test.go pkg/event internal/sessionruntime/process_services.go internal/sessionruntime/process_services_test.go internal/sessionruntime/session_resources.go
+git add pkg/tool/session_resource.go pkg/tool/session_resource_test.go pkg/tool/process.go pkg/tool/process_test.go pkg/event internal/sessionruntime/process_services.go internal/sessionruntime/process_services_test.go internal/sessionruntime/session_resources.go
 git commit -m "feat(event): record process lifecycle metadata"
 ```
 
@@ -1261,10 +1342,21 @@ Execute independently:
   lease release only after proof. Then make the internal enforcement seam
   return an owned asynchronous execution whose `Wait` is backed directly by the
   existing `elevatedRunnerExecution`; transfer the stdio bridge and release
-  closure with it. RED/GREEN selector:
+  closure with it. The transfer includes two distinct retirement obligations:
+  the per-execution broker lease release and the compiled elevated-spec
+  `active.Done` registered before launch. Neither may remain deferred on the
+  returning `Launch` stack; both move into the owned execution and run exactly
+  once only after terminal Job-zero proof. If that proof is delayed, transfer
+  the execution together with the complete grant/path/proxy/backend capsule to
+  the process-level quarantine reaper. The compiled spec's `Release` must
+  continue waiting on `active` and cannot retire broker authority early.
+  Add `TestElevatedAsyncExecutionRetainsBrokerAndSpecActivityUntilJobZero` and
+  `TestElevatedAsyncExecutionQuarantineOwnsRetirements` before changing the
+  bridge.
+  RED/GREEN selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/windows ./internal/exec -run
-  '^Test(ElevatedAsyncExecutionOwnership|ElevatedRunner.*(Job|Release|Quarantine))$'`.
+  '^Test(ElevatedAsyncExecution.*|ElevatedRunner.*(Job|Release|Quarantine))$'`.
   Commit `refactor: expose elevated runner execution ownership`.
 
 **Task 10 combined acceptance**
@@ -1343,8 +1435,15 @@ Windows runtime release, proxy route, and compiled resource exactly once, while
 the single-spawn grant remains consumed and cannot become replayable. Successful
 `Start` performs one ownership transfer into `executorLifecycle`; normal Job/
 cgroup zero proof releases it, and an uncertain proof transfers it intact into
-`quarantinedSpawn`. Extend the existing `ExecutorSet.Close` tests to cover live
-prepared and started handles.
+the process-level `quarantinedSpawn`. That capsule includes streams, retained
+grant/path handles, proxy credentials/routes, transient and compiled backend
+release closures, the per-execution broker release, the elevated compiled-spec
+`active.Done`, and both executor lifecycle barriers. No callback may stay
+reachable only from the old blocking launch stack. Extend the existing
+`quarantinedSpawn` ownership type from its stabilized Windows wording into a
+platform-neutral process-level capsule that can retain a Windows Job execution
+or Linux cgroup lifetime handle. Extend the existing `ExecutorSet.Close` tests
+to cover live prepared and started handles.
 
 **Step 4: Verify GREEN**
 
@@ -1364,6 +1463,7 @@ git commit -m "fix: retain async enforcement through process exit"
 - Modify: `../sandbox/internal/exec/process_tree_unix.go`
 - Modify: `../sandbox/internal/exec/process_tree_windows.go`
 - Modify: `../sandbox/internal/exec/process_tree_other.go`
+- Modify: `../sandbox/internal/enforce/enforce.go`
 - Modify: `../sandbox/internal/linux/backend.go`
 - Modify: `../sandbox/internal/linux/cgroup.go`
 - Modify: `../sandbox/internal/linux/cgroup_test.go`
@@ -1408,12 +1508,15 @@ Execute independently:
   `internal/exec/lifetime_unix.go`,
   `internal/exec/process_parent_death_unix_test.go`,
   `internal/exec/process_parent_death_integration_unix_test.go`, and
+  `internal/enforce/enforce.go`,
   `internal/linux/backend.go`, `internal/linux/cgroup.go`,
   `internal/linux/cgroup_test.go`, `internal/linux/init.go`, and
   `init_linux.go`.
   RED/GREEN:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
-  ./internal/exec -run '^TestProcessTreeLinuxContainmentPlan$'`. Phase Gate 3
+  ./internal/exec ./internal/linux -run
+  '^Test(ProcessTreeLinuxContainmentPlan|CgroupLifetime(KillAndWait|ReadFailureIndeterminate|RetainsOnUnprovedEmpty))$'`.
+  Phase Gate 3
   requires its list output to contain
   `TestIntegrationProcessTreeParentDeath`,
   `TestIntegrationProcessTreeDoubleFork`, and
@@ -1421,7 +1524,21 @@ Execute independently:
   approved Linux worker. The plan test must reject supervised Rung-2 when
   delegated cgroup v2 is unavailable, select PID namespace for Rung 1, select
   and retain a delegated cgroup otherwise, and require `cgroup.kill` plus an
-  exact empty proof before release. The existing optional/best-effort resource
+  exact empty proof before release. Build on Task 10D's result-bearing
+  backend-execution seam in `internal/enforce`: the owned handle must expose
+  wait/termination plus a proof result, not collapse lifetime completion into a
+  blocking exit integer.
+
+  Replace the current void/best-effort cgroup teardown with a result-bearing
+  `KillAndWait(context.Context) error` (exact name may follow package
+  conventions). Nil means `cgroup.kill` succeeded or was unnecessary, a
+  successful read proved `cgroup.procs` empty, and owned cleanup completed.
+  A `cgroup.kill` error, timeout, non-empty read, read/open error, or removal
+  error is a typed failed/indeterminate proof; a read failure is never treated
+  as empty. On any failed/indeterminate proof, retain the cgroup descriptor,
+  directory, execution lifecycle, and entire authority capsule and transfer
+  them to process-level quarantine for retry. `Wait` cannot report confirmed
+  teardown before this returns nil. The existing optional/best-effort resource
   cgroup behavior is not a lifetime guarantee. During the microtask, implement
   the lifetime shim plus proven Linux containment only; commit
   `feat: contain Unix process descendants`.
@@ -2244,9 +2361,13 @@ GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go t
 ```
 
 Attach the checked implementation behind Task 4's stable late-bound lifecycle
-bridge; do not replace the bridge already captured by a resource. Stamp bounded
-metadata without replacing the Tools ID, durably append, and publish live only
-on a new append. Run the focused non-race commit checks and commit
+bridge; do not replace the bridge already captured by a resource. Validate the
+Tools-supplied coordinates, lifecycle matrix, and persisted
+ProcessCreatedAt/ProcessStartedAt/ProcessFinishedAt values, preserve them
+byte-for-byte in the event payload, add only Harness envelope metadata not
+present in the DTO, and never replace the Tools EventID. Durably append and
+publish live only on a new append.
+Run the focused non-race commit checks and commit
 `feat(session): publish process lifecycle metadata`.
 
 **24C — metadata-only notification and restored live dedupe**
@@ -2320,10 +2441,13 @@ Test a dedicated completion command containing only process handle, terminal
 state, enum reason, and target coordinates. It must not accept command, output,
 stdin, path, PID, or arbitrary text. It must not reuse SubagentResult causality.
 
-Validate Tools-supplied stable IDs, stamp coordinates/timestamps without minting
-replacement IDs. The durable journal index, not the ID field alone,
-deduplicates crash retries. Deliver notifications through the owning loop with
-the stable CommandID and explicit delivery errors.
+For lifecycle requests, validate and preserve Tools-supplied stable IDs, target
+coordinates, and process lifecycle timestamps. For completion notifications,
+validate and preserve the stable CommandID and target coordinates. Harness may
+stamp only envelope metadata absent from the applicable neutral DTO; it must
+not rewrite DTO fields or mint replacement IDs. The durable journal index, not
+the ID field alone, deduplicates crash retries. Deliver notifications through
+the owning loop with the stable CommandID and explicit delivery errors.
 
 Combined journal/lifecycle/notification race verification is deferred to Phase
 Gate 6.

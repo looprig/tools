@@ -96,3 +96,27 @@ Those native run IDs/logs and the vulnerability result remain a hard
 coordination prerequisite before Sandbox async implementation begins. Local
 cross-builds, portable subsets, and Docker probes are useful diagnostics but
 are not reported as native runtime evidence.
+
+## Documentation review correction after `53bae1b`
+
+Follow-up review found five plan-level ambiguities, corrected before their
+owning implementation tasks:
+
+- Task 2C now defines and immutably captures only the public storage-provider
+  contract; SessionID-dependent resolution, durable identity anchoring, and
+  new/restore failures moved to Task 2D before process binding.
+- Task 4 now has one exact kind/state/reason matrix, extends rather than
+  redeclares Task 1's terminal-reason enum, and makes Tools-owned persisted
+  timestamps authoritative.
+- Task 24 validates and preserves Tools coordinates/timestamps and adds only
+  Harness envelope metadata absent from the neutral DTO.
+- Sandbox elevated async ownership includes both per-execution broker release
+  and compiled-spec active retirement, including transfer to process-level
+  quarantine when Job-zero proof is delayed.
+- Linux supervised lifetime teardown is result-bearing; cgroup kill/read/empty
+  failures are indeterminate and retain the full capsule for quarantine retry.
+
+This was a documentation-only correction. Per the user's verification
+scheduling policy, no race, integration, fuzz, static-analysis, vulnerability,
+or trimpath command was run here; those checks remain exclusively at their
+owning phase gates.
