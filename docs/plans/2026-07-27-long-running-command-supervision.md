@@ -45,39 +45,36 @@ shared `/Users/ipotter/code/looprig` root.
 For every numbered task:
 
 1. Dispatch a fresh implementation subagent with the complete task text.
-2. Require `superpowers:test-driven-development`.
-3. The implementer writes one failing test and runs it before production code.
-4. The implementer writes only enough code for green, runs the focused
-   non-race test, refactors while green, self-reviews, and commits.
-5. Dispatch a fresh spec-compliance reviewer.
-6. Send every gap back to the same implementer, then re-review until approved.
-7. Dispatch a fresh code-quality/security reviewer with the task's base and head
-   SHAs.
-8. Send critical and important findings back to the implementer, then re-review
-   until approved.
-9. Only then mark the task complete.
+2. Require test-first implementation: author the focused test before its
+   production change, but do not execute it during the task.
+3. Implement the smallest contract-complete change needed for that queued test.
+4. Run `gofmt` only on changed Go files.
+5. Inspect the task diff and commit.
+6. Do not dispatch an independent spec, code-quality, security, or test reviewer
+   for the task.
 
-Before every task or microtask commit, run only:
+No test command is executed at a task or microtask boundary. This includes
+focused unit/functional selectors, race tests, tagged integration discovery or
+execution, fuzzing, repeated/count stress, static analysis, vulnerability
+checks, `make secure`, and trimpath/native/cross-platform builds. Every inline
+task command below is a queued coverage specification for the owning
+`PHASE GATE`, not an instruction to run it during implementation. Labels such
+as failure rationale and acceptance expectation describe what the queued test
+must prove; they do not authorize a pre-commit test execution.
 
-1. `gofmt` on changed Go files;
-2. the task's focused `go test` command without `-race`; and
-3. `git diff --check`.
-
-Do not run race tests, tagged integration discovery or execution, fuzzing,
-repeated/count stress, static analysis, vulnerability checks, `make secure`, or
-trimpath/cross-platform builds at task or microtask boundaries. This keeps the
-TDD loop fast without weakening acceptance: every one of those checks is
-batched at the owning `PHASE GATE`.
-
-At every `PHASE GATE`, run its complete command matrix: full relevant
+At every `PHASE GATE`, run its complete command matrix: every focused functional
+selector queued by tasks in that phase; full relevant
 `go test -race` suites; `go test -tags integration -list` followed by tagged
-integration execution where that phase owns integration tests; every fuzz
-target accumulated through that phase; repository `make secure` (which includes
-format checks, Vet, Staticcheck, Gosec, and Govulncheck); and `CGO_ENABLED=0`
-trimpath native/cross-builds relevant to the changed repositories. Then dispatch
-one phase-level spec reviewer and one phase-level code-quality/security reviewer
-over the complete phase diff. Do not enter the next phase with an unresolved
-finding or a deferred required check.
+integration execution where that phase owns integration tests; every fuzz target
+accumulated through that phase; repository `git diff --check`; repository
+`make secure` (which includes format checks, Vet, Staticcheck, Gosec, and
+Govulncheck); and `CGO_ENABLED=0` trimpath native/cross-builds relevant to the
+changed repositories. Only after the entire test/build/analysis matrix passes,
+dispatch one phase-level spec reviewer and one phase-level
+code-quality/security reviewer over the complete phase diff.
+Fix findings within the still-open phase boundary, rerun affected gate coverage,
+and obtain re-review. Do not enter the next phase with an unresolved finding or
+a deferred required check.
 
 Append one section per gate to
 `tools/docs/plans/2026-07-27-long-running-command-supervision-verification.md`
@@ -86,13 +83,14 @@ exit codes, integration test names printed by `go test -list`, fuzz durations,
 environment or CI run IDs, reviewer findings, fixes, re-review disposition, and
 the final gate decision. Commit that evidence before the next phase.
 
-No production code may be written before its failing test. Configuration and
-module metadata synchronization in Task 0 is the only non-production exception.
+No production code may be written before its focused test is authored.
+Configuration and module metadata synchronization in Task 0 is the only
+non-production exception. Test execution is still deferred to the phase gate.
 
 Large numbered tasks below are decomposed into lettered microtasks. Each lettered
-microtask is a separate subagent assignment, RED/GREEN cycle, review pair, and
-commit. A heading such as Task 8 is a phase grouping, not permission for one
-agent to implement every bullet at once.
+microtask is a separate implementation subagent assignment and commit, with no
+test execution or independent review. A heading such as Task 8 is a phase
+grouping, not permission for one agent to implement every bullet at once.
 
 Sandbox unit tests must use injected/null backends where OS confinement is not
 the subject, so they run inside the managed development sandbox. Tagged live
@@ -125,22 +123,15 @@ feature code. Synchronize those existing dependencies without introducing any
 new direct dependency. `github.com/creack/pty` is added later and is the only
 approved new direct dependency.
 
-**Step 1: Reproduce the baseline failures**
+**Step 1: Inspect the baseline module mismatch**
 
-Run:
-
-```bash
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
-GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=readonly go test ./pkg/tool
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
-GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash
-```
-
-Expected: both fail with `updates to go.mod needed, disabled by -mod=readonly`.
+Inspect the checked-in module and vendor diffs only. Do not execute the former
+readonly failure probes; Phase Gate 0 verifies the synchronized result.
 
 **Step 2: Synchronize existing graphs**
 
-Run:
+Apply these graph-synchronization mutations during Task 0; they are
+implementation commands, not verification:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
@@ -152,12 +143,12 @@ cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache go mod tidy
 ```
 
-Expected: only existing requirements are synchronized; no new direct module is
-introduced.
+By diff inspection, only existing requirements may be synchronized; no new
+direct module may be introduced.
 
 **PHASE GATE 0: Verify the baseline**
 
-Run:
+Run only at Phase Gate 0:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
@@ -171,7 +162,8 @@ cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app
 ```
 
-Expected: PASS. Separately run Sandbox's existing live `./internal/exec` suite
+Gate expectation: PASS. Separately run Sandbox's existing live
+`./internal/exec` suite
 on an approved host/CI worker; the managed workspace may deny `sandbox_apply`
 and loopback listener creation before repository code can execute. When the
 separate Sandbox stabilization owner is still active, record the local denial
@@ -259,16 +251,17 @@ activity invalidates the complete bound observation cache; scoped observation
 paths are deliberately out of scope. Invalid activity maps to broad
 invalidation and can never narrow the prepared lifetime lease.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
-Run:
+Queue for the owning phase gate:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/tool -run 'TestProcessContract|TestProcessError|TestWorkspaceAccess'
 ```
 
-Expected: FAIL because `process.go` and its types do not exist.
+Failure rationale: `process.go` and its types do not exist before
+implementation.
 
 **Step 3: Implement the minimum public contracts**
 
@@ -277,9 +270,9 @@ Implement enums with explicit validation, a typed `ProcessError` supporting
 dependencies plus existing Harness identity types. Keep model-facing process
 handles out of this runner layer.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Expected: PASS.
+Queue the exact focused command from Step 2 for the owning phase gate; it must pass there.
 
 **Step 5: Commit**
 
@@ -308,8 +301,9 @@ The registry is created before restore planning, survives the probe-to-live
 transition, and is activated only when the real Session, hub, publisher, and
 notifier exist.
 
-Execute each subsection below as its own implementer assignment, RED/GREEN
-cycle, review pair, focused commit checks, and commit.
+Execute each subsection below as its own implementation assignment and commit.
+Author its focused tests first, but queue every listed selector for Phase Gate 1
+and dispatch no independent reviewer before that gate.
 
 **2A — public contracts and binding attenuation**
 
@@ -317,18 +311,20 @@ Files: `pkg/tool/session_resource.go`, `pkg/tool/definition.go`, and
 `pkg/tool/definition_test.go`. First add
 `TestProcessBindingRequiresRegistry`,
 `TestProcessBindingRejectsTypedNilRegistry`, and
-`TestAttenuateBindingsPreservesOnlyRequiredProcessServices`, then run:
+`TestAttenuateBindingsPreservesOnlyRequiredProcessServices`. Queue:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/tool -run 'Test(ProcessBinding|AttenuateBindings.*Process)'
 ```
 
-Expected RED: missing contracts/requirement. Add `SessionResource`,
+Failure rationale: the contracts/requirement are missing before implementation.
+Add `SessionResource`,
 `SessionResourceRegistry`, `SessionResourceServices`, `ProcessBinding`, and
 `RequiresProcessServices`, including typed-nil validation, cloning, and
-attenuation. Re-run the exact command, and commit only those
-three files as `feat(tool): bind session process resources`.
+attenuation. Inspect and commit only those three files as
+`feat(tool): bind session process resources`; execute the selector at Phase
+Gate 1.
 
 Use this public resource shape:
 
@@ -379,15 +375,16 @@ Files: `internal/sessionruntime/session_resources.go` and
 `TestSessionResourcesActivateAndShutdownOnce`. The 32-caller test must prove one
 factory call and one returned resource; creation failure must be retryable;
 shutdown racing creation must close rather than leak; activation/shutdown and
-deterministic error aggregation are at most once. Run:
+deterministic error aggregation are at most once. Queue:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run '^TestSessionResources'
 ```
 
-Expected RED: no concrete registry. Implement only registry creation,
-activation, admission close, and shutdown linearization. Re-run the focused
-non-race command, then commit these two files as
+Failure rationale: no concrete registry exists before implementation. Implement
+only registry creation, activation, admission close, and shutdown
+linearization. Inspect and commit these two files; execute the queued selector
+at Phase Gate 1. Commit as
 `feat(session): manage shared session resources`.
 
 **2C — durable storage provider**
@@ -399,14 +396,15 @@ Files: `pkg/rig/session_resource_storage.go`,
 `TestRigRejectsNilResourceStorageProvider`,
 `TestRigRejectsTypedNilResourceStorageProvider`, and
 `TestRigRejectsDuplicateResourceStorageProvider`, plus
-`TestRigDefinitionCapturesResourceStorageProviderImmutably`, then run:
+`TestRigDefinitionCapturesResourceStorageProviderImmutably`. Queue:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/rig -run 'Test(Rig.*ResourceStorage|ResourceStorage)'
 ```
 
-Expected RED: no provider option. Add only the public definition-time provider
-contract and option capture in this microtask:
+Failure rationale: no provider option exists before implementation. Add only
+the public definition-time provider contract and option capture in this
+microtask:
 
 ```go
 type SessionResourceStorage struct {
@@ -437,8 +435,8 @@ immutable-capture success test must not report any of these errors.
 
 This microtask does not call the provider, mint a SessionID, create a directory,
 or decide new-versus-restore identity in `pkg/rig`.
-Re-run the exact command, run the commit-boundary `gofmt` and diff checks, then
-commit these files as
+Run `gofmt` on changed Go files, inspect the diff, and commit these files without
+executing the queued selector. Commit as
 `feat(rig): provide durable session resource storage`.
 
 **2D — restore late binding**
@@ -458,13 +456,13 @@ Files: `pkg/loop/definition.go`,
 `TestResourceStorageUnavailableFailsConstruction`,
 `TestRestorePlanningAndLiveBindingsShareResourceRegistry` and
 `TestRestoreDoesNotPublishBeforeResourceBridgeActivation`, plus
-`TestForeignLoopRejectsProcessServices`, then run:
+`TestForeignLoopRejectsProcessServices`. Queue:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/loop ./pkg/rig ./internal/sessionruntime -run 'Test(DefinitionEngine|ResourceStorage|Restore.*Resource|ForeignLoopRejectsProcessServices)'
 ```
 
-Expected RED: storage is not resolved at a lifecycle point with a known
+Failure rationale: storage is not resolved at a lifecycle point with a known
 SessionID, probe/live bindings do not share a bridge, and Rig cannot inspect a
 loop definition's engine until after binding.
 
@@ -496,9 +494,8 @@ on non-native engines with `process_notifications_unsupported` before calling
 `Definition.Bind` or any tool factory. `TestForeignLoopRejectsProcessServices`
 uses a recording factory and proves its call count remains zero. Legacy
 foreground-only Bash retains its existing foreign-engine behavior. Never expose
-`*sessionruntime.Session` publicly. Re-run the
-focused command. Run the standard focused non-race commit checks and commit
-these files as
+`*sessionruntime.Session` publicly. Run `gofmt` on changed Go files, inspect the
+diff, and commit without executing the queued selector. Commit these files as
 `feat(session): activate process resources after restore`.
 
 ### Task 3: Add lifetime workspace leases
@@ -533,25 +530,28 @@ canceled waiter                                  => removed and successor wakes
 double release                                   => harmless
 ```
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run 'TestWorkspaceCoordinator.*Lifetime'
 ```
 
-Expected: FAIL because lifetime operations and tree overlap do not exist.
+Failure rationale: lifetime operations and tree overlap do not exist before
+implementation.
 
 **Step 3: Implement overlap and fairness**
 
 Replace exact-path equality with component-aware ancestor/descendant overlap.
 Preserve FIFO writer preference and existing whole/checkpoint behavior. Store
-defensive copies of scope lists. Make restore stop registered resources before
-acquiring the checkpoint permit, and always resume admission on failure.
+defensive copies of scope lists. Make restore acquire the checkpoint permit
+against active lifetime leases and release that permit on every return path.
+Task 25 later owns process-admission suspension, process stop, lifetime-lease
+release, restore, and admission-resume ordering.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Expected: PASS.
+Queue the exact focused command from Step 2 for the owning phase gate; it must pass there.
 
 **Step 5: Commit**
 
@@ -719,14 +719,15 @@ Round-trip each event through the existing sealed event codec. Reject:
 - command text, output, stdin, host path, OS PID, or unbounded diagnostics;
 - diagnostics over the fixed 512-byte UTF-8 limit.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/tool ./pkg/event ./pkg/journal ./pkg/sessionstore ./internal/sessionruntime -run 'Test(Process|SessionResourceServices)'
 ```
 
-Expected: FAIL because the typed service DTOs and process events are absent.
+Failure rationale: the typed service DTOs and process events are absent before
+implementation.
 
 **Step 3: Implement event types and codec dispatch**
 
@@ -748,9 +749,9 @@ behind it; it does not replace the bridge captured by resources. Task 4's
 Harness-local fake resource integration must therefore activate with a fully
 validated service set, never the staged empty value.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Expected: PASS.
+Queue the exact focused command from Step 2 for the owning phase gate; it must pass there.
 
 **Step 5: Commit**
 
@@ -772,27 +773,28 @@ public Rig/session API with a temp resource-storage provider. It defines four
 Harness-local external-package fake `tool.Definition`s that declare
 `RequiresProcessServices`; it does not import Tools or use the future Bash and
 process definitions. Bind those fakes, verify one shared registry across
-new/restore, and exercise a lifetime scoped-write/checkpoint conflict.
-
-Verify the test exists and runs:
+new/restore, and exercise an orchestrated lifetime
+scoped-write/checkpoint-permit conflict. The test must not permanently shut down
+session resources; Task 25 owns process stop/resume ordering.
 
 Defer tagged integration discovery and execution to Phase Gate 1, where the
 exact test name must be listed before the test is run.
 
-Commit this integration file separately so its reviewed SHA is part of Phase
-Gate 1. Its tagged discovery and execution remain exclusively at the gate:
+Commit this integration file separately so its SHA is part of Phase Gate 1.
+Its tagged discovery, execution, and independent review remain exclusively at
+the gate:
 
 ```bash
 git add internal/sessionruntime/process_services_integration_test.go
 git commit -m "test(session): integrate process service contracts"
 ```
 
-Dispatch the normal task spec and quality/security reviewers over this
-integration-test commit before entering Phase Gate 1.
-
 ## PHASE GATE 1: Harness contracts
 
-Run:
+First execute every focused functional selector queued by Tasks 1–5, then run
+the complete matrix below.
+
+Run at Phase Gate 1:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
@@ -864,13 +866,13 @@ type Origin struct {
 }
 ```
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run 'Test(Handle|Owner|State|Error|Config)'
 ```
 
-Expected: FAIL because package `process` does not exist.
+Failure rationale: package `process` does not exist before implementation.
 
 **Step 3: Implement the minimum domain**
 
@@ -878,9 +880,9 @@ Use explicit string enums, unexported transition validation, defensive
 configuration normalization, and dependency injection for random bytes and
 clock in tests. Do not expose a PID field.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Expected: PASS.
+Queue the exact focused command from Step 2 for the owning phase gate; it must pass there.
 
 **Step 5: Commit**
 
@@ -931,13 +933,13 @@ Test spool invariants:
 - no path escapes the private resource directory;
 - close and removal are idempotent.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/atomicfile ./process -run 'Test(Atomic|Manifest|Spool)'
 ```
 
-Expected: FAIL because storage does not exist.
+Failure rationale: storage does not exist before implementation.
 
 **Step 3: Implement atomic persistence**
 
@@ -945,10 +947,10 @@ Use `os.OpenFile` with owner-only permissions, full-write loops, file `Sync`,
 same-directory rename, and directory sync where supported. Never write inside
 the workspace. Keep spool and manifest paths unexported.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2 once. Repeated failure-injection
-stress is deferred to Phase Gate 2's race suite.
+Queue the exact focused command from Step 2 for Phase Gate 2. Repeated
+failure-injection stress also runs only in that gate's race suite.
 
 **Step 5: Commit**
 
@@ -988,13 +990,13 @@ Cover:
 - `base64` mode returns exact raw bytes;
 - artifact descriptor is opaque and contains no path.
 
-**Step 3: Verify RED**
+**Step 3: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./internal/safetext ./process -run 'Test(Buffer|Cursor|SafeText|Render|Base64|Artifact)'
 ```
 
-Expected: FAIL.
+Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
 
 **Step 4: Implement buffer and renderer**
 
@@ -1002,9 +1004,9 @@ The rolling window serves recent reads; the spool remains authoritative. A gap
 returns the earliest retained data with `gap:true`. Cursor-ahead is a typed
 error. Base64 reads use the same owner check and byte limits as safe text.
 
-**Step 5: Verify GREEN**
+**Step 5: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 3 once. Fuzzing is deferred to Phase
+Run the exact focused command from Step 3 only at the owning phase gate. Fuzzing is deferred to Phase
 Gate 2.
 
 **Step 6: Commit**
@@ -1024,7 +1026,7 @@ git commit -m "feat(process): render cursor-safe bounded output"
 - Create: `process/supervisor_test.go`
 - Create: `process/fake_process_test.go`
 
-Execute as four reviewed microtasks:
+Execute as four implementation microtasks:
 
 - **8A — admission and quotas:** `TestSupervisorReservesQuotaBeforeStart`,
   `TestSupervisorStartFailureReleasesQuota`, and
@@ -1047,30 +1049,29 @@ Run the microtasks as follows; the broader steps below are phase acceptance,
 not a consolidated implementation assignment:
 
 - **8A:** edit `process/supervisor.go`, `process/supervisor_test.go`, and
-  `process/fake_process_test.go`; RED/GREEN command
+  `process/fake_process_test.go`; queued phase-gate selector
   `go test ./process -run '^TestSupervisor(ReservesQuotaBeforeStart|StartFailureReleasesQuota|RejectsSessionAndLoopQuota)$'`;
-  RED is missing admission/quota reservation. Implement reservation and rollback
+  Failure rationale: admission/quota reservation is missing. Implement reservation and rollback
   around consumption of the caller-supplied `PreparedProcess` only, and commit
   `feat(process): reserve supervisor admission`.
 - **8B:** edit `process/entry.go`, `process/entry_test.go`,
-  `process/supervisor.go`, and `process/supervisor_test.go`; RED/GREEN command
+  `process/supervisor.go`, and `process/supervisor_test.go`; queued phase-gate selector
   `go test ./process -run '^TestSupervisor(PersistsBeforeReturningHandle|DrainsOrderedStreams|OutputLimitStopsProcess)$'`;
-  RED is missing durable handoff/drain. Implement manifest-before-handoff and
+  Failure rationale: durable handoff/drain is missing. Implement manifest-before-handoff and
   bounded stream ownership only, and commit
   `feat(process): persist and drain supervised processes`.
 - **8C:** edit `process/entry.go`, `process/entry_test.go`,
-  `process/supervisor.go`, and `process/supervisor_test.go`; RED/GREEN command
+  `process/supervisor.go`, and `process/supervisor_test.go`; queued phase-gate selector
   `go test ./process -run '^TestSupervisor(TerminalRaceChoosesOnce|PublishesStableLifecycleIDs|ReleasesLeaseOnce)$'`;
-  RED is missing one-shot terminal arbitration. Implement only the CAS
-  terminal path and pre-persisted IDs, verify with the focused command, and
+  Failure rationale: one-shot terminal arbitration is missing. Implement only the CAS
+  terminal path and pre-persisted IDs, queue the focused selector for the owning phase gate, and
   commit `feat(process): arbitrate terminal lifecycle`.
 - **8D:** edit `process/entry.go`, `process/entry_test.go`,
-  `process/supervisor.go`, and `process/supervisor_test.go`; RED/GREEN command
+  `process/supervisor.go`, and `process/supervisor_test.go`; queued phase-gate selector
   `go test ./process -run '^TestSupervisor(NeverEvictsRunning|EvictsCompletedLRU|InvalidatesObservations|ShutdownRejectsAdmission)$'`;
-  RED is missing retention/activity/admission-close behavior. Implement
+  Failure rationale: retention/activity/admission-close behavior is missing. Implement
   deterministic terminal LRU, spawn/activity/end invalidation, activity-channel
-  drain/closure handling, and admission close only; verify with the focused
-  command and commit
+  drain/closure handling, and admission close only; inspect the diff and commit
   `feat(process): retain entries and invalidate observations`.
 
 **Task 8 combined acceptance**
@@ -1100,7 +1101,7 @@ storage, notification, quota, and retention dependencies only. Test:
 - terminal entries use deterministic LRU retention;
 - shutting down rejects admission and input.
 
-After 8A–8D are individually committed and reviewed, defer their combined race
+After 8A–8D are individually committed, defer their combined race
 suite to Phase Gate 2. `Start` must accept the bound owner, origin,
 `PreparedProcess`, workspace lease, lifecycle sink, observation capability,
 storage ceiling, and initial yield settings. It reserves supervisor quotas
@@ -1121,7 +1122,7 @@ terminalization is idempotent.
 - Modify: `process/supervisor.go`
 - Modify: `process/entry.go`
 
-Execute as four reviewed microtasks:
+Execute as four implementation microtasks:
 
 - **9A — poll/any/all waiters:** exact tests
   `TestWaitPollReturnsImmediately`, `TestWaitAnyWakesOnAppend`,
@@ -1142,30 +1143,30 @@ Execute as four reviewed microtasks:
 Execute independently:
 
 - **9A:** create `process/wait.go` and `process/wait_test.go`, modifying
-  `process/supervisor.go` only as needed. RED/GREEN command:
+  `process/supervisor.go` only as needed. queued phase-gate selector:
   `go test ./process -run '^TestWait(PollReturnsImmediately|AnyWakesOnAppend|AllRequiresEveryEntry|CancelRemovesWaiter)$'`.
-  RED is the absent waiter API. Implement generation-based waiter fan-out and
-  quota only, verify with the focused command, and commit
+  Failure rationale: the absent waiter API. Implement generation-based waiter fan-out and
+  quota only, queue the focused selector for the owning phase gate, and commit
   `feat(process): wait on process generations`.
 - **9B:** create `process/restore.go`, `process/restore_test.go`, and
   `process/supervisor_integration_test.go`, modifying `process/entry.go` and
-  `process/supervisor.go` only as needed. RED command:
+  `process/supervisor.go` only as needed. Queued phase-gate selector:
   `go test ./process -run '^TestRestore(CompletedOutput|RunningBecomesLost|NeverSignalsPersistedPID|PublicationCrashRetriesStableID)$'`.
-  RED is absent reconciliation. Implement reopen/lost reconciliation and stable
+  Failure rationale: absent reconciliation. Implement reopen/lost reconciliation and stable
   publication retries without live PID use. Defer the tagged
   `TestSupervisorIntegrationPersistRestore` execution to Phase Gate 2, then
   commit `feat(process): restore supervised process state`.
 - **9C:** create `process/shutdown_test.go`, modifying
-  `process/supervisor.go` and `process/entry.go`. RED/GREEN command:
+  `process/supervisor.go` and `process/entry.go`. queued phase-gate selector:
   `go test ./process -run '^TestShutdown(ClosesAdmissionBeforeStop|EscalatesAndConfirmsTrees|ConcurrentCallersShareResult|TeardownFailureRetainsAuthority)$'`.
-  RED is absent coordinated shutdown. Implement close-admission,
+  Failure rationale: absent coordinated shutdown. Implement close-admission,
   terminate/escalate/confirm, shared result, and retained cleanup authority
-  only; verify with the focused command, and commit
+  only; queue the focused selector for the owning phase gate, and commit
   `feat(process): shut down process trees`.
 - **9D:** modify only `process/supervisor_integration_test.go`. Add
   `TestSupervisorIntegrationShutdownAndRestore` with
   focused default-tag seam tests after 9C. Tagged execution is deferred to
-  Phase Gate 2; an actual gate failure starts a focused nested RED/GREEN fix.
+  Phase Gate 2; an actual gate failure starts a focused nested phase-gate fix.
   Commit
   `test(process): integrate shutdown and restore`.
 
@@ -1195,7 +1196,7 @@ Test:
 - notification backpressure cannot block terminalization;
 - teardown failure retains authority and reports `teardown_failed`.
 
-After 9A–9D are individually committed and reviewed, defer the combined
+After 9A–9D are individually committed, defer the combined
 wait/restore/shutdown race suite to Phase Gate 2. Restore creates no live runner.
 Publication retries always reuse IDs already in the manifest; the durable
 Harness journal index and restored loop projection implemented in Task 24 are
@@ -1213,7 +1214,10 @@ Phase Gate 2 must list both exact integration test names before executing them.
 
 ## PHASE GATE 2: Tools supervisor core
 
-Run:
+First execute every focused functional selector queued by Tasks 6–9, then run
+the complete matrix below.
+
+Run at Phase Gate 2:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
@@ -1320,21 +1324,21 @@ Test:
 - an optional typed `Activities()` stream reports workspace activity and closes
   before `Wait` returns; invalid activity is reported conservatively as broad.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
-Use the exact focused RED/GREEN command specified for each microtask below.
-Expected: each command fails for its stated missing behavior before production
-code is added.
+Use the exact focused queued phase-gate selector specified for each microtask
+below. Each covers behavior missing before production code is added and must
+pass at Phase Gate 3.
 
 **Step 3: Refactor shared preparation and implement start**
 
-Execute as three reviewed microtasks:
+Execute as three implementation microtasks:
 
 - **10A — public types and pipe streams:** `PrepareProcess` returns a
-  single-use prepared handle; RED tests are
+  single-use prepared handle; Queued phase-gate tests are
   `TestPrepareProcessDoesNotSpawn`, `TestPreparedProcessStartOnce`,
   `TestPreparedProcessCloseBeforeStart`, and `TestProcessStreamsBeforeExit`.
-- **10B — start/handoff contexts:** RED tests are
+- **10B — start/handoff contexts:** Queued phase-gate tests are
   `TestPrepareCancellationPreventsHandoff`,
   `TestStartCancellationPreventsHandoff`, and
   `TestCallerCancellationAfterHandoffDoesNotKill`.
@@ -1351,25 +1355,25 @@ Execute independently:
 
 - **10A:** create `internal/exec/process.go`,
   `internal/exec/process_errors.go`, and `internal/exec/process_test.go`, plus
-  the public facade declarations in `sandbox.go`/`facade_test.go`. RED/GREEN:
+  the public facade declarations in `sandbox.go`/`facade_test.go`. Queued phase-gate selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^Test(PrepareProcessDoesNotSpawn|PreparedProcess(StartOnce|CloseBeforeStart)|ProcessStreamsBeforeExit)$'`.
-  RED is missing API. Implement public types, immutable effective access, pipe
+  Failure rationale: missing API. Implement public types, immutable effective access, pipe
   streams, cached wait, and optional bounded activity-stream lifecycle only;
   commit `feat: define prepared pipe processes`.
 - **10B:** modify `internal/exec/process.go`,
   `internal/exec/process_test.go`, and
-  `internal/exec/executor_lifecycle.go`. RED/GREEN:
+  `internal/exec/executor_lifecycle.go`. Queued phase-gate selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^Test(PrepareCancellationPreventsHandoff|StartCancellationPreventsHandoff|CallerCancellationAfterHandoffDoesNotKill)$'`.
-  RED is incorrect context ownership. Implement setup-versus-lifetime context
-  transfer only; verify with the focused command and commit
+  Failure rationale: incorrect context ownership. Implement setup-versus-lifetime context
+  transfer only; queue the focused selector for the owning phase gate and commit
   `feat: detach process lifetime after handoff`.
 - **10C:** modify `internal/exec/executor.go`,
   `internal/exec/executor_lifecycle.go`, and characterization tests only.
   This is the explicit characterization/refactor exception: exact legacy
-  RunCommand, RunArgv, and granted-result tests must be GREEN before and after
-  the pure internal refactor. Do not claim a manufactured RED. Run
+  RunCommand, RunArgv, and granted-result tests must pass at the phase gate after
+  the pure internal refactor. Do not claim a manufactured failure. Queue
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run 'Test(RunCommand|RunArgv|Granted|ExecutorConformance)'`.
   Implement sync prepare/start/drain/wait adaptation only and commit
@@ -1417,7 +1421,7 @@ Execute independently:
   release and `active.Done` do not occur before exact proof, occur exactly once
   after direct or quarantined proof, and `Spec.Release` is neither early nor
   permanently blocked.
-  RED/GREEN selector:
+  queued phase-gate selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/windows ./internal/exec -run
   '^Test(ElevatedAsyncExecution.*|ElevatedRunner.*(Job|Release|Quarantine))$'`.
@@ -1425,7 +1429,7 @@ Execute independently:
 
 **Task 10 combined acceptance**
 
-After 10A–10D are individually committed and reviewed, defer their combined
+After 10A–10D are individually committed, defer their combined
 race/conformance suite to Phase Gate 3.
 
 ### Task 11: Retain grants and enforcement resources across two-phase start
@@ -1475,15 +1479,14 @@ Test:
   normal and delayed cleanup, aggregates release errors once, and never returns
   while authority can still be released by an untracked goroutine.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run 'Test(ProcessLifecycle|AsyncGrant|GrantPath|ExecutorProxy|ExecutorSet)'
 ```
 
-Expected: retained grant/path/route resource lifetime tests fail because the
-first pipe implementation does not yet transfer every enforcement resource
-through terminal cleanup.
+Failure rationale: the first pipe implementation does not yet transfer every
+retained grant/path/route enforcement resource through terminal cleanup.
 
 **Step 3: Implement retained two-phase ownership**
 
@@ -1509,9 +1512,9 @@ platform-neutral process-level capsule that can retain a Windows Job execution
 or Linux cgroup lifetime handle. Extend the existing `ExecutorSet.Close` tests
 to cover live prepared and started handles.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Expected: PASS.
+Queue the exact focused command from Step 2 for the owning phase gate; it must pass there.
 
 **Step 5: Commit**
 
@@ -1544,7 +1547,7 @@ git commit -m "fix: retain async enforcement through process exit"
 - Modify: `../sandbox/internal/windows/elevated_execution_bridge_windows.go`
 - Modify: `../sandbox/internal/windows/elevated_runner_launcher_windows.go`
 
-Execute as four reviewed microtasks:
+Execute as four implementation microtasks:
 
 - **12A — signal state machine:** interrupt, terminate/grace/escalate, kill,
   idempotence, and natural-exit races with a fake process tree.
@@ -1563,10 +1566,10 @@ Execute independently:
 
 - **12A:** files `internal/exec/process.go`,
   `internal/exec/process_tree_signal_test.go`, and platform-neutral fake-tree
-  helpers. RED/GREEN command:
+  helpers. queued phase-gate selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^TestProcessSignal'`. Implement only the signal/terminal
-  state machine; rerun the focused non-race command; commit
+  state machine; queue the focused selector for the owning phase gate; commit
   `feat: control process signals`.
 - **12B:** files `internal/exec/process_tree_unix.go`,
   `internal/exec/lifetime_unix.go`,
@@ -1576,7 +1579,7 @@ Execute independently:
   `internal/linux/backend.go`, `internal/linux/cgroup.go`,
   `internal/linux/cgroup_test.go`, `internal/linux/init.go`, and
   `init_linux.go`.
-  RED/GREEN:
+  Queued phase-gate selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec ./internal/linux -run
   '^Test(ProcessTreeLinuxContainmentPlan|CgroupLifetime(KillAndWait|ReadFailureIndeterminate|RetainsOnUnprovedEmpty))$'`.
@@ -1608,7 +1611,7 @@ Execute independently:
   `feat: contain Unix process descendants`.
 - **12C:** files `internal/exec/lifetime_unix.go`,
   `internal/exec/process_parent_death_integration_unix_test.go`, and
-  `init_other.go`. RED/GREEN:
+  `init_other.go`. Queued phase-gate selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^TestDarwinLifetimeCapabilityFailsClosed$'`. Phase Gate
   3 runs `TestIntegrationProcessTreeDarwinSetsidFailsClosed` on the approved
@@ -1622,7 +1625,7 @@ Execute independently:
   `internal/windows/elevated_execution_bridge_windows.go`,
   `internal/windows/elevated_runner_launcher_windows.go`, and
   `internal/exec/process_tree_windows_test.go`. A focused non-race Windows
-  RED/GREEN command is `GOWORK=off
+  queued phase-gate selector is `GOWORK=off
   GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run
   '^TestProcessTreeWindows(JobBeforeResume|JobEmptyOnClose)$'`. Phase Gate 3
   records discovery and full race coverage. Before changing behavior,
@@ -1658,7 +1661,7 @@ successful Darwin async lifecycle test.
 On Windows, assert the target and helper join the kill-on-close Job before resume
 and that close empties the Job.
 
-After 12A–12D are individually committed and reviewed, defer whole-tree
+After 12A–12D are individually committed, defer whole-tree
 race/integration verification to Phase Gate 3. Unix uses a lifetime shim plus proven containment; Darwin
 fails closed when that proof is unavailable; Windows uses the reviewed Job
 path. `Pdeathsig` alone is insufficient.
@@ -1690,7 +1693,7 @@ before spawn because lifetime containment is unavailable. On applicable success
 platforms, verify output streaming, stdin, timeout, all stop modes,
 grandchildren, grant denial, executor close, and no resource leaks.
 
-**Step 2: Verify CI RED**
+**Step 2: Queue CI phase-gate coverage**
 
 Create `scripts/test-async-ci-workflow.sh`. It parses
 `.github/workflows/ci.yml` and extends the existing platform jobs rather than
@@ -1699,15 +1702,15 @@ requiring invented replacement job keys. Require async selectors in
 in `test-macos`, and live restricted/elevated Job selectors in
 `windows-restricted` and `windows-elevated`. Require the integration tag, race
 mode, exact applicable `TestIntegrationProcess` selectors, and Windows runtime
-invocation. Run:
+invocation. Queue:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
 sh scripts/test-async-ci-workflow.sh
 ```
 
-Expected: FAIL because those commands are absent from the existing jobs. The
-script must not make
+Failure rationale: those commands are absent from the existing jobs. The script
+must not make
 a network call or silently accept missing YAML.
 
 **Step 3: Add fixtures/CI targets without weakening checks**
@@ -1722,11 +1725,10 @@ worker labels, artifacts, skip guards, and residue cleanup while appending the
 new selectors.
 Add a `test-async-ci` Makefile target that invokes the same guard.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused workflow-guard command from Step 2. Expected: PASS and
-the Windows workflow contains a live runtime job. Repository tests, builds, and
-live tagged execution are deferred to Phase Gate 3.
+Run the exact focused workflow-guard command from Step 2 only at Phase Gate 3.
+It must pass there and the Windows workflow must contain a live runtime job.
 
 **Step 5: Commit**
 
@@ -1737,7 +1739,10 @@ git commit -m "test: cover async sandbox processes end to end"
 
 ## PHASE GATE 3: Sandbox pipe execution
 
-Run:
+First execute every focused functional selector queued by Tasks 10–13, then run
+the complete matrix below.
+
+Run at Phase Gate 3:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
@@ -1797,13 +1802,14 @@ Validate ranges, `timeout:0` rules, explicit-supervision detection, and
 conservative detached syntax only for supervised calls. The prepared artifact
 must retain all normalized settings; mutating raw JSON later changes nothing.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash -run 'TestBash(Schema|Supervision|Legacy|Prepared)'
 ```
 
-Expected: new field tests fail; legacy tests pass.
+The queued tests cover absent new fields and preservation of legacy behavior;
+all must pass at Phase Gate 4.
 
 **Step 3: Implement parsing only**
 
@@ -1812,9 +1818,9 @@ runner resolver, supervisor factory dependency, or Harness binding: it only
 normalizes and freezes the new model-facing arguments. Do not route to the
 supervisor yet.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Bash race coverage is deferred to
+Run the exact focused command from Step 2 only at the owning phase gate. Bash race coverage is deferred to
 Phase Gate 4.
 
 **Step 5: Commit**
@@ -1861,13 +1867,13 @@ Test:
 - invocation cancellation after returned handle does not kill;
 - no JSON contains host path or OS PID.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash -run 'TestSupervisedBash'
 ```
 
-Expected: FAIL because supervisor routing is absent.
+Failure rationale: supervisor routing is absent before implementation.
 
 **Step 3: Implement minimal routing**
 
@@ -1884,9 +1890,9 @@ caller options once and accepts a validated concrete
 the LoopID resolver. Never add a Runner field to `tool.ProcessBinding` or a
 runner parameter to the supervisor factory.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Expected: PASS.
+Queue the exact focused command from Step 2 for the owning phase gate; it must pass there.
 
 **Step 5: Commit**
 
@@ -1909,22 +1915,22 @@ limit, wait mode, wait timeout, and `safe_text|base64` encoding. Test poll,
 wait-any, wait-all, input-order preservation, gap, cursor-ahead, terminal
 metadata, opaque artifact, owner isolation, and metadata-safe errors.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run 'TestProcessOutput'
 ```
 
-Expected: FAIL.
+Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
 
 **Step 3: Implement the tool**
 
 Implement `Info`, `PrepareCall` with an empty effect request and sealed prepared
 artifact, `InvokableRun`, and stable JSON rendering. Never return a spool path.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Run the focused non-race test once. Stress repetition is deferred to Phase Gate
+Run the focused non-race test only at the owning phase gate. Stress repetition is deferred to Phase Gate
 4's full race suite.
 
 **Step 5: Commit**
@@ -1948,13 +1954,13 @@ pipe EOF, PTY EOF forwarding, resize validation, resize rejection for pipes,
 optional cursor, omitted-cursor snapshot at pre-write end, optional yield,
 closed input, terminal process, and cross-owner `not_found`.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run 'TestProcessInput'
 ```
 
-Expected: FAIL.
+Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
 
 **Step 3: Implement serialized bounded input**
 
@@ -1962,14 +1968,14 @@ Serialize input per entry. Bound queued bytes and write duration. Apply resize
 only through PTY-capable process. Return a cursor-aware snapshot after optional
 yield.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
 ```bash
 git add process/input_tool.go process/input_tool_test.go
 git commit -m "feat(process): support supervised process input"
 ```
 
-Before committing, re-run the exact focused command from Step 2.
+Inspect the diff and commit without executing tests. Queue the exact focused command from Step 2 for the owning phase gate.
 
 ### Task 18: Implement ProcessStop
 
@@ -1984,13 +1990,13 @@ Test interrupt, terminate with grace then escalation, immediate kill, invalid
 mode/grace, terminal idempotence, natural-exit race, timeout race, confirmed
 tree exit, teardown failure, lifecycle event request, and owner isolation.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./process -run 'TestProcessStop'
 ```
 
-Expected: FAIL.
+Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
 
 **Step 3: Implement stop orchestration**
 
@@ -1998,14 +2004,14 @@ Interrupt does not choose a terminal state unless wait reports exit. Terminate
 escalates once. Kill and terminal stops are idempotent. Do not report success
 before runner confirmation.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
 ```bash
 git add process/stop_tool.go process/stop_tool_test.go
 git commit -m "feat(process): stop supervised process trees"
 ```
 
-Before committing, re-run the exact focused command from Step 2.
+Inspect the diff and commit without executing tests. Queue the exact focused command from Step 2 for the owning phase gate.
 
 ### Task 19: Export four independently selectable definitions
 
@@ -2045,13 +2051,13 @@ context. Test the exact LoopID, zero factory calls after resolver failure,
 runner-free companion construction, unchanged legacy Bash, single option
 resolution, and concurrent Build safety.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test . ./process -run 'Test.*Definition'
 ```
 
-Expected: FAIL because companion definitions are absent.
+Failure rationale: companion definitions are absent before implementation.
 
 **Step 3: Implement root facade and boundary rule**
 
@@ -2063,14 +2069,14 @@ only inside Build after Harness validates bindings. Keep all three companion
 constructors argument-free and the supervisor factory runner-free. Do not add a
 Harness Rig/lifecycle runner option, runner provider, or ProcessBinding field.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
 ```bash
 git add definitions.go definitions_test.go dependency_test.go process/definitions_test.go
 git commit -m "feat: export supervised process tools"
 ```
 
-Before committing, re-run the exact focused command from Step 2.
+Inspect the diff and commit without executing tests. Queue the exact focused command from Step 2 for the owning phase gate.
 
 ### Task 20: Add Tools workflow integration tests
 
@@ -2101,24 +2107,24 @@ Both files begin with:
 They define exact tests `TestIntegrationBashSupervisedWorkflow` and
 `TestIntegrationProcessToolsRestore`.
 
-**Step 2: Verify selection and acceptance**
+**Step 2: Queue selection and acceptance coverage**
 
 Defer tagged test discovery and execution to Phase Gate 4, which must list both
-exact names before running them. During the task, use this one focused
-default-tag seam command:
+exact names before running them. Queue this focused default-tag seam command for
+that gate:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash ./process -run 'Test(SupervisedBash|Process(Output|Input|Stop))'
 ```
 
-An actual gate failure starts a focused RED/GREEN fix in the owning
+An actual gate failure starts a focused phase-gate fix in the owning
 task/repository before the gate is rerun.
 
 **Step 3: Complete only integration seams**
 
 Do not import Sandbox into Tools. Keep the integration runner in `_test.go`.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
 ```bash
 git commit -m "test: exercise supervised tool workflows"
@@ -2126,7 +2132,10 @@ git commit -m "test: exercise supervised tool workflows"
 
 ## PHASE GATE 4: Model-facing tools
 
-Run:
+First execute every focused functional selector queued by Tasks 14–20, then run
+the complete matrix below.
+
+Run at Phase Gate 4:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
@@ -2182,18 +2191,19 @@ before PTY allocation or child spawn. Do not treat the `_unix.go` build
 selection as evidence that Darwin can provide supervised process-tree
 containment.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run 'TestProcessPTY'
 ```
 
-Expected: FAIL with `pty_unavailable` or missing implementation.
+Failure rationale: PTY support is unavailable or unimplemented before this
+change.
 
 **Step 3: Add the dependency and implement**
 
-Run:
+Queue for the owning phase gate:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go get github.com/creack/pty@v1.1.24
@@ -2203,9 +2213,9 @@ Use `pty.Open`, attach the slave before the existing configure/start
 linearization, and retain both terminal endpoints through process cleanup. Do
 not use `pty.Start`, which would bypass the enforcement ownership point.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Tagged integration is deferred to
+Run the exact focused command from Step 2 only at the owning phase gate. Tagged integration is deferred to
 Phase Gate 5.
 
 **Step 5: Commit**
@@ -2234,15 +2244,15 @@ git commit -m "feat: support supervised Unix PTYs"
 Build on the merged Windows restricted/elevated broker and Job Object path.
 ConPTY must not create an unconfined side path.
 
-Execute as three reviewed microtasks:
+Execute as three implementation microtasks:
 
 - **22A — platform-independent ConPTY launch plan:** extract an immutable launch
   plan describing pipes, pseudo-console attribute, suspended creation, Job
-  assignment, broker token/desktop, and resume order. RED test:
+  assignment, broker token/desktop, and resume order. Queued phase-gate test:
   `TestConPTYLaunchPlanOrdersJobBeforeResume`. This fails locally before any
   Windows production code.
 - **22B — Windows pseudo-console process:** implement create/input/output/resize
-  and exact cleanup. RED must be observed on a live Windows worker for
+  and exact cleanup. The failure rationale must be covered on a live Windows worker for
   `TestProcessConPTYInteractive`.
 - **22C — restricted/elevated broker and CI:** prove the same path preserves
   restricted/elevated security and Job ownership with
@@ -2252,15 +2262,16 @@ Execute as three reviewed microtasks:
 Execute independently:
 
 - **22A:** create `internal/exec/conpty_launch_plan.go` and
-  `internal/exec/conpty_launch_plan_test.go` with no Windows build tag. RED:
+  `internal/exec/conpty_launch_plan_test.go` with no Windows build tag. Queued
+  Phase Gate 5 selector:
   `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test
   ./internal/exec -run '^TestConPTYLaunchPlanOrdersJobBeforeResume$'`.
-  Expected failure is the absent plan/ordering. Implement the immutable
-  platform-neutral plan only, re-run the exact command, and commit
+  Failure rationale is the absent plan/ordering. Implement the immutable
+  platform-neutral plan only, inspect the diff, and commit
   `feat: specify ConPTY launch ordering`.
 - **22B:** create `internal/exec/terminal_windows.go` and
   `internal/exec/process_conpty_windows_test.go`, modifying the listed Windows
-  implementation files. A live Windows RED/GREEN run executes
+  implementation files. A live Windows phase-gate run executes
   `go test ./internal/exec -run
   '^TestProcessConPTYInteractive$'`. Implement pseudo-console
   create/input/output/resize/cleanup only and commit
@@ -2269,7 +2280,7 @@ Execute independently:
   `internal/exec/process_conpty_integration_windows_test.go` with
   `//go:build integration`, modify the broker adapters and CI workflow, and
   use `go test ./internal/exec -run '^TestConPTYBrokerJobPlan$'` as the single
-  focused default-tag RED/GREEN command. Tagged discovery and execution
+  focused default-tag queued phase-gate selector. Tagged discovery and execution
   of the restricted and elevated cases are deferred to Phase Gate 5. Implement
   broker/Job preservation and CI wiring only; commit
   `test: prove confined ConPTY execution`.
@@ -2290,7 +2301,7 @@ On Windows test:
 
 Add compile-only non-Windows tests for facade availability and typed errors.
 
-After 22A–22C are individually committed and reviewed, defer their combined
+After 22A–22C are individually committed, defer their combined
 launch-order, pseudo-console, broker, Job, and enforcement verification to
 Phase Gate 5.
 
@@ -2312,23 +2323,22 @@ stream, resize, EOF, input yield, and interrupt-not-terminal-until-exit.
 `process/pty_integration_test.go` begins with `//go:build integration`.
 It defines the exact live test `TestIntegrationProcessPTYToolWorkflow`.
 
-**Step 2: Verify selection and acceptance**
+**Step 2: Queue selection and acceptance coverage**
 
 Defer tagged discovery and execution to Phase Gate 5, which must list the exact
-test before running it. During the task, use this focused default-tag RED/GREEN
-command:
+test before running it. Queue this focused default-tag selector:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test ./bash ./process -run 'Test.*(TTY|PTY|Resize|EOF|Interrupt)'
 ```
 
-Any gate failure starts a focused RED/GREEN fix in the owning task/repository.
+Any gate failure starts a focused phase-gate fix in the owning task/repository.
 
 **Step 3: Implement only missing contract handling**
 
 Do not import the PTY library into Tools.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
 ```bash
 git commit -m "test: verify interactive process tools"
@@ -2336,7 +2346,10 @@ git commit -m "test: verify interactive process tools"
 
 ## PHASE GATE 5: Interactive terminals
 
-Run:
+First execute every focused functional selector queued by Tasks 21–23, then run
+the complete matrix below.
+
+Run at Phase Gate 5:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
@@ -2407,7 +2420,7 @@ of silent fallback.
 - Modify: `../harness/internal/sessionruntime/restore_constructor.go`
 - Create: `../harness/internal/sessionruntime/process_notification_test.go`
 
-Execute as three separate reviewed microtasks.
+Execute as three separate implementation microtasks.
 
 **24A — backend-neutral durable journal idempotency**
 
@@ -2430,17 +2443,17 @@ full durable ledger before the opening fence and update it under the append
 lock, but always append the ownership fence through the raw path so a repeated
 lease epoch still advances fencing. Preserve envelope IDs through replay,
 verify outer blob-pointer ID equals resolved inner ID, and reject mismatches.
-RED:
+Queued phase-gate selector:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/journal ./pkg/sessionstore -run 'Test(SessionJournal(ConcurrentIdenticalIDAppendsOnce|ReopenDeduplicatesEventAndCommand|IdempotencyCollisionFails|OffloadedRecordHydratesIdempotencyIndex)|JournalAppenderDoesNotRepublishDuplicate)'
 ```
 
-Expected: duplicate IDs append multiple frames. Implement only journal result,
+Failure rationale: duplicate IDs append multiple frames. Implement only journal result,
 fingerprinting/collision, ID-preserving index hydration, raw opening fences, and
 appender duplicate reporting.
-Re-run the focused command, and commit
+Inspect the diff and commit; run the focused command only at the owning phase gate.
 `feat(journal): deduplicate durable record retries`. Task 28 repeats the reopen
 proof through Coderig's real fsstore composition.
 
@@ -2454,7 +2467,7 @@ journal/Hub appender wiring in `pkg/hub/deps.go`, `pkg/hub/hub.go`, and
 append failure faulting, coordinates, owner validation, pre-persisted non-zero
 EventIDs, and no Hub apply/broadcast when 24A returns `Appended=false`. Preserve
 the old appender surface through an optional result-bearing extension; the nop
-appender reports `Appended=true`. RED/GREEN:
+appender reports `Appended=true`. Queued phase-gate selector:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run '^TestProcessLifecycle'
@@ -2467,7 +2480,7 @@ ProcessCreatedAt/ProcessStartedAt/ProcessFinishedAt values, preserve them
 byte-for-byte in the event payload, add only Harness envelope metadata not
 present in the DTO, and never replace the Tools EventID. Durably append and
 publish live only on a new append.
-Run the focused non-race commit checks and commit
+Inspect the diff and commit; queue the focused selector for the owning phase gate
 `feat(session): publish process lifecycle metadata`.
 
 **24C — metadata-only notification and restored live dedupe**
@@ -2513,7 +2526,7 @@ notification payload carries session/loop coordinates; append validates them
 against the enclosing live `CommandRecord` route. Add a transient result channel
 reporting accepted, duplicate, collision, retryable-full, or stopped. Command
 append failure remains explicit for this process-notification path; existing
-audit-only commands keep their established behavior. RED/GREEN:
+audit-only commands keep their established behavior. Queued phase-gate selector:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/command ./internal/loopruntime ./internal/sessionruntime -run 'Test(ProcessNotification|ForeignLoopRejectsProcessNotification)'
@@ -2527,7 +2540,7 @@ after an enduring loop causality event commits. Attach this implementation
 behind Task 4's stable completion-notifier bridge rather than rebinding captured
 resources. Foreign engines reject process notifications; they do not silently
 drop them.
-Verify with the focused non-race command, and commit
+Queue the focused non-race selector for the owning phase gate, and commit
 `feat(session): deliver idempotent process notifications`.
 
 **Phase acceptance behavior**
@@ -2582,22 +2595,22 @@ Test:
 - completion/lost durable marker follows checked publication;
 - duplicate restore does not notify twice.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./internal/sessionruntime -run 'Test.*(ProcessShutdown|ProcessRestore|WorkspaceRestore.*Process|ConstructionAbort.*Resource)'
 ```
 
-Expected: FAIL.
+Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
 
 **Step 3: Implement lifecycle ordering**
 
 Add a `session_resources` cleanup phase with bounded timeout reporting. Preserve
 existing checkpoint/hustle cleanup semantics.
 
-**Step 4: Verify GREEN**
+**Step 4: Defer execution to the phase gate**
 
-Re-run the exact focused command from Step 2. Broader and tagged verification
+Run the exact focused command from Step 2 only at the owning phase gate. Broader and tagged verification
 is deferred to Phase Gate 6.
 
 **Step 5: Commit**
@@ -2618,19 +2631,19 @@ git commit -m "feat(session): manage supervised process lifecycle"
 - Create: `../coderig/internal/app/process_adapter.go`
 - Create: `../coderig/internal/app/process_adapter_test.go`
 
-Execute as two reviewed microtasks:
+Execute as two implementation microtasks:
 
 - **26A — resource storage composition:** persisted sessions map to
   `<data-dir>/resources/<session-id>` with a stable provider identity threaded
   through the Rig option; headless sessions receive an isolated process-owned
   temporary base whose SessionID subdirectory is stable for same-process
   reconstruction and is discarded only when Coderig exits.
-  RED tests are `TestProcessResourceRootOutsideWorkspace`,
+  Queued phase-gate tests are `TestProcessResourceRootOutsideWorkspace`,
   `TestProcessResourceRootStableAcrossRestore`,
   `TestProcessResourceRootIdentityMismatchFailsRestore`, and
   `TestHeadlessProcessResourceRootsAreIsolated`, plus
   `TestHeadlessProcessResourceRootStableForSameProcessRestore`. Its single
-  RED/GREEN command is `GOWORK=off
+  queued phase-gate selector is `GOWORK=off
   GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test
   ./internal/app -run 'Test(ProcessResourceRoot|HeadlessProcessResourceRoot)'`.
 - **26B — async adapter:** implement only the two-phase Sandbox-to-Harness type
@@ -2658,14 +2671,14 @@ Test:
 - no Harness `ProcessBinding`, Rig option, lifecycle option, or provider is used
   to transport the adapter.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'TestProcessAdapter'
 ```
 
-Expected: FAIL.
+Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
 
 **Step 3: Implement the mechanical adapter**
 
@@ -2679,14 +2692,14 @@ Harness Bind supplies the LoopID. Task 27 passes the resolver only to the role's
 Bash definition. Do not register it with Harness lifecycle, place it in
 `tool.ProcessBinding`, or add it to the supervisor/companion constructors.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
 ```bash
 git add internal/app/process_adapter.go internal/app/process_adapter_test.go internal/app/toolsets.go
 git commit -m "feat: adapt sandbox async processes"
 ```
 
-Before committing, re-run the exact focused command from Step 2.
+Inspect the diff and commit without executing tests. Queue the exact focused command from Step 2 for the owning phase gate.
 
 ### Task 27: Install the four process definitions in Coderig
 
@@ -2714,13 +2727,13 @@ by Harness binding before the factory/resolver is called. Verify Coderig does
 not install the process-enabled roster on a foreign-engine loop and reports
 `process_notifications_unsupported` for an attempted explicit bind.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'TestProcessTools|Test.*ToolDefinitions'
 ```
 
-Expected: FAIL.
+Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
 
 **Step 3: Wire definitions**
 
@@ -2737,14 +2750,14 @@ still supplies execution ID and grants at invocation. Do not introduce a
 Harness runner provider, Rig/lifecycle option, supervisor runner, or companion
 runner.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
 ```bash
 git add internal/app/toolsets.go internal/app/access_acceptance_test.go internal/app/process_tools_test.go
 git commit -m "feat: install supervised process tools"
 ```
 
-Before committing, re-run the exact focused command from Step 2.
+Inspect the diff and commit without executing tests. Queue the exact focused command from Step 2 for the owning phase gate.
 
 ### Task 28: Add full Coderig integration tests
 
@@ -2804,11 +2817,11 @@ Defer tagged discovery and execution to Phase Gate 6. Its list output must
 include workflow, restore, and
 `TestIntegrationProcessJournalIdempotencyReopen`. The newly added tests may
 already pass as acceptance evidence. An actual failure starts the focused
-nested RED/GREEN cycle below. The reopen test may script inference, but it must
+nested implementation cycle below. The reopen test may script inference, but it must
 use the real fsstore, sessionstore journal/replayer, Rig, Tools, and Sandbox
 boundaries.
 
-Use this single focused default-tag composition command during the task:
+Use this single focused default-tag composition command for the owning phase gate:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'Test(ProcessAdapter|ProcessTools)'
@@ -2819,7 +2832,7 @@ GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go
 For every defect, first add the smallest focused failing unit test in the owning
 repository, fix it there, review it, then rerun this integration suite.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
 ```bash
 git commit -m "test: exercise supervised commands end to end"
@@ -2827,7 +2840,10 @@ git commit -m "test: exercise supervised commands end to end"
 
 ## PHASE GATE 6: Session and production composition
 
-Run:
+First execute every focused functional selector queued by Tasks 24–28, then run
+the complete matrix below.
+
+Run at Phase Gate 6:
 
 ```bash
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/harness
@@ -2870,7 +2886,7 @@ and absence of cross-loop authority.
 - Create: `../harness/internal/sessionruntime/process_security_integration_test.go`
 - Create: `../coderig/internal/app/process_security_integration_test.go`
 
-This heading is four separate reviewed microtasks, never one cross-repository
+This heading is four separate implementation microtasks, never one cross-repository
 implementation assignment:
 
 - **29A — Tools parser/storage security:** named tests
@@ -2892,25 +2908,25 @@ implementation assignment:
 
 Execute each microtask with separate evidence:
 
-- **29A:** from the Tools worktree, RED/GREEN is
+- **29A:** from the Tools worktree, queued phase-gate selector is
   `GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache
   GOFLAGS=-mod=readonly go test ./process -run '^TestSecurity'`. Author the
   three fuzz targets but defer fuzz execution to Phase Gate 7. Fix only Tools
   parsing/storage and commit only Tools files.
 - **29B:** from Sandbox, use focused default-tag unit seams under
-  `./internal/exec`; its single RED/GREEN command is `GOWORK=off
+  `./internal/exec`; its single queued phase-gate selector is `GOWORK=off
   GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/exec -run
   '^TestSecurityProcessUnit'`. Author all four tagged security cases, but defer
   their discovery and execution to Phase Gate 7. Fix and commit only Sandbox
   files.
 - **29C:** from Harness, use focused default-tag process identity/publication
-  seams; its single RED/GREEN command is `GOWORK=off
+  seams; its single queued phase-gate selector is `GOWORK=off
   GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test
   ./internal/sessionruntime -run '^TestSecurity(Process|Workspace)'`. Author all
   three tagged security cases, but defer their discovery and execution to Phase
   Gate 7. Fix and commit only Harness files.
 - **29D:** from Coderig, use focused default-tag process adapter seams under
-  `./internal/app`; its single RED/GREEN command is `GOWORK=off
+  `./internal/app`; its single queued phase-gate selector is `GOWORK=off
   GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test
   ./internal/app -run '^TestSecurityProcessUnit'`. Author all three tagged
   composed-security cases, but defer their discovery and execution to Phase
@@ -2937,11 +2953,12 @@ Cover:
 - workspace scoped-write ancestor/descendant races;
 - completion publisher and notifier failures.
 
-After 29A–29D are separately committed and reviewed, proceed directly to Task
+After 29A–29D are separately committed, proceed directly to Task
 30. Phase Gate 7 performs all four repositories' tagged race suites and 30
 seconds of each fuzz target. A gate failure first receives the smallest focused
-unit regression in the owning repository, a reviewed RED/GREEN fix, and then a
-rerun of the affected gate matrix.
+unit regression in the owning repository and a phase-gate fix, followed by a
+rerun of the affected gate matrix. Independent review starts only after the
+matrix passes.
 
 ### Task 30: Document the public contract and operations
 
@@ -2965,7 +2982,7 @@ Add compile-tested examples for legacy Bash, background, yield, polling,
 wait-many, input, stop, PTY, and Coderig composition. Add schema assertions that
 examples match the shipped tool definitions.
 
-**Step 2: Verify RED**
+**Step 2: Queue focused phase-gate coverage**
 
 Run the one focused documentation/example command:
 
@@ -2973,7 +2990,7 @@ Run the one focused documentation/example command:
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go test . ./bash ./process -run 'Test(Readme|Example|Schema)'
 ```
 
-Expected: FAIL before docs and examples are updated.
+Failure rationale: docs and examples do not yet describe the new behavior.
 
 **Step 3: Document boundaries and operations**
 
@@ -2991,9 +3008,9 @@ Document:
 - integration-test and Windows CI commands;
 - no local PID reattachment.
 
-**Step 4: Verify GREEN and commit**
+**Step 4: Inspect and commit; defer execution**
 
-Re-run the exact focused command from Step 2.
+Run the exact focused command from Step 2 only at the owning phase gate.
 Commit independently in each repository with
 `docs: document supervised command lifecycle`.
 
@@ -3017,7 +3034,10 @@ go mod verify
 Expected: clean worktrees except the verification record while it is being
 written; modules verify.
 
-**Step 2: Run all race and integration suites**
+**Step 2: Run all queued focused, race, fuzz, and integration suites**
+
+First execute every focused functional selector queued by Tasks 29–30, then run
+the complete repository-wide matrix below.
 
 Harness:
 

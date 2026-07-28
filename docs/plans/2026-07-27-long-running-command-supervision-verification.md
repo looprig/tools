@@ -172,3 +172,25 @@ process-enabled definitions are rejected before Bind or factory execution, with
 a recording-factory zero-call assertion. These changes reconcile Tasks
 2D/8/14/15/19/20/26/27. They are documentation-only, and the phase-gate-only
 heavy verification policy is unchanged.
+
+### Phase-boundary-only execution and review override
+
+The user subsequently broadened the scheduling rule: every check now runs only
+at a phase boundary, including focused functional selectors and diff/format
+checks as well as race, tagged integration, fuzz, repeated stress, static
+analysis, vulnerability, and trimpath/native/cross-platform build coverage.
+Task and microtask agents author tests first but do not execute them; they may
+run `gofmt` on changed Go files, inspect the diff, and commit. Independent spec,
+quality, security, and test reviews likewise occur only after the owning phase
+gate's complete command matrix passes. Task-local commands remain in the plan
+solely as queued phase-gate coverage.
+
+The same amendment corrects workspace-restore ownership. Task 3 only makes the
+checkpoint permit conflict with active lifetime leases and releases that permit
+on every return. Task 25 owns process-admission suspension, process stop,
+lifetime-lease release, restore, and admission resume on every path. Phase 1's
+integration test therefore orchestrates a scoped-write/checkpoint-permit
+conflict without permanently shutting down session resources.
+
+This amendment is documentation-only. No test, static-analysis, vulnerability,
+build, automated diff check, or independent review was executed for it.

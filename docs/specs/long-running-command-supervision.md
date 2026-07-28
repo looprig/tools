@@ -1029,40 +1029,46 @@ Acceptance gate:
 - a final spec review and final code-quality/security review have no unresolved
   critical or important findings.
 
-## TDD and review policy
+## Test-first and review policy
 
-Every implementation task follows strict red-green-refactor:
+Every implementation task is test-first but does not execute tests:
 
-1. write one focused failing test;
-2. run it and confirm the expected failure;
-3. write the minimum production code;
-4. rerun the focused test;
-5. refactor only while the focused non-race test remains green;
-6. run `gofmt` on changed Go files and `git diff --check`;
-7. commit the task.
+1. author the focused test before production code;
+2. write the minimum contract-complete production change;
+3. refactor by inspection only;
+4. run `gofmt` on changed Go files;
+5. inspect and commit the task diff.
+
+All test execution and all independent spec/code review occur only at the owning
+phase boundary. Task-local commands in the implementation plan are queued gate
+coverage, never per-task execution instructions.
 
 Unit tests are necessary but insufficient. Each phase that crosses a module or
 OS boundary adds tagged integration coverage. Sandbox integration tests execute
 real descendants, grants, process-tree teardown, and PTY behavior. Coderig
 integration tests exercise the composed Bash-to-Tools-to-Harness-to-Sandbox
 path. Harness integration tests cover shutdown, restore, checked events, and
-workspace leases. Race tests, tagged integration discovery/execution, fuzzing,
-repeated stress, static analysis, vulnerability checks, and trimpath builds run
-only at phase boundaries. Supported repositories run integration tests with
-`-race`; Windows ConPTY and Job behavior also runs on a Windows CI worker.
+workspace leases. Focused functional tests, race tests, tagged integration
+discovery/execution, fuzzing, repeated stress, static analysis, vulnerability
+checks, and trimpath builds all run only at phase boundaries. Supported
+repositories run integration tests with `-race`; Windows ConPTY and Job behavior
+also runs on a Windows CI worker.
 
 At every phase boundary:
 
-1. run the full relevant repository tests with the race detector;
-2. list and run applicable tagged integration tests with `-race`;
-3. run every fuzz target accumulated through the phase;
-4. run repository format, Vet, Staticcheck, Gosec, and vulnerability checks;
-5. run native and relevant cross-platform `CGO_ENABLED=0 -trimpath` builds;
-6. obtain an independent spec-compliance review;
-7. fix every gap and obtain re-review;
-8. obtain an independent code-quality and security review;
-9. fix every critical or important issue and obtain re-review;
-10. record the verified phase before starting the next phase.
+1. run every focused functional selector queued by the phase's tasks;
+2. run the full relevant repository tests with the race detector;
+3. list and run applicable tagged integration tests with `-race`;
+4. run every fuzz target accumulated through the phase;
+5. run repository format and diff checks, Vet, Staticcheck, Gosec, and
+   vulnerability checks;
+6. run native and relevant cross-platform `CGO_ENABLED=0 -trimpath` builds;
+7. obtain an independent spec-compliance review;
+8. fix every gap, rerun affected gate coverage, and obtain re-review;
+9. obtain an independent code-quality and security review;
+10. fix every critical or important issue, rerun affected coverage, and obtain
+    re-review;
+11. record the verified phase before starting the next phase.
 
 ## Final acceptance
 
