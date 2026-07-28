@@ -316,7 +316,7 @@ cycle, review pair, focused commit checks, and commit.
 Files: `pkg/tool/session_resource.go`, `pkg/tool/definition.go`, and
 `pkg/tool/definition_test.go`. First add
 `TestProcessBindingRequiresRegistry`,
-`TestProcessBindingRejectsTypedNilServices`, and
+`TestProcessBindingRejectsTypedNilRegistry`, and
 `TestAttenuateBindingsPreservesOnlyRequiredProcessServices`, then run:
 
 ```bash
@@ -341,6 +341,10 @@ type SessionResource interface {
 type SessionResourceRegistry interface {
 	GetOrCreate(context.Context, string, func(string) (SessionResource, error)) (SessionResource, error)
 }
+
+type ProcessBinding struct {
+	Registry SessionResourceRegistry
+}
 ```
 
 The factory receives its private storage directory. In 2A,
@@ -354,9 +358,14 @@ Do not invent `any`, callback, event, command, or opaque publisher payloads in
 this microtask. The exact bounded service DTOs cannot be correct until Task 4
 defines the process lifecycle domain, and `pkg/tool` cannot import `pkg/event`
 without reversing the dependency boundary. The typed-nil tests in 2A apply to
-the `ProcessBinding` registry/runner interfaces. Task 4 completes the carrier
-with privately held, typed lifecycle and completion services and their
-constructor validation.
+the `ProcessBinding.Registry` interface only. `ProcessBinding` has no Runner
+field. Task 4 completes the carrier with privately held, typed lifecycle and
+completion services and their constructor validation.
+
+Task 1's `AsyncProcessRunner` remains the public adapter contract. It is
+captured immutably by Coderig-constructed Tools definitions in Tasks 19/26/27;
+it is not injected through Harness `Bindings`, a Rig option, or a session
+lifecycle provider.
 
 **2B — registry linearization**
 
@@ -472,6 +481,8 @@ after the live Session, hub, publisher, and notifier exist. At this stage
 activation proves ordering with the empty
 `SessionResourceServices` carrier; Task 4 replaces that staged value with the
 validated typed service set before any real process resource is composed.
+Every probe/live `ProcessBinding` contains that registry only; Task 2D does not
+look up, synthesize, or attach an async runner.
 Reject process-enabled definitions on non-native engines with
 `process_notifications_unsupported`; legacy foreground-only Bash retains its
 existing foreign-engine behavior. Never expose `*sessionruntime.Session`
@@ -1780,7 +1791,9 @@ Expected: new field tests fail; legacy tests pass.
 **Step 3: Implement parsing only**
 
 Keep exported `Factory` and `NewFactory` unchanged. Add a separate binding-aware
-factory used by root definitions. Do not route to the supervisor yet.
+factory used by root definitions. That factory accepts and immutably captures
+the Task 1 `AsyncProcessRunner` as a Tools construction dependency; it does not
+read a runner from Harness bindings. Do not route to the supervisor yet.
 
 **Step 4: Verify GREEN**
 
@@ -1838,10 +1851,11 @@ Expected: FAIL because supervisor routing is absent.
 **Step 3: Implement minimal routing**
 
 Legacy calls execute the unchanged function. Supervised calls obtain the
-session supervisor, owner, origin, prepared grants, runner, effective access,
-observation capability, and settings from bindings/context. They prepare through
-the async runner, acquire the exact lifetime lease, then hand the prepared
-process to `Supervisor.Start`.
+session resource registry, owner, origin, workspace coordination, and
+observation capability from Harness bindings/context. They use the async runner
+captured by the definition/factory closure, prepare through it, acquire the
+exact lifetime lease, then hand the prepared process to `Supervisor.Start`.
+Never add a Runner field to `tool.ProcessBinding`.
 
 **Step 4: Verify GREEN**
 
@@ -1979,15 +1993,18 @@ Before committing, re-run the exact focused command from Step 2.
 
 Require:
 
-- `Bash(...)`;
-- `ProcessOutputDefinition()`;
-- `ProcessInputDefinition()`;
-- `ProcessStopDefinition()`.
+- `Bash(..., bash.WithAsyncProcessRunner(runner))`;
+- `ProcessOutputDefinition(runner)`;
+- `ProcessInputDefinition(runner)`;
+- `ProcessStopDefinition(runner)`.
 
 Each definition produces one tool with the exact name. All require workspace
 and process services as appropriate. Separately built definitions in one
 session obtain the same supervisor registry entry. Different sessions obtain
-different supervisors. Options resolve once and concurrent builds remain safe.
+different supervisors. Every definition captures its non-nil/non-typed-nil
+`tool.AsyncProcessRunner` immutably so whichever definition first resolves the
+registry key can construct the supervisor; tests pass the same runner fixture
+to all four. Options resolve once and concurrent builds remain safe.
 
 **Step 2: Verify RED**
 
@@ -2001,7 +2018,11 @@ Expected: FAIL because companion definitions are absent.
 
 Permit Bash to import shared public `process`, analogous to `permission`.
 Continue forbidding Sandbox and Harness internal imports. Use the keyed registry,
-never a package global.
+never a package global. Add a Tools/bash construction option for the async
+runner and explicit runner arguments to the three companion definition
+constructors. These are definition-construction dependencies, not Harness
+binding fields. Do not add a Harness Rig/lifecycle runner option or runner
+provider.
 
 **Step 4: Verify GREEN and commit**
 
@@ -2022,11 +2043,12 @@ Before committing, re-run the exact focused command from Step 2.
 **Step 1: Write tagged integration acceptance tests**
 
 Compose public Harness binding contracts with a contract-faithful Tools test
-registry and deterministic async runner fixture. Tools cannot import Harness
-`internal/sessionruntime`; real registry composition is reserved for Coderig
-Task 28. Cover foreground compatibility, background start, yield,
-incremental output, wait-many, input, stop, output limit, owner isolation,
-resource shutdown, and manifest restore.
+registry. Pass a deterministic async runner fixture into each Tools definition
+constructor; the fake Harness `ProcessBinding` contains only the registry.
+Tools cannot import Harness `internal/sessionruntime`; real registry composition
+is reserved for Coderig Task 28. Cover foreground compatibility, background
+start, yield, incremental output, wait-many, input, stop, output limit, owner
+isolation, resource shutdown, and manifest restore.
 
 Both files begin with:
 
@@ -2587,7 +2609,9 @@ Test:
   activity broadens invalidation, and channel closure precedes wait;
 - Sandbox error codes map to Harness codes without losing causes;
 - no OS PID crosses the adapter;
-- adapter satisfies `tool.AsyncProcessRunner`.
+- adapter satisfies `tool.AsyncProcessRunner`;
+- no Harness `ProcessBinding`, Rig option, lifecycle option, or provider is used
+  to transport the adapter.
 
 **Step 2: Verify RED**
 
@@ -2601,7 +2625,11 @@ Expected: FAIL.
 **Step 3: Implement the mechanical adapter**
 
 Follow the existing `grantedExecutor` composition pattern. Put no buffering,
-authorization, event, or supervisor policy in Coderig.
+authorization, event, or supervisor policy in Coderig. Expose a Coderig-local
+constructor that wraps the selected Sandbox executor as
+`tool.AsyncProcessRunner`; Task 27 passes that returned adapter directly into
+Tools definition constructors. Do not register it with Harness lifecycle or
+place it in `tool.ProcessBinding`.
 
 **Step 4: Verify GREEN and commit**
 
@@ -2624,9 +2652,12 @@ Before committing, re-run the exact focused command from Step 2.
 
 Test operator and reviewer rosters contain Bash, ProcessOutput, ProcessInput, and
 ProcessStop exactly once. Bind the same per-loop Sandbox executor used by the
-gate. Verify all definitions share one session supervisor and sibling loops
-cannot access one another's handles. Verify Coderig does not install the
-process-enabled roster on a foreign-engine loop and reports
+gate. Construct one Task 26B async adapter for that executor and capture the
+same adapter instance in all four Tools definitions before Harness binding.
+Verify Harness `ProcessBinding` supplies only the shared session registry, all
+definitions share one session supervisor, and sibling loops cannot access one
+another's handles. Verify Coderig does not install the process-enabled roster on
+a foreign-engine loop and reports
 `process_notifications_unsupported` for an attempted explicit bind.
 
 **Step 2: Verify RED**
@@ -2639,8 +2670,12 @@ Expected: FAIL.
 
 **Step 3: Wire definitions**
 
-Construct the Bash definition with sync and async adapters. Append companion
-definitions to both allowed rosters. Preserve reviewer access restrictions.
+Construct the Bash definition with its existing synchronous adapter plus
+`bash.WithAsyncProcessRunner(processAdapter)`. Pass the same `processAdapter`
+explicitly to `ProcessOutputDefinition`, `ProcessInputDefinition`, and
+`ProcessStopDefinition`, then append the definitions to both allowed rosters.
+Preserve reviewer access restrictions. Do not introduce a Harness runner
+provider or Rig/lifecycle option.
 
 **Step 4: Verify GREEN and commit**
 

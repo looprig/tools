@@ -141,3 +141,14 @@ those exact typed kinds. The focused selector is
 `Test(Rig.*ResourceStorage|ResourceStorage)`, which includes the required,
 reject, duplicate, immutable-capture, and provider-contract tests. This is
 documentation-only; no heavy verification was run outside a phase gate.
+
+### Process runner composition correction
+
+`ProcessBinding` is now registry-only; Task 2A's typed-nil assertion applies
+only to `SessionResourceRegistry`, and Task 2D threads no runner. Task 1's
+`AsyncProcessRunner` remains the public adapter contract. Coderig constructs the
+Sandbox adapter and captures the same instance in the four Tools definitions,
+as reconciled across Tasks 14/15/19/20/26/27. No Harness Rig option, lifecycle
+provider, or session binding for a runner is introduced. This is
+documentation-only, and the phase-gate-only heavy verification policy is
+unchanged.

@@ -105,7 +105,9 @@ Tools owns the behavior visible to a model or direct tool consumer:
 - model-facing result and error rendering.
 
 Tools must not import Harness internals or Sandbox directly. It consumes public
-Harness contracts supplied through tool bindings.
+Harness identity, workspace, and session-resource contracts through tool
+bindings. The public `AsyncProcessRunner` contract is instead an immutable
+definition-construction dependency captured by Tools definitions.
 
 ### Harness
 
@@ -116,7 +118,7 @@ Harness owns generic orchestration contracts:
 - keyed, concurrency-safe get-or-create access to shared session resources;
 - a configured, restorable private per-session storage provider for resource
   manifests and spools;
-- the async process runner interface consumed by Tools;
+- the public async process runner interface contract consumed by Tools;
 - durable process lifecycle event types;
 - completion notification delivery;
 - session shutdown and restore ordering;
@@ -125,6 +127,11 @@ Harness owns generic orchestration contracts:
 
 Harness must not know Bash-specific JSON schemas, output cursor rendering, spool
 formats, or shell semantics.
+
+Harness does not provision an async runner through Rig/session lifecycle
+options, and `ProcessBinding` contains only the session resource registry.
+Coderig constructs the Sandbox-to-Harness adapter and passes it into the Tools
+definition constructors; the definitions capture that adapter immutably.
 
 ### Sandbox
 
@@ -682,6 +689,13 @@ generic read-only, scoped-write, or broad-write description. If the runner
 cannot truthfully prepare access or prove lifetime containment, supervised spawn
 fails with `lifetime_enforcement_unavailable`.
 
+This adapter is not a per-session Harness binding. Coderig constructs it from
+the same Sandbox executor used for gated execution and captures it in each
+process-enabled Tools definition. Harness binds only the shared
+`SessionResourceRegistry`; whichever captured definition first resolves the
+key creates the one session supervisor with its captured runner. Coderig passes
+the same adapter instance to all four definitions.
+
 Lease compatibility:
 
 | Background access | Compatibility |
@@ -748,6 +762,11 @@ type Process interface {
     Close(context.Context) error
 }
 ```
+
+Harness owns these public types but does not manufacture or bind an
+implementation. Coderig's Sandbox adapter implements `AsyncProcessRunner` and
+is captured by Tools definitions at construction; `ProcessBinding` remains
+registry-only.
 
 Exact Go names may follow existing package conventions, but the contract must:
 
