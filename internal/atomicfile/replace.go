@@ -84,9 +84,17 @@ var (
 // destination's directory must already exist; Replace never creates it and
 // never writes anywhere outside that directory.
 //
-// On success, path durably contains exactly data. On any failure, path is
-// left exactly as it was before the call (unchanged if it already existed,
-// absent if it did not); no partial or temporary file is left behind.
+// On success, path durably contains exactly data. On a failure at any stage
+// through StageRename, path is left exactly as it was before the call
+// (unchanged if it already existed, absent if it did not); no partial or
+// temporary file is left behind. The one exception is a StageDirSync
+// failure: by that point the rename has already committed, so path already
+// contains data -- the failure only means the containing directory's own
+// entry for that rename could not be confirmed durable (e.g. a crash before
+// the next directory-metadata flush could, in principle, still lose the
+// rename itself on some filesystems). Callers that must distinguish this
+// case from an earlier-stage failure can inspect the returned *Error's
+// Stage field.
 func Replace(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
