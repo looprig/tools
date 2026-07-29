@@ -11,10 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/nofollow"
 	"github.com/looprig/tools/internal/prepared"
 )
 
@@ -461,12 +461,13 @@ func stageTempFile(dir string, data []byte) (string, error) {
 		return "", err
 	}
 	// #nosec G304 -- tmp = target's containment-proven parent dir + a crypto/rand
-	// suffix. O_EXCL|O_NOFOLLOW refuse to clobber an existing name or to follow a
-	// pre-planted symlink AT THE TEMP NAME (cheap defence-in-depth). This does NOT
-	// close the broader parent-dir resolve→open TOCTOU window, which §3c
-	// (write-side threat model) explicitly accepts as out of scope for this local
-	// single-user tool. target's resolved form was proven contained by the caller.
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, newFilePerm)
+	// suffix. O_EXCL + the no-follow open refuse to clobber an existing name or to
+	// follow a pre-planted symlink/reparse point AT THE TEMP NAME (cheap
+	// defence-in-depth; see internal/nofollow). This does NOT close the broader
+	// parent-dir resolve→open TOCTOU window, which §3c (write-side threat model)
+	// explicitly accepts as out of scope for this local single-user tool. target's
+	// resolved form was proven contained by the caller.
+	f, err := nofollow.Open(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, newFilePerm)
 	if err != nil {
 		return "", &writeFileError{reason: "could not create temp file", cause: err}
 	}
@@ -478,19 +479,20 @@ func stageTempFile(dir string, data []byte) (string, error) {
 }
 
 // hashFileOnDisk computes the SHA-256 of target's COMPLETE current raw bytes for
-// the optimistic-concurrency compare. It opens O_RDONLY|O_NOFOLLOW (a final-
-// component symlink fails with ELOOP) and streams the file through the hash (O(1)
-// memory, any size). present is false with a nil error ONLY for a definitive
-// not-found; any other open/stat/read failure (symlink, non-regular, unreadable)
-// returns a non-nil error so the caller fails secure (treats the state as
-// unverifiable and refuses the mutation). The hash is never exposed to the model.
+// the optimistic-concurrency compare. It opens with a no-follow read open (a
+// final-component symlink or reparse point fails to open — see
+// internal/nofollow) and streams the file through the hash (O(1) memory, any
+// size). present is false with a nil error ONLY for a definitive not-found; any
+// other open/stat/read failure (symlink, non-regular, unreadable) returns a
+// non-nil error so the caller fails secure (treats the state as unverifiable and
+// refuses the mutation). The hash is never exposed to the model.
 func hashFileOnDisk(target string) (hash [sha256.Size]byte, present bool, err error) {
-	// #nosec G304 -- target is the containment-proven lexical joined path;
-	// O_NOFOLLOW rejects a final-component symlink and the fd stat confirms a
-	// regular file before any bytes are read.
-	f, oerr := os.OpenFile(target, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// #nosec G304 -- target is the containment-proven lexical joined path; the
+	// no-follow open rejects a final-component symlink/reparse point and the fd
+	// stat confirms a regular file before any bytes are read.
+	f, oerr := nofollow.Open(target, os.O_RDONLY, 0)
 	if oerr != nil {
-		if os.IsNotExist(oerr) {
+		if errors.Is(oerr, os.ErrNotExist) {
 			return hash, false, nil
 		}
 		return hash, false, &writeFileError{reason: "could not open the file to verify freshness", cause: oerr}

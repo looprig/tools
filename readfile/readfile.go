@@ -17,11 +17,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/nofollow"
 	"github.com/looprig/tools/internal/prepared"
 	"github.com/looprig/tools/internal/workspace"
 )
@@ -314,14 +314,15 @@ func (r *ReadFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	return tool.TextResult(out), nil
 }
 
-// readCapped opens abs with O_RDONLY|O_NOFOLLOW (a symlinked final component then
-// fails to open), confirms via fd stat that it is a regular file, and reads up to
-// MaxReadBytes via io.LimitReader. truncated reports whether the file exceeds the
-// cap (one extra byte is read to detect this). Errors are typed via readFileError.
+// readCapped opens abs with a no-follow read open (a symlinked/reparse-point
+// final component then fails to open — see internal/nofollow), confirms via fd
+// stat that it is a regular file, and reads up to MaxReadBytes via
+// io.LimitReader. truncated reports whether the file exceeds the cap (one extra
+// byte is read to detect this). Errors are typed via readFileError.
 func (r *ReadFile) readCapped(abs string) (body string, truncated bool, err error) {
 	// #nosec G304 -- abs is the containedPath-resolved, workspace-confined path;
-	// O_NOFOLLOW + fd stat below close the resolve→open TOCTOU window.
-	f, oerr := os.OpenFile(abs, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// the no-follow open + fd stat below close the resolve→open TOCTOU window.
+	f, oerr := nofollow.Open(abs, os.O_RDONLY, 0)
 	if oerr != nil {
 		return "", false, openErrorToReadFileError(abs, oerr)
 	}
@@ -357,13 +358,18 @@ func joinedUnderRoot(root, input string) string {
 	return filepath.Join(root, filepath.Clean(input))
 }
 
-// openErrorToReadFileError maps an os.OpenFile error to a non-secret typed
-// readFileError. A symlinked final component (O_NOFOLLOW) surfaces as ELOOP.
+// openErrorToReadFileError maps a nofollow.Open error to a non-secret typed
+// readFileError. A symlinked/reparse-point final component surfaces as an error
+// wrapping nofollow.ErrSymlinkNotAllowed. errors.Is (rather than os.IsNotExist,
+// which only unwraps a fixed set of stdlib error types) is used for the
+// not-exist check because Windows's not-found case is a plain wrapped error
+// (fmt.Errorf("%w: %w", fs.ErrNotExist, ...) in internal/nofollow), not one of
+// those recognized types.
 func openErrorToReadFileError(path string, err error) *readFileError {
 	switch {
-	case os.IsNotExist(err):
+	case errors.Is(err, os.ErrNotExist):
 		return &readFileError{reason: "file not found", cause: err}
-	case errors.Is(err, syscall.ELOOP):
+	case errors.Is(err, nofollow.ErrSymlinkNotAllowed):
 		return &readFileError{reason: "refusing to follow a symlinked path", cause: err}
 	default:
 		return &readFileError{reason: "could not open the file", cause: err}

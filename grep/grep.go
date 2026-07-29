@@ -20,12 +20,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/nofollow"
 	"github.com/looprig/tools/internal/prepared"
 	"github.com/looprig/tools/internal/workspace"
 )
@@ -613,14 +613,16 @@ func (g *Grep) runFallback(ctx context.Context, searchAbs, resolvedRoot string, 
 	return matches, truncated, false
 }
 
-// grepFile opens relSlash's file with O_NOFOLLOW (a symlinked final component is
-// not followed), confirms a regular file via fd stat, and returns "rel:line:text"
-// for each matching line, capped to maxGrepLineBytes per line. A binary-looking or
-// unreadable file yields no matches (best-effort).
+// grepFile opens relSlash's file with a no-follow open (a symlinked/reparse-point
+// final component is not followed — see internal/nofollow), confirms a regular
+// file via fd stat, and returns "rel:line:text" for each matching line, capped to
+// maxGrepLineBytes per line. A binary-looking or unreadable file yields no matches
+// (best-effort).
 func (g *Grep) grepFile(abs, relSlash string, re *regexp.Regexp) []string {
-	// #nosec G304 -- abs is under the contained, walked search root; O_NOFOLLOW +
-	// fd stat below reject a symlinked final component / non-regular file.
-	f, err := os.OpenFile(abs, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// #nosec G304 -- abs is under the contained, walked search root; the
+	// no-follow open + fd stat below reject a symlinked/reparse-point final
+	// component or non-regular file.
+	f, err := nofollow.Open(abs, os.O_RDONLY, 0)
 	if err != nil {
 		return nil
 	}

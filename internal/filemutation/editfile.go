@@ -9,10 +9,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/tools/internal/nofollow"
 	"github.com/looprig/tools/internal/prepared"
 )
 
@@ -379,22 +379,23 @@ func (e *EditFile) commitUncontained(target mutationTarget, old, replacement str
 	return diffPreview(target.display, original, updated), nil
 }
 
-// readForEdit opens path O_RDONLY|O_NOFOLLOW (a final-component symlink fails to
-// open with ELOOP), confirms a regular file via the fd stat, and reads up to
-// maxEditFileBytes. path is the LEXICAL joined path (joinedUnderRoot); the caller
-// has already proven the symlink-resolved form is contained. Errors are typed
-// writeFileError (non-secret reason, never contents).
+// readForEdit opens path with a no-follow open (a final-component symlink or
+// reparse point fails to open — see internal/nofollow), confirms a regular file
+// via the fd stat, and reads up to maxEditFileBytes. path is the LEXICAL joined
+// path (joinedUnderRoot); the caller has already proven the symlink-resolved
+// form is contained. Errors are typed writeFileError (non-secret reason, never
+// contents).
 func (e *EditFile) readForEdit(path string) (string, error) {
 	// #nosec G304 -- path is workspace.JoinedPath(root, input): the workspace root +
 	// the lexically-cleaned, contained input (containedPath already proved the
-	// symlink-resolved target is inside the workspace). O_NOFOLLOW rejects a
-	// FINAL-COMPONENT symlink (consistent with ReadFile); it does NOT by itself
-	// close the broader parent-dir resolve→open TOCTOU window, which §3c
+	// symlink-resolved target is inside the workspace). The no-follow open rejects a
+	// FINAL-COMPONENT symlink/reparse point (consistent with ReadFile); it does NOT
+	// by itself close the broader parent-dir resolve→open TOCTOU window, which §3c
 	// (write-side threat model) explicitly accepts as out of scope for this local
 	// single-user tool.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := nofollow.Open(path, os.O_RDONLY, 0)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return "", &writeFileError{reason: "file not found", cause: err}
 		}
 		if isSymlinkLoop(err) {
@@ -441,9 +442,10 @@ func applyReplacement(original, old, replacement string, replaceAll bool) (strin
 	}
 }
 
-// isSymlinkLoop reports whether err is an ELOOP (O_NOFOLLOW hit a symlink).
+// isSymlinkLoop reports whether err is a no-follow refusal (a final-component
+// symlink on POSIX, or a reparse point on Windows — see internal/nofollow).
 func isSymlinkLoop(err error) bool {
-	return errors.Is(err, syscall.ELOOP)
+	return errors.Is(err, nofollow.ErrSymlinkNotAllowed)
 }
 
 // compile-time assertions: EditFile is an InvokableTool, a CallPreparer,
