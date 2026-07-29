@@ -58,16 +58,25 @@ type YieldSettings struct {
 // persisted before the corresponding Harness lifecycle event ... may be
 // published"). 8A only accepted and stored an implementation (both at
 // construction and, per admission, from Start -- see NewSupervisor and
-// Start's doc comments for why both exist), never called one. Task 8C adds
+// Start's doc comments for why both exist), never called one. Task 8C added
 // publish, the method entry.terminalize calls exactly once per process, at
 // its one-shot terminal transition, always with the manifest's already-
 // persisted stable EventID for event.Kind (manifest.go's
-// LifecycleEventIDs.Completed or .Lost) -- never a freshly minted one. 8C
-// never calls publish for a started/backgrounded record; wiring those
-// call sites (at Start/yield time, once a real Harness implementation
-// exists) is a later phase's job, not this microtask's.
+// LifecycleEventIDs.Completed or .Lost) -- never a freshly minted one.
+//
+// Phase Gate 2's Task 8 combined-acceptance follow-up adds publishStart, the
+// method Start calls exactly once per process, immediately after the
+// manifest's StateRunning Save succeeds: Started if the caller did not
+// request immediate backgrounding (YieldSettings.Yield == false), or
+// Backgrounded if it did (Yield == true) -- see lifecycleStartEvent's doc
+// comment (entry.go) for the exact one-of-{Started,Backgrounded} discipline.
+// A foreground-attached process later explicitly yielded to background
+// mid-flight is a harder case Task 8 does not implement -- there is no
+// caller for it yet (Phase 4's Bash tool) -- and is out of this follow-up's
+// scope.
 type lifecycleSink interface {
 	publish(ctx context.Context, event lifecycleTerminalEvent) error
+	publishStart(ctx context.Context, event lifecycleStartEvent) error
 }
 
 // completionNotifier is the other half of SessionResourceServices: the
@@ -819,7 +828,9 @@ func (s *Supervisor) Start(
 	// from the live tool.Process's StreamMode after prepared.Start
 	// succeeds, and this manifest write must happen strictly before that
 	// call.
-	manifest := NewManifest(identity, CommandMetadata{}, accessMode(prepared.EffectiveWorkspaceAccess().Kind), false, time.Now().UTC(), nil)
+	access := accessMode(prepared.EffectiveWorkspaceAccess().Kind)
+	createdAt := time.Now().UTC()
+	manifest := NewManifest(identity, CommandMetadata{}, access, false, createdAt, nil)
 	manifest.Events = events
 	if err := s.manifests.Save(manifest); err != nil {
 		s.releaseQuota(res)
@@ -855,6 +866,49 @@ func (s *Supervisor) Start(
 		s.releaseLease(lease)
 		_ = proc.Close(ctx)
 		return "", Wrap(CodeProcessSetupFailed, err)
+	}
+
+	// base is entry.base (entry.go's manifestBase): the same Start-time-only
+	// manifest fields just persisted above, captured onto the entry so a
+	// later terminal-transition reload failure never has to depend on
+	// reloading them (see manifestBase's and doTerminalize's doc comments).
+	base := manifestBase{
+		command:   manifest.Command,
+		access:    access,
+		tty:       manifest.TTY,
+		createdAt: createdAt,
+		startedAt: startedAt,
+		deadline:  manifest.Deadline,
+		events:    events,
+	}
+
+	// Publish this process's Start-time lifecycle record: Started if the
+	// caller did not request immediate backgrounding, or Backgrounded if it
+	// did (YieldSettings.Yield == true) -- exactly one of the two, using the
+	// manifest's own pre-persisted stable EventID for whichever kind this
+	// is, never a freshly minted one (see lifecycleStartEvent's doc comment,
+	// entry.go). This is synchronous, not deferred into entry.run's
+	// lifetime-scoped goroutine: it is tied to the StateRunning transition
+	// this call just made, which already happens synchronously here. Best-
+	// effort and nil-tolerant, like every other publish/notify call in this
+	// package: a slow or failing sink must never fail Start or delay
+	// returning the Handle -- the manifest itself, already durably saved
+	// above, is the source of truth regardless of whether this notification
+	// succeeds.
+	startKind := tool.ProcessLifecycleStarted
+	startEventID := events.Started
+	if yield.Yield {
+		startKind = tool.ProcessLifecycleBackgrounded
+		startEventID = events.Backgrounded
+	}
+	if sink != nil {
+		_ = sink.publishStart(ctx, lifecycleStartEvent{
+			EventID:   startEventID,
+			Kind:      startKind,
+			Identity:  identity,
+			CreatedAt: createdAt,
+			StartedAt: startedAt,
+		})
 	}
 
 	spool, err := OpenSpool(s.spoolRoot, handle, res.spoolBytes)
@@ -910,6 +964,7 @@ func (s *Supervisor) Start(
 		observations:   observations,
 		ceiling:        ceiling,
 		yield:          yield,
+		base:           base,
 		process:        proc,
 		reservation:    res,
 		manifests:      s.manifests,

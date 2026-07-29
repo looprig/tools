@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -89,14 +90,30 @@ func TestEntryRunClosesDoneAfterDrainingBothStreams(t *testing.T) {
 // calls -- the only way to directly observe terminalize's terminalOnce
 // (sync.Once) "exactly one closure executes" guarantee at the manifest
 // layer, since ManifestStore itself keeps no call counter of its own.
+//
+// loadErr, when non-nil, makes Load fail with that exact error instead of
+// delegating to store -- the fault-injection seam
+// TestEntryTerminalizeSynthesizesManifestWhenReloadFails uses to prove
+// doTerminalize's reload-failure fallback (entry.go's synthesizeManifest):
+// Save always still delegates to the real store regardless of loadErr, so a
+// test can independently confirm what the fallback path actually persisted.
 type fakeManifestSaver struct {
-	store *ManifestStore
+	store   *ManifestStore
+	loadErr error
 
 	mu        sync.Mutex
 	saveCalls int
+	loadCalls int
 }
 
 func (f *fakeManifestSaver) Load(h Handle) (Manifest, error) {
+	f.mu.Lock()
+	f.loadCalls++
+	err := f.loadErr
+	f.mu.Unlock()
+	if err != nil {
+		return Manifest{}, err
+	}
 	return f.store.Load(h)
 }
 
@@ -114,13 +131,26 @@ func (f *fakeManifestSaver) SaveCalls() int {
 	return f.saveCalls
 }
 
+// LoadCalls reports how many times Load was called.
+func (f *fakeManifestSaver) LoadCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loadCalls
+}
+
 var _ manifestSaver = (*fakeManifestSaver)(nil)
 
-// fakeLifecycleSink is a call-counting implementation of lifecycleSink.
+// fakeLifecycleSink is a call-counting implementation of lifecycleSink,
+// tracking publish (terminal events) and publishStart (Started/Backgrounded
+// events) independently, since a single Start call and a single terminalize
+// call each drive a separate one-shot emission through this same fake.
 type fakeLifecycleSink struct {
 	mu           sync.Mutex
 	publishCalls int
 	lastEvent    lifecycleTerminalEvent
+
+	publishStartCalls int
+	lastStartEvent    lifecycleStartEvent
 }
 
 func (f *fakeLifecycleSink) publish(ctx context.Context, event lifecycleTerminalEvent) error {
@@ -136,6 +166,28 @@ func (f *fakeLifecycleSink) PublishCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.publishCalls
+}
+
+func (f *fakeLifecycleSink) publishStart(ctx context.Context, event lifecycleStartEvent) error {
+	f.mu.Lock()
+	f.publishStartCalls++
+	f.lastStartEvent = event
+	f.mu.Unlock()
+	return nil
+}
+
+// PublishStartCalls reports how many times publishStart was called.
+func (f *fakeLifecycleSink) PublishStartCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.publishStartCalls
+}
+
+// LastStartEvent reports the most recent publishStart event.
+func (f *fakeLifecycleSink) LastStartEvent() lifecycleStartEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastStartEvent
 }
 
 var _ lifecycleSink = (*fakeLifecycleSink)(nil)
@@ -290,4 +342,151 @@ func newRaceEntry(t *testing.T) (*entry, raceEntryFakes) {
 	}
 
 	return e, fakes
+}
+
+// --- TestEntryTerminalizeSynthesizesManifestWhenReloadFails ---
+
+// TestEntryTerminalizeSynthesizesManifestWhenReloadFails is the Phase Gate 2
+// quality/security fault-injection proof for doTerminalize's reload-failure
+// fallback (entry.go's synthesizeManifest): when e.manifests.Load fails --
+// simulating a transient reload failure against a manifest Supervisor.Start
+// already durably persisted, exactly like production would encounter --
+// doTerminalize must still (a) persist SOME terminal manifest rather than
+// leaving the process stuck at a nonterminal state, (b) publish the
+// lifecycle event and completion notification using the entry's own
+// pre-persisted stable Events (entry.base), never a zero-value/nil
+// EventID/CommandID, and (c) still run quota release, lease release, and
+// the onTerminal retention hook exactly once each -- the three steps the
+// original report already found correct (they sit outside the old
+// haveManifest guard) and which this fix must not regress.
+func TestEntryTerminalizeSynthesizesManifestWhenReloadFails(t *testing.T) {
+	t.Parallel()
+
+	handle := testHandle(t, 9)
+	owner := testOwner(t)
+	origin := testOrigin(t)
+	identity := Identity{Handle: handle, Owner: owner, Origin: origin}
+
+	events := LifecycleEventIDs{
+		Started:      mustUUID(t),
+		Backgrounded: mustUUID(t),
+		Completed:    mustUUID(t),
+		Lost:         mustUUID(t),
+		CommandID:    mustUUID(t),
+	}
+	createdAt := time.Now().UTC()
+	startedAt := createdAt.Add(time.Millisecond)
+
+	// Persist a real StateRunning manifest first -- exactly what
+	// Supervisor.Start would have already durably written before this
+	// entry's run goroutine ever reaches terminalize -- so the reload
+	// failure injected below is a genuine transient-failure simulation, not
+	// a "nothing was ever persisted" scenario.
+	store := NewManifestStore(t.TempDir())
+	seed := NewManifest(identity, CommandMetadata{Command: "echo hi"}, AccessReadOnly, false, createdAt, nil)
+	seed.Events = events
+	if err := store.Save(seed); err != nil {
+		t.Fatalf("store.Save(starting) err = %v, want nil", err)
+	}
+	seed.State = StateRunning
+	seed.StartedAt = &startedAt
+	if err := store.Save(seed); err != nil {
+		t.Fatalf("store.Save(running) err = %v, want nil", err)
+	}
+
+	spool, err := OpenSpool(t.TempDir(), handle, 0)
+	if err != nil {
+		t.Fatalf("OpenSpool() err = %v, want nil", err)
+	}
+
+	manifests := &fakeManifestSaver{store: store, loadErr: errors.New("injected reload failure")}
+	lifecycle := &fakeLifecycleSink{}
+	notifications := &fakeCompletionNotifier{}
+	lease := &fakeLease{}
+	quotaReleases := &callCounter{}
+	onTerminalCalls := &callCounter{}
+
+	e := &entry{
+		identity:      identity,
+		lease:         lease,
+		lifecycle:     lifecycle,
+		notifications: notifications,
+		manifests:     manifests,
+		reservation:   reservation{loopID: owner.LoopID, sessionID: owner.SessionID, memoryBytes: 10, spoolBytes: 10},
+		releaseQuota:  func(reservation) { quotaReleases.inc() },
+		onTerminal:    func(Handle, Owner) { onTerminalCalls.inc() },
+		base: manifestBase{
+			command:   CommandMetadata{Command: "echo hi"},
+			access:    AccessReadOnly,
+			tty:       false,
+			createdAt: createdAt,
+			startedAt: startedAt,
+			events:    events,
+		},
+		buffer: NewBuffer(0),
+		spool:  spool,
+		done:   make(chan struct{}),
+	}
+
+	code := 0
+	finishedAt := time.Now().UTC()
+	e.terminalize(context.Background(), StateExited, Result{ExitCode: &code, Reason: "exited"}, finishedAt)
+
+	if got := manifests.LoadCalls(); got == 0 {
+		t.Fatal("Load was never called; this test is not exercising the reload-failure path")
+	}
+
+	// (a) SOME terminal manifest still gets persisted, not left stuck
+	// nonterminal.
+	if got := manifests.SaveCalls(); got != 1 {
+		t.Errorf("manifest Save called %d times, want exactly 1", got)
+	}
+	final, err := store.Load(handle)
+	if err != nil {
+		t.Fatalf("store.Load() after terminalize err = %v, want nil", err)
+	}
+	if !final.State.Terminal() {
+		t.Errorf("final manifest state = %v, want a terminal state", final.State)
+	}
+	if final.Result.ExitCode == nil || *final.Result.ExitCode != code {
+		t.Errorf("final manifest Result = %+v, want ExitCode %d", final.Result, code)
+	}
+	if final.Events != events {
+		t.Errorf("final manifest Events = %+v, want unchanged %+v", final.Events, events)
+	}
+
+	// (b) publish/notify are never called with zero-value/nil IDs -- they
+	// use the entry's own pre-persisted stable Events, recovered from
+	// e.base rather than the failed reload.
+	if got := lifecycle.PublishCalls(); got != 1 {
+		t.Errorf("lifecycle publish called %d times, want exactly 1", got)
+	}
+	if lifecycle.lastEvent.EventID.IsZero() {
+		t.Error("lifecycle publish EventID is zero, want the stable pre-persisted Completed ID")
+	}
+	if lifecycle.lastEvent.EventID != events.Completed {
+		t.Errorf("lifecycle publish EventID = %s, want %s", lifecycle.lastEvent.EventID, events.Completed)
+	}
+
+	if got := notifications.NotifyCalls(); got != 1 {
+		t.Errorf("completion notify called %d times, want exactly 1", got)
+	}
+	if notifications.lastEvent.CommandID.IsZero() {
+		t.Error("completion notify CommandID is zero, want the stable pre-persisted CommandID")
+	}
+	if notifications.lastEvent.CommandID != events.CommandID {
+		t.Errorf("completion notify CommandID = %s, want %s", notifications.lastEvent.CommandID, events.CommandID)
+	}
+
+	// (c) quota release / lease release / onTerminal retention hook still
+	// run correctly -- unaffected by the reload failure.
+	if got := quotaReleases.Count(); got != 1 {
+		t.Errorf("quota released %d times, want exactly 1", got)
+	}
+	if got := lease.ReleaseCalls(); got != 1 {
+		t.Errorf("lease released %d times, want exactly 1", got)
+	}
+	if got := onTerminalCalls.Count(); got != 1 {
+		t.Errorf("onTerminal called %d times, want exactly 1", got)
+	}
 }

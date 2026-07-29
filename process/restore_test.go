@@ -150,6 +150,13 @@ func (r *recordingLifecycleSink) Events() []lifecycleTerminalEvent {
 	return out
 }
 
+// publishStart is a no-op: restore_test.go only exercises restore
+// reconciliation's terminal (Lost) publication path, never Supervisor.Start's
+// Started/Backgrounded emission.
+func (r *recordingLifecycleSink) publishStart(_ context.Context, _ lifecycleStartEvent) error {
+	return nil
+}
+
 var _ lifecycleSink = (*recordingLifecycleSink)(nil)
 
 // recordingCompletionNotifier is recordingLifecycleSink's completionNotifier

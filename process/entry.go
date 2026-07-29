@@ -18,14 +18,19 @@ const drainChunkBytes = 32 << 10 // 32 KiB
 
 // manifestSaver is the narrow persistence capability entry.terminalize
 // needs from a ManifestStore: reload the manifest a live entry's Start call
-// already durably persisted (to recover its pre-persisted stable
-// LifecycleEventIDs and every other field a terminal Save must carry
-// forward unchanged) and persist the terminal update. *ManifestStore
+// already durably persisted, and persist the terminal update. *ManifestStore
 // satisfies it directly; entry depends on the interface, not the concrete
 // type, purely so a test can substitute a call-counting fake in place of a
 // real ManifestStore to observe terminalize's one-shot Save guarantee
 // (TestSupervisorTerminalRaceChoosesOnce) without touching real disk I/O
 // semantics.
+//
+// A successful Load is doTerminalize's preferred source of the fields it
+// must carry forward unchanged into the terminal Save, but it is not the
+// only source: entry.base (manifestBase) already carries every one of those
+// same fields, captured once by Supervisor.Start, so a Load failure never
+// leaves doTerminalize without them -- see manifestBase's doc comment and
+// doTerminalize's synthesizeManifest fallback.
 type manifestSaver interface {
 	Load(Handle) (Manifest, error)
 	Save(Manifest) error
@@ -46,6 +51,65 @@ type lifecycleTerminalEvent struct {
 	State      State
 	Result     Result
 	FinishedAt time.Time
+}
+
+// lifecycleStartEvent is the payload lifecycleSink.publishStart receives at
+// a process's Start-time lifecycle emission (Supervisor.Start), the moment
+// the manifest transitions to StateRunning: Started, if the caller did not
+// request immediate backgrounding, or Backgrounded, if it did
+// (YieldSettings.Yield == true) -- Task 8's combined-acceptance text
+// ("lifecycle sink receives the pre-persisted started EventID exactly once"
+// and "explicit/yield handoff emits backgrounded with its stable EventID").
+// Exactly one of {Started, Backgrounded} is ever published per process, at
+// Start, never both, and EventID is always one of the manifest's
+// pre-persisted LifecycleEventIDs.Started/.Backgrounded (manifest.go),
+// mirroring lifecycleTerminalEvent's own pre-persisted-ID discipline --
+// never a freshly minted one.
+//
+// CreatedAt/StartedAt mirror the manifest's own already-set CreatedAt/
+// StartedAt at the point Start calls publishStart (both are set by then,
+// since this happens strictly after the StateRunning Save that sets
+// StartedAt). The harness ProcessLifecycleMetadata validation matrix
+// requires both non-zero for kind Started/Backgrounded
+// (validProcessLifecycleTuple), and forbids a finished timestamp or exit
+// code for either -- this type carries no such fields at all, so a caller
+// building the eventual harness DTO from it cannot populate them by
+// mistake.
+type lifecycleStartEvent struct {
+	EventID   uuid.UUID
+	Kind      tool.ProcessLifecycleKind
+	Identity  Identity
+	CreatedAt time.Time
+	StartedAt time.Time
+}
+
+// manifestBase is the small set of Manifest fields that are set exactly
+// once, at Start, and never change again for the rest of a process's
+// lifetime: the sanitized command description, the effective workspace
+// access mode, whether the process runs under a PTY, the manifest's
+// creation/start/deadline timestamps, and this process's stable
+// LifecycleEventIDs. Supervisor.Start captures all of them onto the entry
+// it registers (entry.base) at the exact same point it persists them into
+// the manifest itself, so entry.doTerminalize's terminal Save never has to
+// depend on successfully reloading the manifest just to recover values it
+// already has in memory -- only Cursors (from e.spool, already
+// reload-independent) and the terminal State/Result/FinishedAt (this call's
+// own parameters) are genuinely NOT part of manifestBase, because they are
+// exactly the fields a terminal transition is setting for the first time.
+//
+// See doTerminalize's synthesizeManifest for the fallback path this makes
+// possible: when e.manifests.Load fails, doTerminalize still assembles a
+// complete, valid terminal Manifest from e.identity + e.base + this call's
+// own parameters, rather than silently skipping the terminal Save (Phase
+// Gate 2 finding).
+type manifestBase struct {
+	command   CommandMetadata
+	access    AccessMode
+	tty       bool
+	createdAt time.Time
+	startedAt time.Time
+	deadline  *time.Time
+	events    LifecycleEventIDs
 }
 
 // completionEvent is the payload completionNotifier.notify receives at a
@@ -91,6 +155,17 @@ type entry struct {
 	observations observationInvalidator
 	ceiling      StorageCeiling
 	yield        YieldSettings
+
+	// base carries the small set of Manifest fields Supervisor.Start sets
+	// once and that never change again -- see manifestBase's doc comment.
+	// It is what lets doTerminalize's terminal Save survive a reload
+	// failure (Phase Gate 2 finding) without losing fidelity: a bare entry
+	// built directly by an older test fixture (predating this field) simply
+	// leaves it at its zero value, which doTerminalize's synthesizeManifest
+	// fallback path only reaches at all when e.manifests.Load has failed --
+	// exactly the same nil/zero-tolerant convention as every other entry
+	// dependency in this file.
+	base manifestBase
 
 	// process is the live tool.Process PreparedProcess.Start returned.
 	// run's drain goroutines and Wait call are its first consumers.
@@ -465,40 +540,39 @@ func (e *entry) terminalize(ctx context.Context, state State, result Result, fin
 }
 
 // doTerminalize is terminalize's guarded body; terminalOnce.Do ensures it
-// runs at most once per entry. It reloads the manifest Start already
-// durably persisted (rather than reconstructing one from scratch) so the
-// terminal Save carries forward every already-persisted field unchanged --
-// most importantly Events, the manifest's stable LifecycleEventIDs
-// (manifest.go): this is what makes the completed/lost lifecycle event and
-// the completion notification reuse the exact pre-persisted EventID/
-// CommandID values rather than minting fresh ones, on this call and on any
-// hypothetical future retry of the same publish step (spec "Manifests and
-// durability": "stable lifecycle EventIDs ... allocated and persisted
-// before publication"). Every dependency is nil-tolerant: a bare entry
-// built directly by a test (no manifests/lifecycle/notifications/
-// releaseQuota/lease wired) still terminalizes cleanly, simply skipping
-// whichever step has no dependency to call.
+// runs at most once per entry. It prefers to reload the manifest Start
+// already durably persisted (rather than reconstructing one from scratch)
+// so the terminal Save carries forward every already-persisted field
+// unchanged. If that reload fails, it falls back to synthesizeManifest,
+// which assembles an equally complete terminal Manifest from e.identity and
+// e.base (manifestBase) -- the same fields Supervisor.Start already
+// captured onto the entry when it first persisted them -- rather than
+// silently skipping the terminal Save entirely (Phase Gate 2 finding: a
+// reload failure must never leave a process's manifest stuck at a
+// nonterminal state, nor fall through to publish/notify with a zero-value
+// manifest and a nil EventID/CommandID the real Harness event codec would
+// reject). Either way, the resulting manifest's Events -- the manifest's
+// stable LifecycleEventIDs (manifest.go) -- is what makes the completed/lost
+// lifecycle event and the completion notification reuse the exact
+// pre-persisted EventID/CommandID values rather than minting fresh ones, on
+// this call and on any hypothetical future retry of the same publish step
+// (spec "Manifests and durability": "stable lifecycle EventIDs ...
+// allocated and persisted before publication"). publish/notify are only
+// ever called with a non-zero EventID/CommandID (see the IsZero guards
+// below); if neither the reload nor the synthesis fallback can produce one
+// -- only possible for a bare entry a test built directly, with no
+// manifests/base wired at all -- they are skipped rather than invoked with
+// an invalid ID. Every dependency is nil-tolerant: a bare entry built
+// directly by a test (no manifests/lifecycle/notifications/releaseQuota/
+// lease wired) still terminalizes cleanly, simply skipping whichever step
+// has no dependency to call.
 func (e *entry) doTerminalize(ctx context.Context, state State, result Result, finishedAt time.Time) {
-	var current Manifest
-	haveManifest := false
-	if e.manifests != nil {
-		if loaded, err := e.manifests.Load(e.identity.Handle); err == nil {
-			current = loaded
-			haveManifest = true
-		}
+	cursors := SpoolCursors{
+		TotalBytes:   e.spool.TotalBytes(),
+		RetainedFrom: e.spool.RetainedFrom(),
 	}
 
-	if haveManifest {
-		current.State = state
-		current.FinishedAt = &finishedAt
-		current.Result = result
-		current.Cursors = SpoolCursors{
-			TotalBytes:   e.spool.TotalBytes(),
-			RetainedFrom: e.spool.RetainedFrom(),
-		}
-		current.CompletionPublished++
-		_ = e.manifests.Save(current)
-	}
+	events, haveEvents := e.terminalManifest(state, result, finishedAt, cursors)
 
 	// exited closes here -- see its doc comment for why this must happen
 	// strictly before the lifecycle publish/completion notify calls below,
@@ -509,13 +583,13 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 	}
 
 	kind := tool.ProcessLifecycleCompleted
-	eventID := current.Events.Completed
+	eventID := events.Completed
 	if state == StateLostOnRestore {
 		kind = tool.ProcessLifecycleLost
-		eventID = current.Events.Lost
+		eventID = events.Lost
 	}
 
-	if e.lifecycle != nil {
+	if e.lifecycle != nil && haveEvents && !eventID.IsZero() {
 		_ = e.lifecycle.publish(ctx, lifecycleTerminalEvent{
 			EventID:    eventID,
 			Kind:       kind,
@@ -526,9 +600,9 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 		})
 	}
 
-	if e.notifications != nil {
+	if e.notifications != nil && haveEvents && !events.CommandID.IsZero() {
 		_ = e.notifications.notify(ctx, completionEvent{
-			CommandID: current.Events.CommandID,
+			CommandID: events.CommandID,
 			Owner:     e.identity.Owner,
 			Handle:    e.identity.Handle,
 			State:     state,
@@ -545,6 +619,92 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 	if e.onTerminal != nil {
 		e.onTerminal(e.identity.Handle, e.identity.Owner)
 	}
+}
+
+// terminalManifest produces and persists the terminal Manifest for this
+// entry, preferring a reload of the manifest Start already durably
+// persisted and falling back to synthesizeManifest when that reload fails.
+// It returns the resulting manifest's Events (the values doTerminalize's
+// publish/notify calls must use) and whether a manifest was actually
+// produced at all -- false only for a bare test-built entry with neither a
+// reloadable manifest nor a populated e.base to synthesize from.
+//
+// Either path's Save call is best-effort, matching the rest of this file's
+// established convention (drain/appendChunk's storage-failure handling,
+// Supervisor.Start's own synchronous terminal-Save branches): a Save
+// failure here does not prevent doTerminalize from still publishing/
+// notifying with the stable IDs it already knows in memory, and does not
+// abort quota/lease release or the onTerminal retention hook -- exactly the
+// fault-injection contract the Phase Gate 2 review asked for ("quota
+// release / lease release / onTerminal retention hook still run correctly"
+// even when persistence itself is degraded).
+func (e *entry) terminalManifest(state State, result Result, finishedAt time.Time, cursors SpoolCursors) (LifecycleEventIDs, bool) {
+	if e.manifests != nil {
+		if loaded, err := e.manifests.Load(e.identity.Handle); err == nil {
+			loaded.State = state
+			loaded.FinishedAt = &finishedAt
+			loaded.Result = result
+			loaded.Cursors = cursors
+			loaded.CompletionPublished++
+			_ = e.manifests.Save(loaded)
+			return loaded.Events, true
+		}
+	}
+
+	// The reload failed (or there is no manifests dependency at all):
+	// synthesize as complete a terminal manifest as this entry's own
+	// in-memory state allows, rather than silently abandoning the terminal
+	// Save.
+	synthesized, ok := e.synthesizeManifest(state, result, finishedAt, cursors)
+	if !ok {
+		return LifecycleEventIDs{}, false
+	}
+	if e.manifests != nil {
+		_ = e.manifests.Save(synthesized)
+	}
+	return synthesized.Events, true
+}
+
+// synthesizeManifest builds a best-effort terminal Manifest entirely from
+// this entry's own in-memory state -- e.identity and e.base (both set once,
+// at Start, and immutable for the rest of a process's lifetime) plus this
+// call's own state/result/finishedAt/cursors parameters -- for
+// terminalManifest to persist when e.manifests.Load has failed to reload
+// the manifest Start already durably persisted. ok is false only when
+// e.identity.Handle is itself invalid: a bare entry a test built directly
+// that was never registered by Supervisor.Start at all, and therefore has
+// nothing meaningful to persist regardless of which path is taken.
+//
+// Every field this method sets comes from e.identity/e.base, never from the
+// failed reload: CommandMetadata, Access, TTY, CreatedAt, Deadline, and
+// Events are all captured once by Supervisor.Start (see manifestBase's doc
+// comment) specifically so a later reload failure here never has to guess
+// at them. CompletionPublished is set directly to 1 rather than
+// incremented: terminalOnce guarantees doTerminalize runs at most once per
+// entry, and Supervisor.Start's own manifest writes never touch
+// CompletionPublished, so the true prior value this terminal transition is
+// replacing is always 0 -- the same effective result the loaded-manifest
+// path's current.CompletionPublished++ produces.
+func (e *entry) synthesizeManifest(state State, result Result, finishedAt time.Time, cursors SpoolCursors) (Manifest, bool) {
+	if !e.identity.Handle.Valid() {
+		return Manifest{}, false
+	}
+	startedAt := e.base.startedAt
+	return Manifest{
+		Identity:            e.identity,
+		Command:             e.base.command,
+		Access:              e.base.access,
+		TTY:                 e.base.tty,
+		State:               state,
+		CreatedAt:           e.base.createdAt,
+		StartedAt:           &startedAt,
+		FinishedAt:          &finishedAt,
+		Deadline:            e.base.deadline,
+		Cursors:             cursors,
+		Result:              result,
+		Events:              e.base.events,
+		CompletionPublished: 1,
+	}, true
 }
 
 // classifyWaitOutcome maps the tool.ProcessResult/error pair

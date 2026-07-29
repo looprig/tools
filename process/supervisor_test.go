@@ -879,6 +879,96 @@ func TestSupervisorPublishesStableLifecycleIDs(t *testing.T) {
 	}
 }
 
+// --- TestSupervisorStartPublishesStartedOrBackgrounded ---
+
+// TestSupervisorStartPublishesStartedOrBackgrounded proves the Phase Gate 2
+// fix to Task 8's combined-acceptance text: "lifecycle sink receives the
+// pre-persisted started EventID exactly once" and "explicit/yield handoff
+// emits backgrounded with its stable EventID". With YieldSettings{Yield:
+// false}, Start must cause the sink to receive exactly one Started publish
+// carrying the manifest's own Events.Started ID; with YieldSettings{Yield:
+// true}, exactly one Backgrounded publish carrying Events.Backgrounded's ID
+// instead, and never a Started publish either way -- exactly one of the two
+// kinds is ever emitted per Start call, never both.
+func TestSupervisorStartPublishesStartedOrBackgrounded(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		yield    bool
+		wantKind tool.ProcessLifecycleKind
+	}{
+		{name: "no yield emits started", yield: false, wantKind: tool.ProcessLifecycleStarted},
+		{name: "yield emits backgrounded", yield: true, wantKind: tool.ProcessLifecycleBackgrounded},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := Config{
+				MaxRunningProcessesPerLoop:    4,
+				MaxRunningProcessesPerSession: 4,
+				MaxProcessInMemoryBytes:       1 << 20,
+				MaxAggregateInMemoryBytes:     10 << 20,
+				MaxProcessSpoolBytes:          1 << 20,
+				MaxAggregateSpoolBytes:        10 << 20,
+			}
+			manifestRoot := t.TempDir()
+			store := NewManifestStore(manifestRoot)
+			sup, err := NewSupervisor(cfg, store, t.TempDir(), nil, nil)
+			if err != nil {
+				t.Fatalf("NewSupervisor() err = %v, want nil", err)
+			}
+			owner := testOwner(t)
+			origin := testOrigin(t)
+
+			proc := &fakeProcess{
+				waitResult: tool.ProcessResult{ExitCode: 0, Reason: tool.ProcessTerminalExited, FinishedAt: time.Now()},
+			}
+			prepared := &fakePreparedProcess{process: proc}
+			lease := &fakeLease{}
+			sink := &fakeLifecycleSink{}
+
+			handle, err := sup.Start(context.Background(), owner, origin, prepared, lease, sink, nil, StorageCeiling{}, YieldSettings{Yield: tt.yield})
+			if err != nil {
+				t.Fatalf("Start() err = %v, want nil", err)
+			}
+
+			t.Cleanup(func() {
+				waitEntryDone(t, testEntry(t, sup, handle), 5*time.Second)
+			})
+
+			afterStart, err := store.Load(handle)
+			if err != nil {
+				t.Fatalf("store.Load() err = %v, want nil", err)
+			}
+
+			if got := sink.PublishStartCalls(); got != 1 {
+				t.Fatalf("publishStart called %d times, want exactly 1", got)
+			}
+			gotEvent := sink.LastStartEvent()
+			if gotEvent.Kind != tt.wantKind {
+				t.Errorf("publishStart Kind = %v, want %v", gotEvent.Kind, tt.wantKind)
+			}
+
+			wantEventID := afterStart.Events.Started
+			if tt.yield {
+				wantEventID = afterStart.Events.Backgrounded
+			}
+			if gotEvent.EventID.IsZero() {
+				t.Error("publishStart EventID is zero, want the manifest's pre-persisted stable ID")
+			}
+			if gotEvent.EventID != wantEventID {
+				t.Errorf("publishStart EventID = %s, want %s", gotEvent.EventID, wantEventID)
+			}
+			if gotEvent.CreatedAt.IsZero() || gotEvent.StartedAt.IsZero() {
+				t.Errorf("publishStart CreatedAt/StartedAt = %v/%v, want both non-zero", gotEvent.CreatedAt, gotEvent.StartedAt)
+			}
+		})
+	}
+}
+
 // --- TestSupervisorNeverEvictsRunning ---
 
 // TestSupervisorNeverEvictsRunning proves that a running entry (one whose
