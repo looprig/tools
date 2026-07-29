@@ -9,11 +9,15 @@ import (
 	"os"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/looprig/tools/internal/nofollow"
 )
 
 // store_windows.go implements store.go's platform primitives for Windows:
 // LockFileEx/UnlockFileEx for the interprocess lock, a
-// FILE_FLAG_OPEN_REPARSE_POINT open for the O_NOFOLLOW symlink defense, and
+// reparse-point-refusing open (delegated to the shared internal/nofollow
+// primitive, this package's own former FILE_FLAG_OPEN_REPARSE_POINT
+// implementation and its documented faithfulness gaps now live there), and
 // a SID/token owner comparison plus NumberOfLinks for the Stat_t-based
 // owner/link-count identity checks. See store_unix.go for the POSIX
 // counterparts and store.go for the shared logic that calls into these.
@@ -22,69 +26,23 @@ import (
 // process token — it compiles and is a good-faith, invariant-preserving
 // port, but real-machine validation belongs to the plan's Phase 5
 // ("Unix PTY and Windows ConPTY") Windows-hardening pass. Faithfulness
-// gaps against the Unix behavior are called out at each function below.
+// gaps against the Unix behavior are called out at each function below (and,
+// for openNoFollow's mechanism, in internal/nofollow's own doc comments).
 
 // openNoFollow opens path with the given flag/perm, refusing to traverse a
 // reparse point (Windows's analogue of a symlink) at the final path
-// component — the closest available equivalent of Unix's O_NOFOLLOW.
-//
-// Faithfulness gap: unlike O_NOFOLLOW, CreateFile has no flag that fails
-// the open outright when the target is a reparse point.
-// FILE_FLAG_OPEN_REPARSE_POINT instead succeeds and hands back a handle to
-// the reparse point object itself (rather than transparently following it
-// to its target, which is the unsafe behavior being defended against). This
-// function closes that gap itself: it inspects the resulting handle's
-// FILE_ATTRIBUTE_REPARSE_POINT bit via GetFileInformationByHandle and
-// refuses (returning errSymlinkNotAllowed) before the handle is ever
-// returned to a caller, so the net effect matches O_NOFOLLOW — traversal is
-// refused, not silently allowed — even though the mechanism differs. One
-// known imprecision: this refuses *any* reparse point (symlink, junction,
-// mount point, or a third-party filesystem filter's reparse tag) rather
-// than symlinks specifically; that is deliberately conservative (fail
-// closed) rather than under-protective, but the Phase 5 pass should confirm
-// it doesn't reject reparse points the store legitimately needs to open.
+// component — the closest available equivalent of Unix's O_NOFOLLOW. It
+// delegates the actual open to the shared internal/nofollow primitive (also
+// used by grep/readfile/filemutation) and translates its exported
+// ErrSymlinkNotAllowed into this package's own errSymlinkNotAllowed so
+// store.go's shared classification keeps using its private sentinel.
 func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
-	var access uint32
-	switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
-	case os.O_WRONLY:
-		access = windows.GENERIC_WRITE
-	case os.O_RDWR:
-		access = windows.GENERIC_READ | windows.GENERIC_WRITE
-	default:
-		access = windows.GENERIC_READ
-	}
-	if flag&os.O_CREATE != 0 {
-		access |= windows.GENERIC_WRITE
-	}
-	createDisposition := uint32(windows.OPEN_EXISTING)
-	if flag&os.O_CREATE != 0 {
-		createDisposition = windows.OPEN_ALWAYS
-	}
-	pathPtr, err := windows.UTF16PtrFromString(path)
+	file, err := nofollow.Open(path, flag, perm)
 	if err != nil {
-		return nil, err
-	}
-	shareMode := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
-	// FILE_FLAG_OPEN_REPARSE_POINT: open the reparse point object itself
-	// instead of transparently following it to its target.
-	attrs := uint32(windows.FILE_ATTRIBUTE_NORMAL | windows.FILE_FLAG_OPEN_REPARSE_POINT)
-	handle, err := windows.CreateFile(pathPtr, access, shareMode, nil, createDisposition, attrs, 0)
-	if err != nil {
-		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-			return nil, fmt.Errorf("%w: %w", fs.ErrNotExist, err)
+		if errors.Is(err, nofollow.ErrSymlinkNotAllowed) {
+			return nil, fmt.Errorf("%w: %w", errSymlinkNotAllowed, err)
 		}
 		return nil, err
-	}
-	file := os.NewFile(uintptr(handle), path)
-
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		_ = file.Close()
-		return nil, fmt.Errorf("%w: refusing reparse point at %s", errSymlinkNotAllowed, path)
 	}
 	return file, nil
 }

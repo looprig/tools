@@ -8,25 +8,29 @@ import (
 	"io/fs"
 	"os"
 	"syscall"
+
+	"github.com/looprig/tools/internal/nofollow"
 )
 
 // store_unix.go implements store.go's platform primitives for every
 // non-Windows target using the POSIX syscall package: symlink-safe opens
-// (O_NOFOLLOW), advisory interprocess locking (flock), and the owner/
-// link-count identity checks (Stat_t). See store_windows.go for the
-// Windows counterparts and store.go for the shared logic that calls into
-// these.
+// (delegated to the shared internal/nofollow primitive), advisory
+// interprocess locking (flock), and the owner/link-count identity checks
+// (Stat_t). See store_windows.go for the Windows counterparts and store.go
+// for the shared logic that calls into these.
 
-// openNoFollow opens path with flag|O_NOFOLLOW so a symlink at the final
-// path component is refused rather than traversed — the store's defense
-// against a symlink swapped in by another user to redirect the store onto a
-// file it does not expect to read or write. A refusal (ELOOP, or EMLINK on
-// platforms that report it that way) is reported as errSymlinkNotAllowed so
-// store.go's shared classification never needs a platform error type.
+// openNoFollow opens path with flag, refusing to traverse a symlink at the
+// final path component — the store's defense against a symlink swapped in
+// by another user to redirect the store onto a file it does not expect to
+// read or write. It delegates the actual open to the shared
+// internal/nofollow primitive (also used by grep/readfile/filemutation) and
+// translates its exported ErrSymlinkNotAllowed into this package's own
+// errSymlinkNotAllowed so store.go's shared classification keeps using its
+// private sentinel.
 func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
-	file, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW, perm)
+	file, err := nofollow.Open(path, flag, perm)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EMLINK) {
+		if errors.Is(err, nofollow.ErrSymlinkNotAllowed) {
 			return nil, fmt.Errorf("%w: %w", errSymlinkNotAllowed, err)
 		}
 		return nil, err
