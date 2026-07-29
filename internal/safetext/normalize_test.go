@@ -338,3 +338,62 @@ func TestTruncateUnderLimitReturnsUnchanged(t *testing.T) {
 		t.Errorf("Truncate() = %q, want unchanged %q", got, data)
 	}
 }
+
+// --- fuzzing ---
+
+// FuzzNormalize is the phase-gate-required fuzz target (plan Task 7, Step 3's
+// queued selector; Phase Gate 2's command matrix runs it by exact name). It
+// checks three invariants against arbitrary byte input, none of which any
+// individual table-driven test above can exhaustively cover:
+//
+//   - Normalize never panics;
+//   - its output is always valid UTF-8 and contains no raw stripped control
+//     byte (C0/C1/DEL) other than the approved whitespace set, and never a
+//     bare ESC -- i.e. no escape sequence or control byte can ever leak
+//     through, complete or truncated, regardless of input;
+//   - feeding the same bytes to a fresh Normalizer in one call versus split
+//     across two calls (at every input's fuzz-chosen midpoint) produces
+//     byte-identical cumulative output -- the exact split-boundary
+//     correctness property this package exists to guarantee (normalize.go's
+//     doc comment: "even when a sequence is split across two separate
+//     Normalize calls"), and the primary reason this target exists at all.
+func FuzzNormalize(f *testing.F) {
+	f.Add([]byte("hello, world\n"))
+	f.Add([]byte("\x1b[31mred\x1b[0m plain"))
+	f.Add([]byte("\x1b]0;window title\x07rest"))
+	f.Add([]byte("\x1bP+q544e\x1b\\tail"))
+	f.Add([]byte{0xff, 0xfe, 0x80, 0x81})
+	f.Add([]byte("caf\xc3\xa9\x00\x1b"))
+	f.Add([]byte{0x1b})
+	f.Add([]byte{0x1b, '['})
+	f.Add([]byte(""))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var whole Normalizer
+		out := whole.Normalize(data)
+
+		if !utf8.Valid(out) {
+			t.Fatalf("Normalize(%q) output is not valid UTF-8: %q", data, out)
+		}
+		for _, r := range string(out) {
+			if r == 0x1B {
+				t.Fatalf("Normalize(%q) output leaked a raw ESC byte: %q", data, out)
+			}
+			if isStrippedControl(r) && !isApprovedWhitespace(r) {
+				t.Fatalf("Normalize(%q) output leaked stripped control rune %U: %q", data, r, out)
+			}
+		}
+
+		if len(data) == 0 {
+			return
+		}
+		split := len(data) / 2
+		var chunked Normalizer
+		var got []byte
+		got = append(got, chunked.Normalize(data[:split])...)
+		got = append(got, chunked.Normalize(data[split:])...)
+		if !bytes.Equal(got, out) {
+			t.Fatalf("split-call output diverged from whole-call output for %q:\n whole: %q\n split: %q", data, out, got)
+		}
+	})
+}
