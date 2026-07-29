@@ -286,9 +286,22 @@ func (e *entry) run(ctx context.Context) {
 		}
 	}
 
-	result, waitErr := e.process.Wait(ctx)
-
+	// Draining to EOF must happen before Wait, not after: EOF on
+	// stdout/stderr is driven by the child process itself closing those
+	// descriptors (which happens independently of whether the parent has
+	// called Wait), but a real os/exec-backed Process's Wait closes the
+	// underlying pipe files once the child exits. Calling Wait first would
+	// race that close against these drain goroutines' still-in-progress
+	// reads on the same pipes and can silently truncate or lose real
+	// output -- exactly the ordering the Go exec package's docs warn
+	// against ("it is incorrect to call Wait before all reads from the
+	// pipe have completed"). tool.ProcessActivitySource's own contract
+	// ("the activity channel must close before Process.Wait returns") is
+	// unaffected either way: draining it here, before Wait is even called,
+	// still satisfies that guarantee.
 	drainWG.Wait()
+
+	result, waitErr := e.process.Wait(ctx)
 
 	e.invalidateObservations(context.Background())
 
