@@ -67,11 +67,9 @@ rerun is required and will be recorded here before Phase 3 begins.
 
 ## Phase 1 — Harness contracts and session coordination
 
-**Decision:** Pending only the authorized Govulncheck result. The implementation,
-functional verification, static/security analysis, builds, and independent
-reviews are accepted. Govulncheck is not reported as passing because contacting
-`vuln.go.dev` would disclose this private repository's module/package names and
-dependency versions, and that disclosure has not been explicitly authorized.
+**Decision:** Accepted. The implementation, functional verification,
+static/security analysis, vulnerability scan, builds, and independent reviews
+all passed.
 
 **Repository head**
 
@@ -126,6 +124,8 @@ The Harness worktree was clean at the final gate.
 - `GOWORK=off ... make lint`: exit 0. Vet and Staticcheck passed; Gosec scanned
   217 files / 50,555 lines and reported zero issues.
 - `GOWORK=off ... go mod verify`: `all modules verified`.
+- After explicit user authorization for the private-module metadata disclosure,
+  `GOWORK=off ... go tool govulncheck ./...`: `No vulnerabilities found.`
 - Native, `linux/amd64`, and `windows/amd64`
   `go build -trimpath ./...`: exit 0.
 - The Windows `internal/sessionruntime` test binary cross-compiled at the final
@@ -142,9 +142,8 @@ The Harness worktree was clean at the final gate.
   findings.
 - Final quality/security re-review: approved with no remaining Critical,
   Important, or Minor findings.
-- The only open Phase Gate 1 item is the networked Govulncheck authorization and
-  result. No alternate database, stale cache, or metadata-disclosure workaround
-  was used.
+- Govulncheck was run only after explicit authorization; no alternate database,
+  stale cache, or metadata-disclosure workaround was used.
 
 ## Phase 3 — Sandbox stabilization coordination note
 
