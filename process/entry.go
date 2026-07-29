@@ -267,6 +267,21 @@ type entry struct {
 // invalidateObservations call is made with context.Background() for the
 // same reason.
 func (e *entry) run(ctx context.Context) {
+	// ctx is lifetimeCtx (supervisor.go's go e.run(lifetimeCtx)), and
+	// lifetimeCancel is its paired cancel func. Deferring the call here
+	// releases the context's resources once run -- the sole owner of this
+	// context's lifetime -- returns, regardless of whether anything actually
+	// observes ctx.Done() beforehand. context.CancelFunc is idempotent, so
+	// this is safe even after a future stop-request path (see this
+	// function's own doc comment above) calls lifetimeCancel early to
+	// interrupt an in-flight Wait. Nil-tolerant like every other entry
+	// dependency (see this file's other "if e.xxx != nil" guards): a bare
+	// *entry built directly by a unit test, rather than through
+	// Supervisor.Start, never sets it.
+	if e.lifetimeCancel != nil {
+		defer e.lifetimeCancel()
+	}
+
 	e.invalidateObservations(ctx)
 
 	var drainWG sync.WaitGroup

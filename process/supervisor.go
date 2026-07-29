@@ -888,7 +888,20 @@ func (s *Supervisor) Start(
 		return "", Wrap(CodeProcessSetupFailed, err)
 	}
 
-	lifetimeCtx, cancel := context.WithCancel(context.Background())
+	// lifetimeCtx is deliberately derived from context.Background(), not the
+	// request-scoped ctx parameter above: per tool.PreparedProcess's
+	// documented contract, "the returned Process lives until Wait, Close,
+	// its deadline, or runner shutdown independently of the Start context,"
+	// and Task 8's combined-acceptance text requires "invocation
+	// cancellation after handoff does not cancel lifetime." A supervised
+	// background process must outlive the Start call that spawned it. cancel
+	// is stored as lifetimeCancel and called by entry.run's own deferred
+	// cleanup once that goroutine returns (entry.go), so the two gosec G118
+	// findings this used to produce here (background-derived context;
+	// cancel func apparently never called) are both addressed, the second
+	// one in a different file gosec's same-function check cannot see --
+	// hence the explicit #nosec below on the one line gosec still flags.
+	lifetimeCtx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- cancel is called by entry.run's deferred cleanup (entry.go), see comment above
 
 	e := &entry{
 		identity:       identity,
@@ -915,7 +928,7 @@ func (s *Supervisor) Start(
 	s.entries[handle] = e
 	s.mu.Unlock()
 
-	go e.run(lifetimeCtx)
+	go e.run(lifetimeCtx) // #nosec G118 -- lifetimeCtx is deliberately independent of ctx; see the comment where it's constructed above
 
 	return handle, nil
 }
