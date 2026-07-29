@@ -83,13 +83,28 @@ func (p *fakePreparedProcess) CloseCalls() int {
 var _ tool.PreparedProcess = (*fakePreparedProcess)(nil)
 
 // fakeProcess is a deterministic, test-controlled implementation of
-// tool.Process. Like fakePreparedProcess, it starts minimal: 8A only needs
-// a value fakePreparedProcess.Start can return. Stdout/Stderr/Stdin return
-// closed, empty streams by default so a caller that reads them in a later
-// microtask never blocks; Wait/Resize/Signal are simple configurable
-// stubs, and Close counts its calls.
+// tool.Process. Like fakePreparedProcess, it starts minimal: 8A only needed
+// a value fakePreparedProcess.Start can return, so Stdout/Stderr defaulted
+// to closed, empty streams unconditionally. 8B adds the stdout/stderr
+// fields below so a stream-drain test can inject its own controllable
+// io.ReadCloser (e.g. an io.Pipe end, or a bytes.Reader wrapped in
+// io.NopCloser) -- see this type's original doc comment's own prediction:
+// "expected to grow new fields ... as Task 8B/8C/8D ... add scenarios
+// (durable handoff, stream drain, terminal races, restore, shutdown)". A
+// zero-value field (nil) preserves 8A's exact default behavior, so no
+// existing test's fakeProcess{} literal changes meaning.
+// Wait/Resize/Signal are simple configurable stubs, and Close counts its
+// calls.
 type fakeProcess struct {
 	streamMode tool.ProcessStreamMode
+
+	// stdout and stderr, when set, are returned verbatim by Stdout/Stderr
+	// instead of the default closed, empty reader. A test that wants to
+	// drive the entry's drain goroutines (entry.go's drain) with
+	// controlled bytes -- an io.Pipe end, for instance -- sets these
+	// directly.
+	stdout io.ReadCloser
+	stderr io.ReadCloser
 
 	waitResult tool.ProcessResult
 	waitErr    error
@@ -101,8 +116,20 @@ type fakeProcess struct {
 	closeCalls int
 }
 
-func (p *fakeProcess) Stdout() io.ReadCloser { return io.NopCloser(strings.NewReader("")) }
-func (p *fakeProcess) Stderr() io.ReadCloser { return io.NopCloser(strings.NewReader("")) }
+func (p *fakeProcess) Stdout() io.ReadCloser {
+	if p.stdout != nil {
+		return p.stdout
+	}
+	return io.NopCloser(strings.NewReader(""))
+}
+
+func (p *fakeProcess) Stderr() io.ReadCloser {
+	if p.stderr != nil {
+		return p.stderr
+	}
+	return io.NopCloser(strings.NewReader(""))
+}
+
 func (p *fakeProcess) Stdin() io.WriteCloser { return nopWriteCloser{io.Discard} }
 
 func (p *fakeProcess) StreamMode() tool.ProcessStreamMode {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
@@ -109,9 +110,9 @@ type reservation struct {
 type Supervisor struct {
 	cfg       Config
 	manifests *ManifestStore
-	// spoolRoot is the private resource root Task 8B's entries will open
-	// their Spool beneath (spool.go's OpenSpool root parameter). 8A stores
-	// it but does not yet open any spool.
+	// spoolRoot is the private resource root every entry's Spool is opened
+	// beneath (spool.go's OpenSpool root parameter). Start opens one Spool
+	// per admitted process here, keyed by that process's Handle.
 	spoolRoot string
 
 	// lifecycle and notifications are the Supervisor's session-scoped
@@ -261,6 +262,25 @@ func (s *Supervisor) releaseLease(lease Lease) {
 	_ = lease.Release()
 }
 
+// accessMode maps a Harness WorkspaceAccessKind (tool.WorkspaceAccess,
+// PreparedProcess.EffectiveWorkspaceAccess) to this package's manifest-level
+// AccessMode (manifest.go). Both are closed, three-value domains in the same
+// read-only/scoped-write/broad-write order. An unrecognized kind -- which
+// tool.WorkspaceAccessKind.Valid() should never let through, but this
+// function does not assume that -- conservatively maps to the narrowest,
+// AccessReadOnly, rather than producing an invalid AccessMode that would
+// fail Manifest.Validate.
+func accessMode(kind tool.WorkspaceAccessKind) AccessMode {
+	switch kind {
+	case tool.WorkspaceAccessScopedWrite:
+		return AccessScopedWrite
+	case tool.WorkspaceAccessBroadWrite:
+		return AccessBroadWrite
+	default:
+		return AccessReadOnly
+	}
+}
+
 // handleExists reports whether h already names an entry in the registry; it
 // is NewHandle's collision check (identity.go's HandleExists), so a minted
 // Handle can never collide with one already admitted.
@@ -283,18 +303,38 @@ func (s *Supervisor) handleExists(h Handle) bool {
 //
 // Start reserves every quota reserveQuota enforces before calling
 // prepared.Start (TestSupervisorReservesQuotaBeforeStart), at most once,
-// exactly matching PreparedProcess.Start's own single-use contract. If
-// prepared.Start fails, Start releases every reservation it made, releases
-// lease, and closes prepared -- idempotent per the Harness PreparedProcess
-// contract -- before returning a *Error wrapping CodeSpawnFailed
-// (TestSupervisorStartFailureReleasesQuota). If a quota is already
-// exhausted, Start returns a *Error wrapping CodeProcessQuotaExceeded
-// without ever calling prepared.Start or prepared.Close
+// exactly matching PreparedProcess.Start's own single-use contract. It then
+// atomically persists this process's manifest in state StateStarting --
+// via s.manifests, a real durable ManifestStore -- before ever calling
+// prepared.Start, so a Handle can never be returned for a process that has
+// no durable record (TestSupervisorPersistsBeforeReturningHandle; spec
+// "Manifests and durability": "Before returning a process handle, Tools
+// atomically persists a manifest"). This requires minting the Handle (and
+// therefore checking handleExists) before prepared.Start is called, not
+// after, unlike a Handle-agnostic admission flow would.
+//
+// If prepared.Start fails, Start releases every reservation it made,
+// releases lease, and closes prepared -- idempotent per the Harness
+// PreparedProcess contract -- before returning a *Error wrapping
+// CodeSpawnFailed (TestSupervisorStartFailureReleasesQuota). The
+// already-persisted StateStarting manifest is deliberately left as-is on
+// this path: transitioning it to a terminal state is Task 8C's
+// terminal-arbiter compare-and-set, not this microtask's. If a quota is
+// already exhausted, Start returns a *Error wrapping
+// CodeProcessQuotaExceeded without ever calling prepared.Start or
+// prepared.Close, and without minting a Handle or writing any manifest
 // (TestSupervisorRejectsSessionAndLoopQuota).
 //
-// Start does not yet persist a manifest, drain streams, or arbitrate a
-// terminal state (Task 8B/8C); it returns the freshly minted Handle as soon
-// as the entry is registered.
+// Once prepared.Start succeeds, Start persists the manifest's StateRunning
+// transition, opens this process's in-memory Buffer and durable Spool
+// (both sized from the exact quota reservation -- see reservation's doc
+// comment), registers the entry, and starts the entry's single
+// wait/activity/drain goroutine (entry.go's run) on a lifetime-scoped
+// context that is deliberately independent of ctx (see run's doc comment
+// for why). Start returns the freshly minted Handle only after the entry
+// is registered and its goroutine has been started
+// (TestSupervisorDrainsOrderedStreams, TestSupervisorSpoolCeilingDropsOldest).
+// Start does not yet arbitrate a terminal state (Task 8C).
 func (s *Supervisor) Start(
 	ctx context.Context,
 	owner Owner,
@@ -315,6 +355,33 @@ func (s *Supervisor) Start(
 		return "", err
 	}
 
+	handle, err := NewHandle(s.handleExists)
+	if err != nil {
+		s.releaseQuota(res)
+		s.releaseLease(lease)
+		_ = prepared.Close()
+		return "", err
+	}
+
+	identity := Identity{Handle: handle, Owner: owner, Origin: origin}
+
+	// CommandMetadata is left at its zero value: Start's signature (fixed
+	// by Task 8's combined-acceptance text) carries no sanitized command
+	// description for this microtask to record, and Manifest.Validate does
+	// not require one. A later phase (Bash, Phase 4) is the caller that
+	// actually knows the command line; wiring it through is out of this
+	// task's scope. TTY is likewise left false here: it is only knowable
+	// from the live tool.Process's StreamMode after prepared.Start
+	// succeeds, and this manifest write must happen strictly before that
+	// call.
+	manifest := NewManifest(identity, CommandMetadata{}, accessMode(prepared.EffectiveWorkspaceAccess().Kind), false, time.Now().UTC(), nil)
+	if err := s.manifests.Save(manifest); err != nil {
+		s.releaseQuota(res)
+		s.releaseLease(lease)
+		_ = prepared.Close()
+		return "", Wrap(CodeProcessSetupFailed, err)
+	}
+
 	proc, err := prepared.Start(ctx)
 	if err != nil {
 		s.releaseQuota(res)
@@ -323,28 +390,46 @@ func (s *Supervisor) Start(
 		return "", Wrap(CodeSpawnFailed, err)
 	}
 
-	handle, err := NewHandle(s.handleExists)
+	startedAt := time.Now().UTC()
+	manifest.State = StateRunning
+	manifest.StartedAt = &startedAt
+	if err := s.manifests.Save(manifest); err != nil {
+		s.releaseQuota(res)
+		s.releaseLease(lease)
+		_ = proc.Close(ctx)
+		return "", Wrap(CodeProcessSetupFailed, err)
+	}
+
+	spool, err := OpenSpool(s.spoolRoot, handle, res.spoolBytes)
 	if err != nil {
 		s.releaseQuota(res)
 		s.releaseLease(lease)
 		_ = proc.Close(ctx)
-		return "", err
+		return "", Wrap(CodeProcessSetupFailed, err)
 	}
 
+	lifetimeCtx, cancel := context.WithCancel(context.Background())
+
 	e := &entry{
-		identity:     Identity{Handle: handle, Owner: owner, Origin: origin},
-		lease:        lease,
-		lifecycle:    sink,
-		observations: observations,
-		ceiling:      ceiling,
-		yield:        yield,
-		process:      proc,
-		reservation:  res,
+		identity:       identity,
+		lease:          lease,
+		lifecycle:      sink,
+		observations:   observations,
+		ceiling:        ceiling,
+		yield:          yield,
+		process:        proc,
+		reservation:    res,
+		buffer:         NewBuffer(res.memoryBytes),
+		spool:          spool,
+		lifetimeCancel: cancel,
+		done:           make(chan struct{}),
 	}
 
 	s.mu.Lock()
 	s.entries[handle] = e
 	s.mu.Unlock()
+
+	go e.run(lifetimeCtx)
 
 	return handle, nil
 }
