@@ -286,9 +286,21 @@ func TestSupervisorIntegrationShutdownAndRestore(t *testing.T) {
 	// A subprocess that ignores the portable interrupt signal (Signal's
 	// graceful request, above) but still dies to a real SIGKILL, so
 	// Shutdown's escalation path is genuinely exercised rather than exiting
-	// on the very first (graceful) signal.
+	// on the very first (graceful) signal. The trailing `exec` matters: without
+	// it, this shell forks sleep as a child rather than replacing itself (a
+	// leading trap disqualifies the shell's usual tail-call exec optimization
+	// for the final command), so execProcess.Kill's single-PID
+	// cmd.Process.Kill only kills the now-empty parent shell while the
+	// orphaned `sleep` keeps running for its full 30s -- verified directly
+	// with a standalone os/exec repro before this fix (EOF/Wait arrived at
+	// ~30s post-kill without `exec`, ~0.2ms with it). `exec` replaces the
+	// shell's own process image with `sleep` in place (same PID), and
+	// SIG_IGN dispositions -- unlike custom handlers -- survive exec, so the
+	// ignored-INT behavior above is preserved. Real cross-grandchild process
+	// tree teardown (killing an entire tree regardless of shell/exec shape)
+	// is Sandbox's job (plan Task 12), not this Tools-only fake's.
 	prepared := &execPreparedProcess{
-		cmd:    exec.Command("sh", "-c", "trap '' INT; sleep 30"),
+		cmd:    exec.Command("sh", "-c", "trap '' INT; exec sleep 30"),
 		access: tool.NewWorkspaceAccess(tool.WorkspaceAccessReadOnly, nil, nil),
 	}
 
