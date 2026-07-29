@@ -147,6 +147,32 @@ type entry struct {
 	// independent stores.
 	appendMu sync.Mutex
 
+	// waitMu guards generation and wake, the append-driven wake mechanism
+	// Task 9A's wait.go builds on (bumpGeneration, generationSnapshot). It
+	// is a separate lock from appendMu -- disjoint from the Buffer/Spool
+	// append sequence -- so a blocked waiter's read of (generation, wake)
+	// never has to contend with, or wait behind, an in-flight append.
+	waitMu sync.Mutex
+	// generation counts how many times appendChunk has appended a
+	// non-empty chunk to this entry, starting at zero. wait.go's waiters
+	// compare a caller-supplied "last observed" generation against the
+	// current value to decide whether new output has arrived since they
+	// last looked.
+	generation uint64
+	// wake is closed, then immediately replaced with a fresh channel, by
+	// every bumpGeneration call (the classic Go "close to broadcast every
+	// current waiter, replace to re-arm for the next one" pattern). A
+	// waiter that captures (generation, wake) together, atomically, under
+	// waitMu (generationSnapshot) can safely decide "already advanced" vs.
+	// "block on wake" with no lost-wakeup window: any bump after the
+	// snapshot is read is guaranteed to close exactly the channel that
+	// snapshot returned. A process's terminal transition is deliberately
+	// not wired through this same mechanism -- see wait.go, which selects
+	// on the entry's existing done channel (closed exactly once, by run,
+	// after terminalize returns) as the independent "or the entry
+	// terminalizes" wake condition instead.
+	wake chan struct{}
+
 	// lifetimeCancel cancels the entry's own lifetime-scoped context (see
 	// run's doc comment for why this is never the ctx a caller passed into
 	// Supervisor.Start). 8B stores it purely so a later microtask (Stop,
@@ -306,11 +332,56 @@ func (e *entry) drain(wg *sync.WaitGroup, r io.ReadCloser) {
 // drain's are: 8B's drain path must never abort or block the process over
 // an output-storage failure. Surfacing a persistent Spool append failure
 // (e.g. disk full) more visibly is out of 8B's scope.
+//
+// A non-empty chunk also bumps this entry's generation (Task 9A), waking
+// every waiter currently blocked in wait.go's blocking Wait modes. The
+// bump happens after appendMu is released: it uses its own lock (waitMu),
+// and there is no ordering requirement between releasing appendMu and
+// bumping generation beyond "after this chunk is durably appended", which
+// is already true once appendMu.Unlock returns.
 func (e *entry) appendChunk(chunk []byte) {
+	if len(chunk) == 0 {
+		return
+	}
+
 	e.appendMu.Lock()
-	defer e.appendMu.Unlock()
 	_, _ = e.buffer.Append(chunk)
 	_, _ = e.spool.Append(chunk)
+	e.appendMu.Unlock()
+
+	e.bumpGeneration()
+}
+
+// bumpGeneration advances the entry's generation counter by one and wakes
+// every waiter currently blocked on the previous generation's wake
+// channel, by closing it and replacing it with a fresh one -- see wake's
+// doc comment for the exact "close to broadcast, replace to re-arm"
+// pattern and why it is race-safe with generationSnapshot. wake may still
+// be nil here for an entry built directly by an older test fixture that
+// predates Task 9A (entry_test.go's TestEntryRunClosesDoneAfterDrainingBothStreams,
+// newRaceEntry); closing a nil channel would panic, so the first bump for
+// such an entry only allocates wake, skipping the close (there is nothing
+// listening on a channel that was never handed out).
+func (e *entry) bumpGeneration() {
+	e.waitMu.Lock()
+	e.generation++
+	if e.wake != nil {
+		close(e.wake)
+	}
+	e.wake = make(chan struct{})
+	e.waitMu.Unlock()
+}
+
+// generationSnapshot atomically returns this entry's current generation
+// together with the wake channel that will close on the very next
+// bumpGeneration call. Reading both values together, under the same lock
+// acquisition, is what lets a caller compare generation against its own
+// last-observed value and then select on wake with no lost-wakeup window
+// (see wake's doc comment).
+func (e *entry) generationSnapshot() (uint64, <-chan struct{}) {
+	e.waitMu.Lock()
+	defer e.waitMu.Unlock()
+	return e.generation, e.wake
 }
 
 // terminalize is the one-shot compare-and-set terminal arbiter every path

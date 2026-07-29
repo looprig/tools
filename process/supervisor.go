@@ -205,6 +205,17 @@ type Supervisor struct {
 	// terminalEntry's doc comment for what this stands in for).
 	nextTerminalSeq int64
 
+	// pendingWaitersBySession tracks, per session, how many blocking (any
+	// or all mode) wait.go Wait calls are currently outstanding (Task 9A).
+	// A missing key means zero. acquireWaiterSlot/releaseWaiterSlot
+	// (wait.go) keep it an exact mirror of every currently-blocked waiter,
+	// enforcing cfg.MaxPendingWaiters -- "the outstanding ProcessOutput
+	// wait: any|all waiters a session admits concurrently" (config.go) --
+	// the same way runningByLoop/runningBySession enforce their own
+	// quotas. Poll-mode Wait calls never touch this map: they return
+	// immediately and never block.
+	pendingWaitersBySession map[uuid.UUID]int
+
 	// shuttingDown is set once by closeAdmission; Start checks it first and
 	// rejects admission immediately once true (Task 8D: "shutting down
 	// rejects admission and input" -- this flag covers admission only; see
@@ -230,15 +241,16 @@ func NewSupervisor(cfg Config, manifests *ManifestStore, spoolRoot string, lifec
 		return nil, Wrap(CodeInvalidSettings, errors.New("manifest store is required"))
 	}
 	return &Supervisor{
-		cfg:              normalized,
-		manifests:        manifests,
-		spoolRoot:        spoolRoot,
-		lifecycle:        lifecycle,
-		notifications:    notifications,
-		runningByLoop:    make(map[uuid.UUID]int),
-		runningBySession: make(map[uuid.UUID]int),
-		entries:          make(map[Handle]*entry),
-		terminal:         make(map[Handle]terminalEntry),
+		cfg:                     normalized,
+		manifests:               manifests,
+		spoolRoot:               spoolRoot,
+		lifecycle:               lifecycle,
+		notifications:           notifications,
+		runningByLoop:           make(map[uuid.UUID]int),
+		runningBySession:        make(map[uuid.UUID]int),
+		entries:                 make(map[Handle]*entry),
+		terminal:                make(map[Handle]terminalEntry),
+		pendingWaitersBySession: make(map[uuid.UUID]int),
 	}, nil
 }
 
@@ -691,6 +703,7 @@ func (s *Supervisor) Start(
 		spool:          spool,
 		lifetimeCancel: cancel,
 		done:           make(chan struct{}),
+		wake:           make(chan struct{}),
 	}
 
 	s.mu.Lock()
