@@ -112,7 +112,7 @@ func loadOnlyManifest(t *testing.T, store *ManifestStore, dir string) Manifest {
 // Supervisor.evictResources' spool.Remove call actually deleted the file.
 func spoolFileExists(t *testing.T, spoolRoot string, h Handle) bool {
 	t.Helper()
-	path, err := resourcePath(spoolRoot, h, spoolSuffix)
+	path, _, err := resourcePath(spoolRoot, h, spoolSuffix)
 	if err != nil {
 		t.Fatalf("resourcePath() err = %v, want nil", err)
 	}

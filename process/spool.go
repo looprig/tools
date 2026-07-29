@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"sync"
 
@@ -71,20 +72,20 @@ func OpenSpool(root string, h Handle, ceiling int64) (*Spool, error) {
 	if ceiling <= 0 {
 		ceiling = DefaultMaxProcessSpoolBytes
 	}
-	path, err := resourcePath(root, h, spoolSuffix)
+	path, rel, err := resourcePath(root, h, spoolSuffix)
 	if err != nil {
 		return nil, err
 	}
 
 	s := &Spool{path: path, ceiling: ceiling}
 
-	data, err := os.ReadFile(path)
+	data, err := readResourceFile(root, rel)
 	switch {
 	case err == nil:
 		if err := s.hydrate(data); err != nil {
 			return nil, err
 		}
-	case os.IsNotExist(err):
+	case errors.Is(err, fs.ErrNotExist):
 		// Fresh spool: nothing retained yet.
 	default:
 		return nil, Wrap(CodeSpoolCorrupt, err)

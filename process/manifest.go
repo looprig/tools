@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -372,24 +373,55 @@ func (e *ImmutableIdentityChangedError) Error() string {
 	return fmt.Sprintf("process: manifest %s: update changed immutable identity", e.Handle)
 }
 
-// resourcePath resolves the on-disk path for a per-process resource file
-// (manifest or spool) beneath root, keyed by h plus a fixed suffix. It
-// defensively re-checks that the resolved path is lexically within root
-// even though Handle.Valid() already constrains h to unpadded URL-safe
-// base64 with no path separators — this is the security invariant that no
-// path constructed by this package may ever escape the private
-// resource-root directory, proven even against a malicious or corrupt
-// Handle string built by direct type conversion rather than NewHandle.
-func resourcePath(root string, h Handle, suffix string) (string, error) {
+// resourcePath resolves both the absolute on-disk path and the root-relative
+// name for a per-process resource file (manifest or spool) beneath root,
+// keyed by h plus a fixed suffix. It defensively re-checks that the resolved
+// path is lexically within root even though Handle.Valid() already
+// constrains h to unpadded URL-safe base64 with no path separators — this is
+// the security invariant that no path constructed by this package may ever
+// escape the private resource-root directory, proven even against a
+// malicious or corrupt Handle string built by direct type conversion rather
+// than NewHandle.
+//
+// The returned rel is suitable for use as the name argument to an *os.Root
+// scoped to root (readResourceFile below): callers needing read access
+// scope through that root as defense-in-depth on top of this lexical check,
+// rather than opening full directly. full remains available for the callers
+// that need an absolute path -- atomicfile.Replace's create-temp-and-rename
+// dance and os.Remove.
+func resourcePath(root string, h Handle, suffix string) (full, rel string, err error) {
 	if !h.Valid() {
-		return "", New(CodeNotFound)
+		return "", "", New(CodeNotFound)
 	}
-	full := filepath.Join(root, string(h)+suffix)
-	rel, err := filepath.Rel(root, full)
+	full = filepath.Join(root, string(h)+suffix)
+	rel, err = filepath.Rel(root, full)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", New(CodeNotFound)
+		return "", "", New(CodeNotFound)
 	}
-	return full, nil
+	return full, rel, nil
+}
+
+// readResourceFile reads the resource file named rel (the root-relative name
+// resourcePath returns) from beneath root, scoped through an *os.Root opened
+// for exactly the duration of this one read (gosec G304: "Consider using
+// os.Root to scope file access under a fixed root"). This is defense-in-depth
+// layered on top of resourcePath's own Handle-format and lexical-escape
+// checks, not a replacement for them: rel is never trusted to be safe merely
+// because it came from resourcePath.
+//
+// The *os.Root is opened and closed per call rather than held on
+// ManifestStore/Spool: neither type has, or should gain, a store-wide Close
+// of its own (see supervisor.go's doShutdown doc comment), and a manifest or
+// spool read can happen at any point in a process's — or a restored
+// process's — lifetime, long after any single construction-time root handle
+// could reasonably be assumed still valid.
+func readResourceFile(root, rel string) ([]byte, error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return r.ReadFile(rel)
 }
 
 // ManifestStore persists one Manifest per process Handle as versioned JSON
@@ -409,25 +441,30 @@ func NewManifestStore(root string) *ManifestStore {
 	return &ManifestStore{root: filepath.Clean(root)}
 }
 
+// path resolves h's absolute on-disk manifest path, for the callers below
+// that need one (Save's atomicfile.Replace, Delete's os.Remove).
 func (s *ManifestStore) path(h Handle) (string, error) {
-	return resourcePath(s.root, h, manifestSuffix)
+	full, _, err := resourcePath(s.root, h, manifestSuffix)
+	return full, err
 }
 
 // Load reads and validates the manifest for h. A missing file reports
 // CodeNotFound. Malformed JSON, an unrecognized format version, or a value
 // that fails Manifest.Validate all report CodeManifestCorrupt.
 func (s *ManifestStore) Load(h Handle) (Manifest, error) {
-	path, err := s.path(h)
+	_, rel, err := resourcePath(s.root, h, manifestSuffix)
 	if err != nil {
 		return Manifest{}, err
 	}
-	return s.loadPath(path)
+	return s.loadPath(rel)
 }
 
-func (s *ManifestStore) loadPath(path string) (Manifest, error) {
-	data, err := os.ReadFile(path)
+// loadPath reads and validates the manifest named rel -- a root-relative
+// name from resourcePath -- from beneath s.root.
+func (s *ManifestStore) loadPath(rel string) (Manifest, error) {
+	data, err := readResourceFile(s.root, rel)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return Manifest{}, New(CodeNotFound)
 		}
 		return Manifest{}, Wrap(CodeManifestCorrupt, err)
@@ -461,7 +498,7 @@ func (s *ManifestStore) Save(m Manifest) error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
-	path, err := s.path(m.Handle)
+	path, rel, err := resourcePath(s.root, m.Handle, manifestSuffix)
 	if err != nil {
 		return err
 	}
@@ -469,7 +506,7 @@ func (s *ManifestStore) Save(m Manifest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	existing, err := s.loadPath(path)
+	existing, err := s.loadPath(rel)
 	switch {
 	case err == nil:
 		if err := validateManifestUpdate(existing, m); err != nil {
