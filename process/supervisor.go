@@ -52,26 +52,36 @@ type YieldSettings struct {
 	Yield bool
 }
 
-// lifecycleSink is Task 8's minimal placeholder for the narrow lifecycle-
-// publication capability the spec's "Supervisor lifetime" section describes
-// as half of Harness's SessionResourceServices ("stable lifecycle EventIDs
-// ... allocated and persisted before the corresponding Harness lifecycle
-// event ... may be published"). It intentionally carries no methods yet:
-// 8A only needs to accept and store an implementation (both at construction
-// and, per admission, from Start -- see NewSupervisor and Start's doc
-// comments for why both exist), never to call one. Task 8C adds the methods
-// needed to publish started/backgrounded/completed/lost records using a
-// manifest's pre-persisted stable EventIDs (manifest.go's
-// LifecycleEventIDs).
-type lifecycleSink interface{}
+// lifecycleSink is the narrow lifecycle-publication capability the spec's
+// "Supervisor lifetime" section describes as half of Harness's
+// SessionResourceServices ("stable lifecycle EventIDs ... allocated and
+// persisted before the corresponding Harness lifecycle event ... may be
+// published"). 8A only accepted and stored an implementation (both at
+// construction and, per admission, from Start -- see NewSupervisor and
+// Start's doc comments for why both exist), never called one. Task 8C adds
+// publish, the method entry.terminalize calls exactly once per process, at
+// its one-shot terminal transition, always with the manifest's already-
+// persisted stable EventID for event.Kind (manifest.go's
+// LifecycleEventIDs.Completed or .Lost) -- never a freshly minted one. 8C
+// never calls publish for a started/backgrounded record; wiring those
+// call sites (at Start/yield time, once a real Harness implementation
+// exists) is a later phase's job, not this microtask's.
+type lifecycleSink interface {
+	publish(ctx context.Context, event lifecycleTerminalEvent) error
+}
 
-// completionNotifier is Task 8's minimal placeholder for the other half of
-// SessionResourceServices: the bounded completion notification submitted to
-// the owning loop (spec "Supervisor lifetime"; mirrors harness/pkg/tool's
-// ProcessCompletionNotification). Like lifecycleSink, it carries no methods
-// yet in 8A; Task 8C/8D add them alongside the terminal-arbiter and
-// retention work that actually needs to notify.
-type completionNotifier interface{}
+// completionNotifier is the other half of SessionResourceServices: the
+// bounded completion notification submitted to the owning loop (spec
+// "Supervisor lifetime"; mirrors harness/pkg/tool's
+// ProcessCompletionNotification). Like lifecycleSink, 8A accepted and
+// stored an implementation but never called one. Task 8C adds notify, the
+// method entry.terminalize calls exactly once per process, at the same
+// one-shot terminal transition, always with the manifest's already-
+// persisted stable LifecycleEventIDs.CommandID -- never a freshly minted
+// one.
+type completionNotifier interface {
+	notify(ctx context.Context, event completionEvent) error
+}
 
 // observationInvalidator is Task 8's minimal placeholder for the
 // originating loop's observation-cache invalidation capability (spec
@@ -281,6 +291,36 @@ func accessMode(kind tool.WorkspaceAccessKind) AccessMode {
 	}
 }
 
+// newLifecycleEventIDs allocates a fresh stable EventID for each lifecycle
+// kind a process could eventually emit -- started, backgrounded, completed,
+// lost -- plus a completion CommandID, all in one call so Start can persist
+// every one of them in the very first manifest it ever saves (spec
+// "Manifests and durability": "stable lifecycle EventIDs and completion-
+// notification CommandID allocated and persisted before publication").
+// Allocating all five up front, rather than minting each lazily at its own
+// publish time, is what lets a later publish attempt -- including a
+// hypothetical retry, or one made after a crash-recovery reload of the
+// manifest from disk -- always reuse the exact same ID:
+// ManifestStore.Save's validateLifecycleEventIDsStable (manifest.go)
+// rejects any later attempt to reassign an already-non-zero field.
+func newLifecycleEventIDs() (LifecycleEventIDs, error) {
+	var ids [5]uuid.UUID
+	for i := range ids {
+		id, err := uuid.New()
+		if err != nil {
+			return LifecycleEventIDs{}, err
+		}
+		ids[i] = id
+	}
+	return LifecycleEventIDs{
+		Started:      ids[0],
+		Backgrounded: ids[1],
+		Completed:    ids[2],
+		Lost:         ids[3],
+		CommandID:    ids[4],
+	}, nil
+}
+
 // handleExists reports whether h already names an entry in the registry; it
 // is NewHandle's collision check (identity.go's HandleExists), so a minted
 // Handle can never collide with one already admitted.
@@ -314,12 +354,14 @@ func (s *Supervisor) handleExists(h Handle) bool {
 // after, unlike a Handle-agnostic admission flow would.
 //
 // If prepared.Start fails, Start releases every reservation it made,
-// releases lease, and closes prepared -- idempotent per the Harness
-// PreparedProcess contract -- before returning a *Error wrapping
-// CodeSpawnFailed (TestSupervisorStartFailureReleasesQuota). The
-// already-persisted StateStarting manifest is deliberately left as-is on
-// this path: transitioning it to a terminal state is Task 8C's
-// terminal-arbiter compare-and-set, not this microtask's. If a quota is
+// releases lease, closes prepared -- idempotent per the Harness
+// PreparedProcess contract -- and transitions the already-persisted
+// StateStarting manifest directly to StateFailed (there is no live entry
+// on this path, so this is a plain synchronous Save, not
+// entry.terminalize's compare-and-set: Start's own call sequence is
+// already the only writer of this manifest at this point, and no
+// concurrent caller can race it) before returning a *Error wrapping
+// CodeSpawnFailed (TestSupervisorStartFailureReleasesQuota). If a quota is
 // already exhausted, Start returns a *Error wrapping
 // CodeProcessQuotaExceeded without ever calling prepared.Start or
 // prepared.Close, and without minting a Handle or writing any manifest
@@ -334,7 +376,17 @@ func (s *Supervisor) handleExists(h Handle) bool {
 // for why). Start returns the freshly minted Handle only after the entry
 // is registered and its goroutine has been started
 // (TestSupervisorDrainsOrderedStreams, TestSupervisorSpoolCeilingDropsOldest).
-// Start does not yet arbitrate a terminal state (Task 8C).
+//
+// Start allocates this process's stable LifecycleEventIDs
+// (newLifecycleEventIDs) and records them on the very first manifest it
+// persists, so they are already durably in place before the process can
+// ever reach a terminal state (TestSupervisorPublishesStableLifecycleIDs;
+// spec "Manifests and durability"). Start itself does not arbitrate a
+// terminal state for a process that reaches one after prepared.Start
+// succeeds -- that is entry.terminalize's one-shot compare-and-set
+// (entry.go), driven by run's natural Wait() return today and, starting in
+// Task 9C, also by an explicit stop request, a deadline timeout, or
+// supervisor shutdown.
 func (s *Supervisor) Start(
 	ctx context.Context,
 	owner Owner,
@@ -365,6 +417,21 @@ func (s *Supervisor) Start(
 
 	identity := Identity{Handle: handle, Owner: owner, Origin: origin}
 
+	// events are this process's stable lifecycle EventIDs and completion
+	// CommandID (manifest.go's LifecycleEventIDs), allocated once here and
+	// recorded on every manifest Save from this point on. See
+	// newLifecycleEventIDs' doc comment for why allocating all five up
+	// front -- rather than lazily at each one's own publish time -- is what
+	// lets entry.terminalize's eventual completed/lost publish always reuse
+	// these exact IDs.
+	events, err := newLifecycleEventIDs()
+	if err != nil {
+		s.releaseQuota(res)
+		s.releaseLease(lease)
+		_ = prepared.Close()
+		return "", Wrap(CodeProcessSetupFailed, err)
+	}
+
 	// CommandMetadata is left at its zero value: Start's signature (fixed
 	// by Task 8's combined-acceptance text) carries no sanitized command
 	// description for this microtask to record, and Manifest.Validate does
@@ -375,6 +442,7 @@ func (s *Supervisor) Start(
 	// succeeds, and this manifest write must happen strictly before that
 	// call.
 	manifest := NewManifest(identity, CommandMetadata{}, accessMode(prepared.EffectiveWorkspaceAccess().Kind), false, time.Now().UTC(), nil)
+	manifest.Events = events
 	if err := s.manifests.Save(manifest); err != nil {
 		s.releaseQuota(res)
 		s.releaseLease(lease)
@@ -387,6 +455,17 @@ func (s *Supervisor) Start(
 		s.releaseQuota(res)
 		s.releaseLease(lease)
 		_ = prepared.Close()
+
+		finishedAt := time.Now().UTC()
+		manifest.State = StateFailed
+		manifest.FinishedAt = &finishedAt
+		manifest.Result = Result{Reason: reasonString(tool.ProcessTerminalFailed)}
+		// Best-effort: Start already reports CodeSpawnFailed regardless of
+		// whether this terminal Save itself succeeds, and there is no
+		// entry/completion-notification path to retry it through on this
+		// synchronous, single-writer path.
+		_ = s.manifests.Save(manifest)
+
 		return "", Wrap(CodeSpawnFailed, err)
 	}
 
@@ -419,6 +498,9 @@ func (s *Supervisor) Start(
 		yield:          yield,
 		process:        proc,
 		reservation:    res,
+		manifests:      s.manifests,
+		notifications:  s.notifications,
+		releaseQuota:   s.releaseQuota,
 		buffer:         NewBuffer(res.memoryBytes),
 		spool:          spool,
 		lifetimeCancel: cancel,

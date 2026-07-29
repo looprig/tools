@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,13 +112,27 @@ func TestSupervisorPersistsBeforeReturningHandle(t *testing.T) {
 	observed := make(chan Manifest, 1)
 	observeErr := make(chan error, 1)
 
+	// stdoutR/stderrR are deliberately never closed until this test's own
+	// post-Start manifest assertions are done: an entry whose process looks
+	// already-exited (fakeProcess{}'s zero-value Wait) now drives real
+	// terminal arbitration (Task 8C), including an asynchronous manifest
+	// Save that would otherwise race this test's own synchronous
+	// store.Load(handle) check of the StateRunning manifest immediately
+	// below.
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	t.Cleanup(func() {
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+	})
+
 	prepared := &fakePreparedProcess{
 		startFunc: func(ctx context.Context) (tool.Process, error) {
 			m := loadOnlyManifest(t, store, manifestRoot)
 			observed <- m
 			observeErr <- nil
 			<-release
-			return &fakeProcess{}, nil
+			return &fakeProcess{stdout: stdoutR, stderr: stderrR}, nil
 		},
 	}
 	lease := &fakeLease{}
@@ -374,6 +389,19 @@ func TestSupervisorReservesQuotaBeforeStart(t *testing.T) {
 		observedLoop, observedSession int
 		observedMemory, observedSpool int64
 	)
+
+	// See TestSupervisorPersistsBeforeReturningHandle's stdoutR/stderrR
+	// comment: keep the admitted entry's process looking "still running"
+	// (drain blocked on unclosed pipes) until this test's own post-Start
+	// assertions -- including lease.ReleaseCalls() == 0 -- are done, so
+	// Task 8C's real terminal arbitration cannot race them.
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	t.Cleanup(func() {
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+	})
+
 	prepared := &fakePreparedProcess{
 		startFunc: func(ctx context.Context) (tool.Process, error) {
 			sup.mu.Lock()
@@ -382,7 +410,7 @@ func TestSupervisorReservesQuotaBeforeStart(t *testing.T) {
 			observedMemory = sup.reservedMemoryBytes
 			observedSpool = sup.reservedSpoolBytes
 			sup.mu.Unlock()
-			return &fakeProcess{}, nil
+			return &fakeProcess{stdout: stdoutR, stderr: stderrR}, nil
 		},
 	}
 	lease := &fakeLease{}
@@ -532,7 +560,19 @@ func TestSupervisorRejectsSessionAndLoopQuota(t *testing.T) {
 				secondOwner.SessionID = mustUUID(t)
 			}
 
-			first := &fakePreparedProcess{process: &fakeProcess{}}
+			// Keep first's process looking "still running" (drain blocked on
+			// unclosed pipes) for the rest of this subtest: otherwise Task
+			// 8C's real terminal arbitration could release first's quota
+			// reservation before second's Start call below, which would
+			// wrongly let second be admitted instead of rejected.
+			firstStdoutR, firstStdoutW := io.Pipe()
+			firstStderrR, firstStderrW := io.Pipe()
+			t.Cleanup(func() {
+				_ = firstStdoutW.Close()
+				_ = firstStderrW.Close()
+			})
+
+			first := &fakePreparedProcess{process: &fakeProcess{stdout: firstStdoutR, stderr: firstStderrR}}
 			if _, err := sup.Start(context.Background(), firstOwner, testOrigin(t), first, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{}); err != nil {
 				t.Fatalf("first Start() err = %v, want nil", err)
 			}
@@ -549,5 +589,185 @@ func TestSupervisorRejectsSessionAndLoopQuota(t *testing.T) {
 				t.Errorf("PreparedProcess.Close called %d times for rejected admission, want 0", got)
 			}
 		})
+	}
+}
+
+// --- TestSupervisorTerminalRaceChoosesOnce ---
+
+// TestSupervisorTerminalRaceChoosesOnce proves entry.terminalize's one-shot
+// compare-and-set: when several goroutines race to terminalize the same
+// entry concurrently -- standing in for the natural Wait() return racing an
+// explicit stop request, a timeout, and supervisor shutdown, none of which
+// have a caller yet (Task 9C) -- exactly one of them wins. Its dominant
+// assertion is that the manifest was written exactly once (SaveCalls()==1)
+// and, consequently, that the final persisted manifest carries exactly one
+// racer's ExitCode rather than some interleaving/corruption of several.
+// TestSupervisorReleasesLeaseOnce exercises the same race, but leads with
+// the lease-release assertion instead.
+func TestSupervisorTerminalRaceChoosesOnce(t *testing.T) {
+	t.Parallel()
+
+	e, fakes := newRaceEntry(t)
+
+	const racers = 8
+	var wg sync.WaitGroup
+	wg.Add(racers)
+	for i := 0; i < racers; i++ {
+		code := i
+		go func() {
+			defer wg.Done()
+			e.terminalize(context.Background(), StateExited, Result{ExitCode: &code, Reason: "exited"}, time.Now().UTC())
+		}()
+	}
+	wg.Wait()
+
+	if got := fakes.manifests.SaveCalls(); got != 1 {
+		t.Errorf("manifest Save called %d times across %d concurrent terminalize calls, want exactly 1", got, racers)
+	}
+	if got := fakes.lifecycle.PublishCalls(); got != 1 {
+		t.Errorf("lifecycle publish called %d times, want exactly 1", got)
+	}
+	if got := fakes.notifications.NotifyCalls(); got != 1 {
+		t.Errorf("completion notify called %d times, want exactly 1", got)
+	}
+	if got := fakes.quotaReleases.Count(); got != 1 {
+		t.Errorf("quota released %d times, want exactly 1", got)
+	}
+
+	final, err := fakes.manifests.Load(e.identity.Handle)
+	if err != nil {
+		t.Fatalf("Load() err = %v, want nil", err)
+	}
+	if !final.State.Terminal() {
+		t.Errorf("final manifest state = %v, want a terminal state", final.State)
+	}
+	if final.Result.ExitCode == nil {
+		t.Fatal("final manifest Result.ExitCode is nil, want the winning racer's exit code")
+	}
+	if got := *final.Result.ExitCode; got < 0 || got >= racers {
+		t.Errorf("final manifest Result.ExitCode = %d, want one of the %d racers' codes [0, %d)", got, racers, racers)
+	}
+
+	// A second, later call must remain a no-op: terminalOnce has already
+	// fired, so this must not attempt (and therefore must not fail
+	// against) another terminal Save.
+	e.terminalize(context.Background(), StateKilled, Result{Reason: "killed"}, time.Now().UTC())
+	if got := fakes.manifests.SaveCalls(); got != 1 {
+		t.Errorf("manifest Save called %d times after a later terminalize call, want still exactly 1", got)
+	}
+}
+
+// --- TestSupervisorReleasesLeaseOnce ---
+
+// TestSupervisorReleasesLeaseOnce proves the same one-shot race as
+// TestSupervisorTerminalRaceChoosesOnce, but leads with the
+// combined-acceptance text's "one lease release" property: fakeLease's
+// call counter (reused from 8A's fake_process_test.go) reports exactly one
+// Release call no matter how many goroutines race to terminalize the same
+// entry concurrently.
+func TestSupervisorReleasesLeaseOnce(t *testing.T) {
+	t.Parallel()
+
+	e, fakes := newRaceEntry(t)
+
+	const racers = 8
+	var wg sync.WaitGroup
+	wg.Add(racers)
+	for i := 0; i < racers; i++ {
+		go func() {
+			defer wg.Done()
+			e.terminalize(context.Background(), StateFailed, Result{Reason: "failed"}, time.Now().UTC())
+		}()
+	}
+	wg.Wait()
+
+	if got := fakes.lease.ReleaseCalls(); got != 1 {
+		t.Errorf("Lease.Release called %d times across %d concurrent terminalize calls, want exactly 1", got, racers)
+	}
+}
+
+// --- TestSupervisorPublishesStableLifecycleIDs ---
+
+// TestSupervisorPublishesStableLifecycleIDs proves that Start allocates and
+// durably persists this process's stable LifecycleEventIDs (manifest.go)
+// before the process can ever reach a terminal state, and that the actual
+// terminal-path publication reuses those exact pre-persisted IDs rather
+// than minting new ones: (a) every Events field is already non-zero in the
+// manifest immediately after Start returns, before any terminal event, and
+// (b) reloading the manifest from disk -- once right after the entry
+// terminalizes, and again a second time simulating a crash-recovery reload
+// / retry of the terminal-publication step -- reports the exact same
+// values both times, not freshly minted ones.
+func TestSupervisorPublishesStableLifecycleIDs(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		MaxRunningProcessesPerLoop:    4,
+		MaxRunningProcessesPerSession: 4,
+		MaxProcessInMemoryBytes:       1 << 20,
+		MaxAggregateInMemoryBytes:     10 << 20,
+		MaxProcessSpoolBytes:          1 << 20,
+		MaxAggregateSpoolBytes:        10 << 20,
+	}
+	manifestRoot := t.TempDir()
+	store := NewManifestStore(manifestRoot)
+	sup, err := NewSupervisor(cfg, store, t.TempDir(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewSupervisor() err = %v, want nil", err)
+	}
+	owner := testOwner(t)
+	origin := testOrigin(t)
+
+	proc := &fakeProcess{
+		waitResult: tool.ProcessResult{ExitCode: 0, Reason: tool.ProcessTerminalExited, FinishedAt: time.Now()},
+	}
+	prepared := &fakePreparedProcess{process: proc}
+	lease := &fakeLease{}
+
+	handle, err := sup.Start(context.Background(), owner, origin, prepared, lease, nil, nil, StorageCeiling{}, YieldSettings{})
+	if err != nil {
+		t.Fatalf("Start() err = %v, want nil", err)
+	}
+
+	afterStart, err := store.Load(handle)
+	if err != nil {
+		t.Fatalf("store.Load() err = %v, want nil", err)
+	}
+	if afterStart.Events.Started.IsZero() ||
+		afterStart.Events.Backgrounded.IsZero() ||
+		afterStart.Events.Completed.IsZero() ||
+		afterStart.Events.Lost.IsZero() ||
+		afterStart.Events.CommandID.IsZero() {
+		t.Fatalf("manifest Events immediately after Start = %+v, want every field non-zero", afterStart.Events)
+	}
+
+	e := testEntry(t, sup, handle)
+	select {
+	case <-e.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the entry to terminalize")
+	}
+
+	afterTerminal, err := store.Load(handle)
+	if err != nil {
+		t.Fatalf("store.Load() err = %v, want nil", err)
+	}
+	if !afterTerminal.State.Terminal() {
+		t.Errorf("manifest state after terminalize = %v, want terminal", afterTerminal.State)
+	}
+	if afterTerminal.Events != afterStart.Events {
+		t.Errorf("manifest Events after terminalize = %+v, want unchanged from %+v", afterTerminal.Events, afterStart.Events)
+	}
+
+	// Simulate a crash-recovery reload / retry of the terminal-publication
+	// step: reload the manifest from disk a second time and confirm it
+	// still reports the exact same pre-persisted IDs, not freshly minted
+	// ones.
+	reloaded, err := store.Load(handle)
+	if err != nil {
+		t.Fatalf("store.Load() (second reload) err = %v, want nil", err)
+	}
+	if reloaded.Events != afterStart.Events {
+		t.Errorf("manifest Events on reload = %+v, want unchanged from %+v", reloaded.Events, afterStart.Events)
 	}
 }
