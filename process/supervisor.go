@@ -221,6 +221,19 @@ type Supervisor struct {
 	// rejects admission and input" -- this flag covers admission only; see
 	// closeAdmission's doc comment for scope).
 	shuttingDown bool
+
+	// shutdownOnce guards Shutdown's actual coordinated-termination sequence
+	// (Task 9C) so concurrent and later callers all share exactly one
+	// shutdown attempt and its exact result -- combined-acceptance:
+	// "concurrent shutdown callers receive the same result". shutdownErr is
+	// written exactly once, by whichever caller's Do closure executes
+	// doShutdown, and is safe for every other caller to read immediately
+	// after its own Do call returns without any additional lock: sync.Once's
+	// own memory-model guarantee ("the completion of a single call of f() is
+	// synchronized before the return of any call of Do(f)") makes that read
+	// safe.
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 // NewSupervisor returns a Supervisor governed by cfg (normalized; see
@@ -275,6 +288,197 @@ func (s *Supervisor) closeAdmission() {
 	s.mu.Lock()
 	s.shuttingDown = true
 	s.mu.Unlock()
+}
+
+// Shutdown implements the spec's "Supervisor lifetime" coordinated shutdown
+// sequence: close admission to new processes, concurrently request graceful
+// termination of every currently running process tree, escalate to a
+// forceful kill for any tree still running once cfg.GracefulShutdownPeriod
+// elapses, confirm every tree has exited, and return any teardown failure to
+// the caller.
+//
+// Shutdown closes admission (closeAdmission) as its very first step --
+// before requesting termination of a single process -- so a concurrent Start
+// call is rejected immediately with CodeSupervisorShuttingDown even while
+// Shutdown's later termination/escalation steps are still in flight
+// (TestShutdownClosesAdmissionBeforeStop).
+//
+// Every currently running entry (snapshotRunningEntries) is signaled
+// tool.ProcessSignalTerminate concurrently, one goroutine per entry; an
+// entry that has not confirmed exit within cfg.GracefulShutdownPeriod of
+// that request is then signaled tool.ProcessSignalKill
+// (TestShutdownEscalatesAndConfirmsTrees). Shutdown waits on each entry's
+// exited channel -- not done -- for that confirmation: see entry.go's
+// exited field doc comment for why a slow or backpressured completion
+// notification must never delay this step (combined-acceptance:
+// "notification backpressure cannot block terminalization"). A signaled
+// entry's actual terminal-state computation and manifest write are never
+// bypassed or duplicated here -- run's existing natural Wait()-return path
+// (entry.terminalize) is what every signal ultimately drives, exactly as it
+// already does for an unforced exit.
+//
+// Shutdown is idempotent and safe to call concurrently: only the first
+// call's invocation actually runs the shutdown sequence (sync.Once); every
+// concurrent or later caller receives that exact same result
+// (TestShutdownConcurrentCallersShareResult). Only the first caller's ctx is
+// ever used -- every other caller's ctx argument is ignored, exactly like
+// every other input to a no-op Do call.
+//
+// A teardown failure -- a Signal call that itself returns an error --
+// doesn't stop the affected entry from reaching a terminal state: its run
+// goroutine still classifies whatever outcome its live tool.Process.Wait
+// ultimately reports and terminalizes normally. Shutdown only aggregates
+// every such Signal failure into its own returned error, a *Error wrapping
+// CodeTeardownFailed (TestShutdownTeardownFailureRetainsAuthority) --
+// Shutdown retains authority over every process regardless of a teardown
+// hiccup; it never loses track of one.
+//
+// Steps the ordered sequence describes but that need no new code here:
+// terminal manifests are already flushed and workspace leases are already
+// released by entry.doTerminalize (Task 8C), which every signaled entry
+// still reaches through its own run goroutine; any caller still blocked in
+// Wait is already released once an entry's done channel closes (Task 9A's
+// existing generation/done wake mechanism), no new mechanism required.
+// Closing storage handles is a deliberate no-op: neither ManifestStore nor
+// Spool has (or should have) a Supervisor-wide Close of its own -- a
+// process's completed output must remain readable through its Spool after
+// Shutdown returns, exactly as Restore already relies on for a clean
+// (non-lost) reconciliation of a shutdown-terminated process
+// (TestSupervisorIntegrationShutdownAndRestore).
+func (s *Supervisor) Shutdown(ctx context.Context) error {
+	s.shutdownOnce.Do(func() {
+		s.shutdownErr = s.doShutdown(ctx)
+	})
+	return s.shutdownErr
+}
+
+// shutdownTarget is one running entry doShutdown must terminate, paired with
+// its Handle for potential future diagnostics.
+type shutdownTarget struct {
+	handle Handle
+	entry  *entry
+}
+
+// doShutdown is Shutdown's guarded body; shutdownOnce.Do ensures it runs at
+// most once. See Shutdown's doc comment for the full ordered sequence this
+// implements.
+func (s *Supervisor) doShutdown(ctx context.Context) error {
+	s.closeAdmission()
+
+	targets := s.snapshotRunningEntries()
+	if len(targets) == 0 {
+		return nil
+	}
+
+	if errs := s.terminateEntries(ctx, targets); len(errs) > 0 {
+		return Wrap(CodeTeardownFailed, errors.Join(errs...))
+	}
+	return nil
+}
+
+// snapshotRunningEntries returns every currently registered entry that has
+// not yet reached a terminal state (entry.done not yet closed) -- the
+// "snapshot every currently running handle" step of the ordered shutdown
+// sequence. An entry already terminal -- including one Restore reopened,
+// which is terminal by construction and was never live in this Supervisor
+// instance at all -- is never signaled, and its exited channel (possibly
+// nil for a Restore-reopened entry) is never touched.
+func (s *Supervisor) snapshotRunningEntries() []shutdownTarget {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var targets []shutdownTarget
+	for h, e := range s.entries {
+		if closed(e.done) {
+			continue
+		}
+		targets = append(targets, shutdownTarget{handle: h, entry: e})
+	}
+	return targets
+}
+
+// terminateEntries concurrently terminates every target -- one goroutine per
+// entry, fanned into a plain sync.WaitGroup with a mutex-guarded error slice
+// (golang.org/x/sync is only an indirect, unapproved dependency for this
+// module; see CLAUDE.md's Dependencies section) -- and collects every
+// non-nil error terminateOneEntry returns. A slow or failing entry never
+// blocks or masks any other entry's own termination.
+func (s *Supervisor) terminateEntries(ctx context.Context, targets []shutdownTarget) []error {
+	var (
+		mu   sync.Mutex
+		errs []error
+		wg   sync.WaitGroup
+	)
+
+	wg.Add(len(targets))
+	for _, target := range targets {
+		go func(target shutdownTarget) {
+			defer wg.Done()
+			if err := s.terminateOneEntry(ctx, target.entry); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+		}(target)
+	}
+	wg.Wait()
+
+	return errs
+}
+
+// terminateOneEntry requests graceful termination of one running entry's
+// process tree (tool.ProcessSignalTerminate), escalating to a forceful kill
+// (tool.ProcessSignalKill) once cfg.GracefulShutdownPeriod elapses without
+// e.exited having closed, and unconditionally waits for that confirmation
+// before returning -- on every return path, including after a Signal error,
+// so this call can never report success (or, for that matter, return at
+// all) for an entry it has not actually confirmed exited
+// (TestShutdownTeardownFailureRetainsAuthority). It deliberately does not
+// select on ctx while waiting for e.exited: tool.ProcessSignalKill is not
+// interceptable by a well-behaved process tree, so this wait is expected to
+// complete on its own once the kill escalation above has been issued: an
+// unconditional wait here can never regress into a permanent hang for a
+// correctly implemented Process, and racing it against ctx would only trade
+// one failure mode (a slow real teardown) for a strictly worse one (walking
+// away from an entry Shutdown can no longer confirm exited at all). Every
+// Signal call's error is joined into the returned error, reporting a
+// teardown failure to the caller without ever narrowing that guarantee.
+//
+// e is always an entry snapshotRunningEntries returned, which only ever
+// selects entries Supervisor.Start registered -- e.process and e.exited are
+// therefore always non-nil here.
+func (s *Supervisor) terminateOneEntry(ctx context.Context, e *entry) error {
+	var errs []error
+
+	if err := e.process.Signal(ctx, tool.ProcessSignalTerminate); err != nil {
+		errs = append(errs, err)
+	}
+
+	grace := s.cfg.GracefulShutdownPeriod
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
+	select {
+	case <-e.exited:
+		return joinTeardownErrors(errs)
+	case <-timer.C:
+	}
+
+	if err := e.process.Signal(ctx, tool.ProcessSignalKill); err != nil {
+		errs = append(errs, err)
+	}
+
+	<-e.exited
+	return joinTeardownErrors(errs)
+}
+
+// joinTeardownErrors returns nil for an empty errs slice (the common case:
+// no teardown failure at all) and errors.Join(errs...) otherwise.
+func joinTeardownErrors(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
 }
 
 // recordTerminal is entry.doTerminalize's post-terminal-Save retention hook
@@ -703,6 +907,7 @@ func (s *Supervisor) Start(
 		spool:          spool,
 		lifetimeCancel: cancel,
 		done:           make(chan struct{}),
+		exited:         make(chan struct{}),
 		wake:           make(chan struct{}),
 	}
 

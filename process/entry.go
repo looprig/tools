@@ -193,6 +193,32 @@ type entry struct {
 	// returned, so a caller (test, or a later microtask) can observe the
 	// entry's complete terminal transition without polling.
 	done chan struct{}
+
+	// exited closes inside doTerminalize as soon as this process's terminal
+	// manifest is durably persisted (or, for a dependency-free entry, as
+	// soon as that attempt has been made) -- strictly before the lifecycle
+	// publish and completion notify calls that follow it. Task 9C:
+	// Supervisor.Shutdown's "confirm every tree has exited" step waits on
+	// this channel, deliberately not on done, so a slow or backpressured
+	// lifecycleSink.publish/completionNotifier.notify call can never delay
+	// Shutdown's own completion (combined-acceptance: "notification
+	// backpressure cannot block terminalization"). Every other caller
+	// (wait.go's Wait, via the entry's done/generation wake mechanism) is
+	// unaffected and continues to depend on done exactly as it did before
+	// 9C: it needs the fully completed terminal transition, not merely
+	// confirmed-exited.
+	//
+	// Supervisor.Start populates this field for every entry it registers;
+	// restore.go's reopenEntry sets it too (reusing its already-closed done
+	// channel, since a restored entry is terminal by construction), purely
+	// for hygiene. Every entry Shutdown ever actually waits on comes from
+	// Start -- Restore's reopened entries are already terminal (done
+	// pre-closed) and are filtered out of Shutdown's snapshot before exited
+	// is ever touched. This field is nil-tolerant like every other entry
+	// dependency (see bumpGeneration's identical nil-guard on wake) so a
+	// bare test-built entry that predates 9C still terminalizes cleanly
+	// without it.
+	exited chan struct{}
 }
 
 // run is the single goroutine an entry owns for the rest of its lifetime,
@@ -444,6 +470,14 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 		}
 		current.CompletionPublished++
 		_ = e.manifests.Save(current)
+	}
+
+	// exited closes here -- see its doc comment for why this must happen
+	// strictly before the lifecycle publish/completion notify calls below,
+	// rather than after them (which is where done closes, in run, once this
+	// whole method returns).
+	if e.exited != nil {
+		close(e.exited)
 	}
 
 	kind := tool.ProcessLifecycleCompleted

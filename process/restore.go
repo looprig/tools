@@ -234,5 +234,17 @@ func (s *Supervisor) reopenEntry(m Manifest) (*entry, error) {
 		buffer:    NewBuffer(s.cfg.MaxProcessInMemoryBytes),
 		spool:     spool,
 		done:      done,
+		// exited is pre-closed too, for the same reason done is: this entry
+		// is already terminal, by construction, the instant it is restored.
+		// Reusing done itself (rather than allocating a second, separately
+		// closed channel) is fine -- both are already closed and neither is
+		// ever closed again -- and keeps this entry consistent with the
+		// invariant every Supervisor.Start-registered entry also holds:
+		// exited closes at or before done. Supervisor.Shutdown never
+		// actually reaches this field for a restored entry (its own
+		// snapshotRunningEntries step filters out every already-terminal
+		// entry via done before exited is ever touched); this is purely for
+		// hygiene, not a load-bearing requirement.
+		exited: done,
 	}, nil
 }

@@ -123,11 +123,30 @@ type fakeProcess struct {
 	waitResult tool.ProcessResult
 	waitErr    error
 
+	// waitBlock, when non-nil, causes Wait to block until it is closed (or
+	// ctx is done) instead of returning (waitResult, waitErr) immediately.
+	// Task 9C uses this to simulate a process that keeps running until a
+	// coordinated shutdown's escalation actually signals it -- see
+	// signalFunc.
+	waitBlock chan struct{}
+
 	resizeErr error
 	signalErr error
 
+	// signalFunc, when set, is called by Signal instead of returning
+	// signalErr directly, so a test can implement custom per-signal
+	// behavior -- e.g. ignoring tool.ProcessSignalTerminate but closing
+	// waitBlock (simulating an actual exit) on tool.ProcessSignalKill (Task
+	// 9C's coordinated-shutdown escalation tests). If nil, Signal returns
+	// signalErr unconditionally, exactly as before this field existed.
+	signalFunc func(tool.ProcessSignal) error
+
 	mu         sync.Mutex
 	closeCalls int
+	// signalCalls records, in call order, every signal Signal was actually
+	// asked to deliver (Task 9C: proving Supervisor.Shutdown's
+	// terminate-before-kill escalation ordering).
+	signalCalls []tool.ProcessSignal
 }
 
 func (p *fakeProcess) Stdout() io.ReadCloser {
@@ -158,12 +177,37 @@ func (p *fakeProcess) StreamMode() tool.ProcessStreamMode {
 }
 
 func (p *fakeProcess) Wait(ctx context.Context) (tool.ProcessResult, error) {
+	if p.waitBlock != nil {
+		select {
+		case <-p.waitBlock:
+		case <-ctx.Done():
+			return tool.ProcessResult{}, ctx.Err()
+		}
+	}
 	return p.waitResult, p.waitErr
 }
 
 func (p *fakeProcess) Resize(ctx context.Context, cols, rows uint16) error { return p.resizeErr }
 
-func (p *fakeProcess) Signal(ctx context.Context, sig tool.ProcessSignal) error { return p.signalErr }
+func (p *fakeProcess) Signal(ctx context.Context, sig tool.ProcessSignal) error {
+	p.mu.Lock()
+	p.signalCalls = append(p.signalCalls, sig)
+	p.mu.Unlock()
+	if p.signalFunc != nil {
+		return p.signalFunc(sig)
+	}
+	return p.signalErr
+}
+
+// SignalCalls reports every signal Signal was asked to deliver, in call
+// order.
+func (p *fakeProcess) SignalCalls() []tool.ProcessSignal {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]tool.ProcessSignal, len(p.signalCalls))
+	copy(out, p.signalCalls)
+	return out
+}
 
 func (p *fakeProcess) Close(ctx context.Context) error {
 	p.mu.Lock()

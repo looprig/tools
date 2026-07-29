@@ -5,10 +5,10 @@ package process
 // This file is the Task 9 filesystem/subprocess acceptance seam
 // (docs/plans/2026-07-27-long-running-command-supervision.md, Task 9's "9D
 // -- filesystem/subprocess acceptance"). It starts here in 9B with
-// TestSupervisorIntegrationPersistRestore, the 9B boundary; 9C's dispatch
-// later appends TestSupervisorIntegrationShutdownAndRestore to this same
-// file, reusing execPreparedProcess/execProcess below for its own coordinated
-// shutdown scenario. Per the plan's phase-boundary-only execution override,
+// TestSupervisorIntegrationPersistRestore, the 9B boundary; 9C adds
+// TestSupervisorIntegrationShutdownAndRestore below, reusing
+// execPreparedProcess/execProcess for its own coordinated-shutdown-then-
+// restore scenario. Per the plan's phase-boundary-only execution override,
 // this tagged suite is written now but its execution is deferred to Phase
 // Gate 2 -- it is never run by a task/microtask agent.
 
@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -35,10 +36,12 @@ import (
 // tool.AsyncProcessRunner/Harness Sandbox adapter, which does not exist in
 // this module.
 //
-// Signal/Resize are minimal: this file's own TestSupervisorIntegrationPersistRestore
-// never calls either (restore reconciliation never signals a live process at
-// all -- see restore.go), and a fuller Signal implementation is 9C's concern
-// for its own shutdown scenario, not this microtask's.
+// Resize is minimal: no test in this file calls it. Signal started minimal
+// too in 9B (TestSupervisorIntegrationPersistRestore never calls it --
+// restore reconciliation never signals a live process at all, see
+// restore.go) and was upgraded in 9C to a fuller, portable-signal-aware
+// implementation for TestSupervisorIntegrationShutdownAndRestore -- see
+// execProcess.Signal's own doc comment below.
 type execPreparedProcess struct {
 	cmd    *exec.Cmd
 	access tool.WorkspaceAccess
@@ -114,15 +117,27 @@ func (p *execProcess) Wait(context.Context) (tool.ProcessResult, error) {
 
 func (p *execProcess) Resize(context.Context, uint16, uint16) error { return nil }
 
-// Signal forwards every portable signal request to a real process-tree
-// kill. A single real child process (this file's fixture never spawns a
-// deeper tree) makes Kill sufficient; a more faithful tree-confirmed
-// escalation is 9C's coordinated-shutdown concern, not this file's.
-func (p *execProcess) Signal(context.Context, tool.ProcessSignal) error {
+// Signal forwards a portable signal request to the real OS process. Task 9C
+// upgrades this from 9B's always-Kill placeholder (every Signal call used to
+// force-kill regardless of which portable signal was requested -- see this
+// type's original doc comment, which flagged "a more faithful ...
+// escalation is 9C's coordinated-shutdown concern") to actually distinguish
+// a graceful request from a forceful one, so
+// TestSupervisorIntegrationShutdownAndRestore can exercise
+// Supervisor.Shutdown's real terminate-then-escalate ordering against a
+// genuine OS process tree. tool.ProcessSignalKill maps to Process.Kill
+// (SIGKILL); every other portable signal maps to os.Interrupt, the only
+// other signal value the os package guarantees is portable across
+// platforms (os.Process.Signal's doc comment) -- this module has no
+// dependency on the syscall package's platform-specific signal constants.
+func (p *execProcess) Signal(_ context.Context, sig tool.ProcessSignal) error {
 	if p.cmd.Process == nil {
 		return nil
 	}
-	return p.cmd.Process.Kill()
+	if sig == tool.ProcessSignalKill {
+		return p.cmd.Process.Kill()
+	}
+	return p.cmd.Process.Signal(os.Interrupt)
 }
 
 func (p *execProcess) Close(context.Context) error {
@@ -232,5 +247,109 @@ func TestSupervisorIntegrationPersistRestore(t *testing.T) {
 	}
 	if reloaded.Result.ExitCode == nil || *reloaded.Result.ExitCode != 0 {
 		t.Errorf("restored Result.ExitCode = %v, want 0", reloaded.Result.ExitCode)
+	}
+}
+
+// --- TestSupervisorIntegrationShutdownAndRestore ---
+
+// TestSupervisorIntegrationShutdownAndRestore covers Task 9C's coordinated
+// shutdown end to end against a real OS subprocess, on top of the same
+// restore boundary TestSupervisorIntegrationPersistRestore already covers: a
+// real long-running `sh -c` process that ignores the portable interrupt
+// signal (so Shutdown's real terminate-then-escalate ordering is genuinely
+// exercised against a real process tree, not merely a fake), a
+// Supervisor.Shutdown call against it, and a from-scratch Supervisor
+// simulating a session restore afterward. The point of the second half is
+// the same one TestSupervisorIntegrationPersistRestore's own restore step
+// makes for a naturally-exited process: the shutdown-terminated process must
+// reconcile as an ordinary completed process, not lost_on_restore, because
+// Shutdown's own coordinated termination already durably wrote its terminal
+// manifest -- restore must never mistake a clean shutdown-driven exit for an
+// abandoned, still-running one.
+func TestSupervisorIntegrationShutdownAndRestore(t *testing.T) {
+	manifestRoot := t.TempDir()
+	spoolRoot := t.TempDir()
+
+	store := NewManifestStore(manifestRoot)
+	lifecycle := &fakeLifecycleSink{}
+	notifications := &fakeCompletionNotifier{}
+
+	cfg := Config{GracefulShutdownPeriod: 200 * time.Millisecond}
+	sup, err := NewSupervisor(cfg, store, spoolRoot, lifecycle, notifications)
+	if err != nil {
+		t.Fatalf("NewSupervisor() err = %v, want nil", err)
+	}
+
+	owner := testOwner(t)
+	origin := testOrigin(t)
+
+	// A subprocess that ignores the portable interrupt signal (Signal's
+	// graceful request, above) but still dies to a real SIGKILL, so
+	// Shutdown's escalation path is genuinely exercised rather than exiting
+	// on the very first (graceful) signal.
+	prepared := &execPreparedProcess{
+		cmd:    exec.Command("sh", "-c", "trap '' INT; sleep 30"),
+		access: tool.NewWorkspaceAccess(tool.WorkspaceAccessReadOnly, nil, nil),
+	}
+
+	handle, err := sup.Start(context.Background(), owner, origin, prepared, nil, nil, nil, StorageCeiling{}, YieldSettings{})
+	if err != nil {
+		t.Fatalf("Start() err = %v, want nil", err)
+	}
+
+	if err := sup.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() err = %v, want nil", err)
+	}
+
+	original, err := store.Load(handle)
+	if err != nil {
+		t.Fatalf("store.Load() err = %v, want nil", err)
+	}
+	if !original.State.Terminal() {
+		t.Fatalf("State after Shutdown() = %v, want a terminal state", original.State)
+	}
+	if original.State == StateLostOnRestore {
+		t.Fatalf("State after Shutdown() = %v, want a clean shutdown-driven terminal state, not lost_on_restore", original.State)
+	}
+
+	// Simulate a session restore against the exact same on-disk resource
+	// root, exactly like TestSupervisorIntegrationPersistRestore -- a brand
+	// new Supervisor, no live process handles at all.
+	restoredStore := NewManifestStore(manifestRoot)
+	restoredLifecycle := &fakeLifecycleSink{}
+	restoredNotifications := &fakeCompletionNotifier{}
+	restored, err := NewSupervisor(Config{}, restoredStore, spoolRoot, restoredLifecycle, restoredNotifications)
+	if err != nil {
+		t.Fatalf("NewSupervisor() (restored) err = %v, want nil", err)
+	}
+
+	report, err := restored.Restore(context.Background())
+	if err != nil {
+		t.Fatalf("Restore() err = %v, want nil", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Fatalf("Restore() errors = %+v, want none", report.Errors)
+	}
+	if len(report.Reconciled) != 1 || report.Reconciled[0] != handle {
+		t.Fatalf("Restore() reconciled = %+v, want [%v]", report.Reconciled, handle)
+	}
+
+	restoredEntry := testEntry(t, restored, handle)
+	if restoredEntry.process != nil {
+		t.Error("restored entry has a live tool.Process, want nil")
+	}
+	if !closed(restoredEntry.done) {
+		t.Error("restored entry's done channel is not closed")
+	}
+
+	reloaded, err := restoredStore.Load(handle)
+	if err != nil {
+		t.Fatalf("restoredStore.Load() err = %v, want nil", err)
+	}
+	if reloaded.State != original.State {
+		t.Errorf("restored State = %v, want unchanged from the pre-restore shutdown-driven state %v", reloaded.State, original.State)
+	}
+	if reloaded.State == StateLostOnRestore {
+		t.Error("restored State = lost_on_restore, want the process to remain queryable as a normal completed process: it already had a clean shutdown-driven terminal manifest write, not an abandoned one")
 	}
 }
