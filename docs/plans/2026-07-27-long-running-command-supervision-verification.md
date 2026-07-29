@@ -305,3 +305,26 @@ notification. Tasks 24A and 24B are unchanged.
 These amendments are documentation-only. Per the phase-boundary-only policy,
 no test, static-analysis, vulnerability, build, or independent review was
 executed for them.
+
+## Phase 2, Task 5: quota-default clarification
+
+The spec's "Quotas and retention" section lists eight configuration knobs but
+gives numeric defaults only for the three shared with "Output capture and
+storage" (1 MiB in-memory window, 64 MiB spool, 32 KiB inline result) plus
+handle entropy and grace period. It leaves
+`MaxRunningProcessesPerLoop`/`MaxRunningProcessesPerSession`,
+`MaxRetainedCompletedProcessesPerSession`, `MaxPendingWaiters`, and
+`MaxPendingInputBytes` numerically unspecified. The Task 5 implementer chose
+8 / 32 / 100 / 64 / 1 MiB respectively, documented in `process/config.go` as
+conservative, overridable, non-spec-mandated operational defaults, with every
+aggregate default deliberately derived from its per-process/per-session
+counterpart.
+
+This gap was deliberately closed rather than missed: these are pure
+operational tuning knobs with no security or correctness invariant attached,
+every value is override-able through `Config`, and the aggregate spool-byte
+quota (`MaxAggregateSpoolBytes`, derived from `MaxRunningProcessesPerSession`)
+already bounds worst-case retained-completed-process disk usage independent of
+the `MaxRetainedCompletedProcessesPerSession` count, so the two quotas are not
+redundant risk. No plan amendment, test, static-analysis, vulnerability,
+build, or independent review was executed for this documentation-only note.
