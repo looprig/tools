@@ -43,6 +43,36 @@ func testEntry(t *testing.T, sup *Supervisor, h Handle) *entry {
 	return e
 }
 
+// waitEntryDone blocks until e's done channel closes, or fails the test if
+// that does not happen within timeout. done only closes once run's Wait call
+// has returned, both drain goroutines have finished, and terminalize --
+// including its manifest Save and (Task 8D) its terminal-LRU retention hook,
+// which can itself delete a durable manifest/spool file -- has fully
+// returned (entry.go's done field doc comment).
+//
+// Every test that starts a live entry (directly, or via Supervisor.Start)
+// whose eventual termination writes into a t.TempDir()-rooted ManifestStore/
+// Spool root must synchronize on this exact signal before the test function
+// returns: Go's t.TempDir() cleanup (registered by the t.TempDir() call
+// itself, in call order, and therefore run LAST relative to any cleanup a
+// test registers afterward -- see testing.T.Cleanup's LIFO ordering) does
+// not know to wait for an entry's own background termination goroutine, and
+// races it otherwise -- "directory not empty" ENOTEMPTY flakes under -race
+// are the observable symptom. A test that keeps a fake process artificially
+// "running" via an unclosed io.Pipe (e.g. TestSupervisorNeverEvictsRunning's
+// pattern) must call this from the SAME t.Cleanup that closes the pipe,
+// after closing it, and that cleanup must itself be registered after the
+// Supervisor's own TempDir-backed store/spoolRoot are established, so LIFO
+// ordering runs it before those TempDirs are ever removed.
+func waitEntryDone(t *testing.T, e *entry, timeout time.Duration) {
+	t.Helper()
+	select {
+	case <-e.done:
+	case <-time.After(timeout):
+		t.Fatalf("timed out after %s waiting for entry %q to terminalize", timeout, e.identity.Handle)
+	}
+}
+
 // loadOnlyManifest scans dir -- a ManifestStore's root -- for exactly one
 // manifest file and loads it through store. It exists so a test can
 // observe a manifest durably written by a Start call it has not seen
@@ -142,11 +172,25 @@ func TestSupervisorPersistsBeforeReturningHandle(t *testing.T) {
 	// Save that would otherwise race this test's own synchronous
 	// store.Load(handle) check of the StateRunning manifest immediately
 	// below.
+	//
+	// handle is declared here, before the pipes/cleanup below, so the
+	// cleanup closure can see its final value (Go's declare-before-use
+	// scoping): it is assigned below, inside the goroutine that calls
+	// sup.Start, well before this cleanup ever runs.
+	var handle Handle
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	t.Cleanup(func() {
 		_ = stdoutW.Close()
 		_ = stderrW.Close()
+		// Closing the pipes above only unblocks the entry's drain
+		// goroutines asynchronously; it does not wait for the resulting
+		// terminalize (manifest Save into manifestRoot) to actually finish.
+		// This wait must happen here, in the same cleanup, registered after
+		// manifestRoot's own t.TempDir() call above so LIFO ordering runs it
+		// strictly before that TempDir is removed (waitEntryDone's doc
+		// comment).
+		waitEntryDone(t, testEntry(t, sup, handle), 5*time.Second)
 	})
 
 	prepared := &fakePreparedProcess{
@@ -160,7 +204,6 @@ func TestSupervisorPersistsBeforeReturningHandle(t *testing.T) {
 	}
 	lease := &fakeLease{}
 
-	var handle Handle
 	var startErr error
 	done := make(chan struct{})
 	go func() {
@@ -293,6 +336,14 @@ func TestSupervisorDrainsOrderedStreams(t *testing.T) {
 		t.Fatalf("stderrW.Close() err = %v, want nil", err)
 	}
 
+	// Closing the pipes above only unblocks the entry's drain goroutines
+	// asynchronously; the resulting terminalize (manifest Save into
+	// newTestSupervisor's t.TempDir()-rooted manifest store) is not
+	// guaranteed to have finished yet. Wait for it here, before this test
+	// function returns and that TempDir's cleanup runs (waitEntryDone's doc
+	// comment).
+	waitEntryDone(t, e, 5*time.Second)
+
 	const want = "AAAABBBBCCCC"
 
 	data, next, gap, err := e.buffer.Read(0, 0)
@@ -368,6 +419,7 @@ func TestSupervisorSpoolCeilingDropsOldest(t *testing.T) {
 	if got := e.spool.TotalBytes(); got != total {
 		t.Fatalf("spool.TotalBytes() = %d, want %d (drain must keep counting every appended byte even after drops)", got, total)
 	}
+
 	if got := e.spool.RetainedFrom(); got != total-ceiling {
 		t.Errorf("spool.RetainedFrom() = %d, want %d", got, total-ceiling)
 	}
@@ -385,6 +437,16 @@ func TestSupervisorSpoolCeilingDropsOldest(t *testing.T) {
 	if next != total {
 		t.Errorf("spool.Read(0, ...) next cursor = %d, want %d", next, total)
 	}
+
+	// proc.stdout is a finite bytes.Reader, so drain reaches EOF and the
+	// entry terminalizes on its own, with no test action to unblock it.
+	// e.spool.TotalBytes() reaching total above only proves the drain
+	// finished appending; it says nothing about whether the resulting
+	// terminalize (manifest Save into newTestSupervisor's t.TempDir()-rooted
+	// manifest store) has completed yet. Wait for it here, before this test
+	// function returns and that TempDir's cleanup runs (waitEntryDone's doc
+	// comment).
+	waitEntryDone(t, e, 5*time.Second)
 }
 
 // --- TestSupervisorReservesQuotaBeforeStart ---
@@ -418,11 +480,20 @@ func TestSupervisorReservesQuotaBeforeStart(t *testing.T) {
 	// (drain blocked on unclosed pipes) until this test's own post-Start
 	// assertions -- including lease.ReleaseCalls() == 0 -- are done, so
 	// Task 8C's real terminal arbitration cannot race them.
+	//
+	// handle is declared here, before the pipes/cleanup below, so the
+	// cleanup closure can see its final value once sup.Start assigns it
+	// further down (Go's declare-before-use scoping).
+	var handle Handle
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	t.Cleanup(func() {
 		_ = stdoutW.Close()
 		_ = stderrW.Close()
+		// See waitEntryDone's doc comment: this must run, in this same
+		// cleanup, after closing the pipes above and before
+		// newTestSupervisor's TempDir-rooted store/spoolRoot are removed.
+		waitEntryDone(t, testEntry(t, sup, handle), 5*time.Second)
 	})
 
 	prepared := &fakePreparedProcess{
@@ -438,7 +509,8 @@ func TestSupervisorReservesQuotaBeforeStart(t *testing.T) {
 	}
 	lease := &fakeLease{}
 
-	handle, err := sup.Start(context.Background(), owner, origin, prepared, lease, nil, nil, StorageCeiling{}, YieldSettings{})
+	var err error
+	handle, err = sup.Start(context.Background(), owner, origin, prepared, lease, nil, nil, StorageCeiling{}, YieldSettings{})
 	if err != nil {
 		t.Fatalf("Start() err = %v, want nil", err)
 	}
@@ -588,20 +660,32 @@ func TestSupervisorRejectsSessionAndLoopQuota(t *testing.T) {
 			// 8C's real terminal arbitration could release first's quota
 			// reservation before second's Start call below, which would
 			// wrongly let second be admitted instead of rejected.
+			//
+			// firstHandle is declared here, before the pipes/cleanup below,
+			// so the cleanup closure can see its final value once sup.Start
+			// assigns it further down (Go's declare-before-use scoping).
+			var firstHandle Handle
 			firstStdoutR, firstStdoutW := io.Pipe()
 			firstStderrR, firstStderrW := io.Pipe()
 			t.Cleanup(func() {
 				_ = firstStdoutW.Close()
 				_ = firstStderrW.Close()
+				// See waitEntryDone's doc comment: this must run, in this
+				// same cleanup, after closing the pipes above and before
+				// newTestSupervisor's TempDir-rooted store/spoolRoot are
+				// removed.
+				waitEntryDone(t, testEntry(t, sup, firstHandle), 5*time.Second)
 			})
 
 			first := &fakePreparedProcess{process: &fakeProcess{stdout: firstStdoutR, stderr: firstStderrR}}
-			if _, err := sup.Start(context.Background(), firstOwner, testOrigin(t), first, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{}); err != nil {
+			var err error
+			firstHandle, err = sup.Start(context.Background(), firstOwner, testOrigin(t), first, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{})
+			if err != nil {
 				t.Fatalf("first Start() err = %v, want nil", err)
 			}
 
 			second := &fakePreparedProcess{process: &fakeProcess{}}
-			_, err := sup.Start(context.Background(), secondOwner, testOrigin(t), second, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{})
+			_, err = sup.Start(context.Background(), secondOwner, testOrigin(t), second, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{})
 			if !errors.Is(err, New(CodeProcessQuotaExceeded)) {
 				t.Fatalf("second Start() err = %v, want CodeProcessQuotaExceeded", err)
 			}
@@ -825,18 +909,31 @@ func TestSupervisorNeverEvictsRunning(t *testing.T) {
 	const running = 3
 	handles := make([]Handle, 0, running)
 	for i := 0; i < running; i++ {
+		// h is declared here, before the pipes/cleanup below, so the
+		// cleanup closure can see its final value once sup.Start assigns it
+		// further down (Go's declare-before-use scoping). Each loop
+		// iteration gets its own fresh h (var inside the loop body), so
+		// every iteration's cleanup closes over its own handle, not a
+		// shared one.
+		var h Handle
 		stdoutR, stdoutW := io.Pipe()
 		stderrR, stderrW := io.Pipe()
 		t.Cleanup(func() {
 			_ = stdoutW.Close()
 			_ = stderrW.Close()
+			// See waitEntryDone's doc comment: this must run, in this same
+			// cleanup, after closing the pipes above and before
+			// newTestSupervisor's TempDir-rooted store/spoolRoot are
+			// removed.
+			waitEntryDone(t, testEntry(t, sup, h), 5*time.Second)
 		})
 
 		prepared := &fakePreparedProcess{process: &fakeProcess{stdout: stdoutR, stderr: stderrR}}
-		h, err := sup.Start(context.Background(), owner, origin, prepared, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{})
+		started, err := sup.Start(context.Background(), owner, origin, prepared, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{})
 		if err != nil {
 			t.Fatalf("Start() [%d] err = %v, want nil", i, err)
 		}
+		h = started
 		handles = append(handles, h)
 	}
 

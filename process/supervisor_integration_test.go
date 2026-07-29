@@ -301,6 +301,14 @@ func TestSupervisorIntegrationShutdownAndRestore(t *testing.T) {
 		t.Fatalf("Shutdown() err = %v, want nil", err)
 	}
 
+	// Shutdown's own "confirm every tree has exited" step only waits on
+	// e.exited, not e.done (see terminateOneEntry's doc comment), so wait on
+	// done directly here before this test function returns and manifestRoot/
+	// spoolRoot's t.TempDir() cleanup runs -- see supervisor_test.go's
+	// waitEntryDone doc comment for why that matters even though this
+	// particular scenario has no explicit unclosed-pipe pattern of its own.
+	waitEntryDone(t, testEntry(t, sup, handle), 5*time.Second)
+
 	original, err := store.Load(handle)
 	if err != nil {
 		t.Fatalf("store.Load() err = %v, want nil", err)
