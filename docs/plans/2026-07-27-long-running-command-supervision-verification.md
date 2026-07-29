@@ -328,3 +328,191 @@ already bounds worst-case retained-completed-process disk usage independent of
 the `MaxRetainedCompletedProcessesPerSession` count, so the two quotas are not
 redundant risk. No plan amendment, test, static-analysis, vulnerability,
 build, or independent review was executed for this documentation-only note.
+
+## Phase 2 — Tools supervisor core
+
+**Decision:** Accepted. Tasks 5-9 (including all lettered microtasks),
+Phase Gate 2's complete command matrix, two rounds of independent review, and
+a gate-closure Windows cross-compilation fix all passed.
+
+**Repository head**
+
+- Tools: `f093040204da6b8211d59c7dde3dd96c2d4c54e9`
+
+The Tools worktree was clean at the final gate. 30 commits span
+`19b84a0..HEAD` (Task 0/Phase 1 docs baseline through this gate's close).
+
+**Implemented scope**
+
+- `process/identity.go|state.go|errors.go|config.go|types.go` (Task 5):
+  CSPRNG opaque handles with no owner/path/timestamp/PID, the closed state
+  machine and its transition table, the full stable error-code taxonomy, and
+  quota/retention configuration with documented, self-consistent defaults;
+- `internal/atomicfile` + `process/manifest.go|spool.go` (Task 6): durable
+  write-new/sync/rename/dirsync persistence, versioned manifests with
+  pre-persisted stable lifecycle IDs and terminal-result immutability, and a
+  bounded-retention disk spool that drops oldest bytes rather than erroring
+  or terminating the process;
+- `process/buffer.go`, `internal/safetext`, `process/render.go` (Task 7): a
+  fixed-size in-memory ring buffer, a chunk-boundary-safe ANSI/control-byte
+  normalizer, and symmetric safe-text/base64 render paths;
+- `process/supervisor.go|entry.go` (Task 8A-8D): runner-free admission with
+  quota reserve/rollback, manifest-before-handoff durability, ordered
+  combined-stream drain, one-shot terminal compare-and-set arbitration with
+  stable ID reuse, terminal-LRU retention, and observation invalidation;
+- `process/wait.go|restore.go` + `process/supervisor.go` shutdown path (Task
+  9A-9D): generation-based poll/any/all waiters with leak-free cancellation,
+  restore reconciliation (`lost_on_restore`, corrupt-entry isolation, no
+  live-PID signaling), and coordinated 9-step shutdown with shared-result
+  concurrent callers and teardown-failure authority retention;
+- Gate-closure infrastructure (unrelated to process supervision, discovered
+  while running this gate's required Windows cross-build): `permission`
+  package split into `!windows`/`windows` file-locking and identity-check
+  implementations, and a new `internal/nofollow` package centralizing a
+  Windows/Unix no-follow-open primitive, adopted at 5 previously-hidden
+  `O_NOFOLLOW` call sites across `grep`, `readfile`, and
+  `internal/filemutation`.
+
+**Phase-gate RED and repair evidence**
+
+- First race run: `TestConfigNormalizePartialOverrideKeepsExplicitFields`
+  failed (`Config.Normalize` validated the cross-field per-loop/per-session
+  invariant against the already-defaulted config instead of the caller's
+  original input, spuriously rejecting a legitimate partial override) and
+  `TestSupervisorNeverEvictsRunning`/`TestSupervisorSpoolCeilingDropsOldest`
+  flaked with `TempDir RemoveAll cleanup: directory not empty`. Root-caused:
+  no test synchronized on an entry's background termination goroutine before
+  the test function returned and `t.TempDir()` cleanup began deleting the
+  same directory that goroutine's manifest/spool write was still landing in.
+  Fixed by validating `Config` before defaulting, and by adding a
+  `waitEntryDone` helper applied at all 7 affected sites (verified: the
+  original code reproduced 28 failures across 20 `-race -count=20` runs; the
+  fix ran clean across the same 20 iterations, then 3× more on the full
+  gate command).
+- Tagged integration run: `TestSupervisorIntegrationPersistRestore` failed
+  (`restored spool content = "", want "hello from the integration
+  subprocess"`). Root-caused via a standalone `os/exec` repro:
+  `entry.run` called `Process.Wait` before joining the stdout/stderr drain
+  goroutines, racing a real process's `cmd.Wait`-triggered pipe close
+  against still-in-progress reads — exactly the ordering the Go `exec`
+  package's docs warn against. Fixed by draining to EOF before reaping the
+  exit status.
+- Same run: `TestSupervisorIntegrationShutdownAndRestore` passed but took
+  30s instead of completing near-instantly after its 200ms grace period.
+  Root-caused via a standalone repro: `sh -c "trap '' INT; sleep 30"` forks
+  `sleep` as a child rather than exec'ing in place (a leading `trap`
+  disqualifies the shell's tail-call exec optimization), so the test
+  fixture's single-PID kill only killed the empty parent shell while the
+  orphaned `sleep` ran to completion. Fixed by using `exec sleep 30` in the
+  test fixture (a test-fixture bug, not a supervisor defect).
+- `make secure`: gosec found 5 issues in Phase 2's own new code — two G118
+  (an intentionally session-outliving context now documented with `#nosec`;
+  a `cancel` func stored but never called, now genuinely released via
+  `entry.run`'s deferred, nil-tolerant cleanup) and three G304 (`manifest.go`
+  and `spool.go` reads hardened with per-operation `os.OpenRoot` scoping,
+  following the `harness` module's own Phase 1 precedent for the identical
+  finding class; `internal/atomicfile`'s directory-sync open documented with
+  `#nosec`, since its `dir` argument carries no caller/Handle-derived path
+  segment of its own).
+- Full-module Windows cross-build: failed in `permission/store.go`
+  (pre-existing, unrelated to Phase 2, never previously exercised by any
+  gate in this plan — `syscall.Flock`/`O_NOFOLLOW`/`Stat_t` have no Windows
+  equivalents). Consulted on approach (deferring would only relocate the
+  identical blocker to Phase Gates 4 and 6): fixed as a two-commit split
+  (mechanical `!windows` relocation with no behavior change, then a new
+  `windows` implementation using `golang.org/x/sys/windows`'s
+  `LockFileEx`/`UnlockFileEx`, reparse-point-aware opens, and SID-based
+  owner checks — `golang.org/x/sys` explicitly user-approved and recorded in
+  `CLAUDE.md`). Fixing `permission` unmasked 5 more `O_NOFOLLOW` call sites
+  in `grep`/`readfile`/`internal/filemutation`, previously hidden behind
+  `permission`'s own build failure; centralized into a new
+  `internal/nofollow` package (with its own table tests) and adopted at
+  every site. A residual gosec G304 on that new shared primitive (a generic
+  `os.OpenFile`-like function, analogous to why `os.OpenFile` itself isn't
+  flagged) was resolved with a documented `#nosec`.
+
+**Final GREEN evidence**
+
+- `go test -race ./internal/atomicfile ./internal/safetext ./process`:
+  exit 0. `go test -race ./...` (whole module): exit 0.
+- `go test -tags integration -list '^TestSupervisorIntegration' ./process`
+  printed both required names (`TestSupervisorIntegrationPersistRestore`,
+  `TestSupervisorIntegrationShutdownAndRestore`) before either ran; tagged
+  `-race` execution of both: exit 0.
+- `go test ./internal/safetext -run '^$' -fuzz '^FuzzNormalize$'
+  -fuzztime=10s`: exit 0, 136+ corpus entries, no failures (an earlier
+  10s/20s run at higher worker concurrency executed 3.1M+ cases cleanly).
+- `make secure` (format check, Vet, Staticcheck, Gosec, `go mod verify`,
+  Govulncheck): exit 0. Gosec: 58 files / 13,293 lines / 13 documented
+  `#nosec` suppressions / 0 issues. `go mod verify`: all modules verified.
+  Govulncheck: no vulnerabilities found.
+- `CGO_ENABLED=0 go build -trimpath ./...`: native, `linux/amd64`, and
+  `windows/amd64` all exit 0 for the complete module.
+- `git diff --check`: exit 0.
+
+**Review disposition**
+
+- First round — independent spec-compliance review: 8 of 9 checked areas
+  (state transitions, cursor rules, quotas, manifest fields, restore rules,
+  completion-marker/stable-ID discipline, Task 9 wait/shutdown acceptance,
+  post-Phase-1 amendments) compliant with cited evidence. One finding:
+  Task 8's combined-acceptance text ("lifecycle sink receives the
+  pre-persisted started EventID exactly once"; "explicit/yield handoff
+  emits backgrounded with its stable EventID") was unimplemented — no
+  `Started`/`Backgrounded` publish call existed anywhere.
+- First round — independent quality/security review: 9 of 11 checked areas
+  (terminal-race arbitration, atomic-replacement durability, safe-text
+  framing including its fuzz-proven split-boundary property, base64/safe-text
+  plumbing symmetry, owner isolation, waiter cleanup, shutdown authority
+  retention, security invariants 1-10, code quality) passed with cited
+  evidence. One Important finding: `entry.doTerminalize` silently dropped
+  the terminal manifest write (and would have published an event with a
+  nil EventID/CommandID) if a manifest reload failed, with no retry possible
+  once the one-shot `terminalOnce` guard had already fired — untested. Two
+  Minor findings: `atomicfile.Replace`'s doc comment overclaimed its
+  on-failure guarantee (didn't note the post-rename dirsync-failure
+  exception, which its own fault-injection test already correctly encoded);
+  the new Windows `checkDirIdentity` re-resolved security info by path
+  instead of reusing an already-open handle, narrowing but not eliminating
+  a TOCTOU window Unix's equivalent doesn't have.
+- Fixes: implemented `Started`/`Backgrounded` publication in `Supervisor.Start`
+  (using pre-persisted manifest EventIDs, nil-tolerant, best-effort);
+  eliminated `doTerminalize`'s reload dependency entirely by capturing the
+  Start-time-immutable manifest fields onto the entry itself
+  (`entry.base`/`manifestBase`), so a reload failure now still produces a
+  complete, valid, durably-saved terminal manifest with genuine non-zero
+  stable IDs instead of a silent skip; corrected the `atomicfile` doc
+  comment; closed the Windows directory-identity TOCTOU window by fetching
+  security info from the same already-open, no-follow directory handle used
+  for the reparse-point check.
+- Second round — independent re-review of all four fixes, with every
+  verification command re-run directly rather than trusting the fix
+  report: three of four findings fully resolved with no reservations. The
+  fourth (Started/Backgrounded publication) was substantively resolved and
+  well-tested, but the re-review found one new, narrow gap the fix itself
+  introduced: `publishStart` ran before `OpenSpool`, so a spool-open
+  failure could emit a Started/Backgrounded event for a process that never
+  gets a registered entry and therefore never reaches a terminal publish —
+  a nonterminal event with no terminal pair.
+- Fix: moved the `publishStart` call to after every remaining `Start`
+  failure branch (i.e. after `OpenSpool` succeeds), so a Started/Backgrounded
+  publish is now always eventually followed by exactly one terminal publish.
+  Re-verified directly (not re-reviewed by a third round, given the fix's
+  narrow, mechanical, purely-reordering nature): full race suite, tagged
+  integration suite, `gosec`, `go vet`, and all three trimpath builds all
+  passed clean after this final fix, and are recorded in this section's
+  Final GREEN evidence above (which reflects the head commit after this
+  fix, not the pre-fix state either review round saw).
+
+**Explicit scope bound on the gate-closure Windows work.** The `permission`/
+`internal/nofollow` Windows code satisfies this gate's bar of compiles clean
+plus a carefully-reasoned, good-faith port of the real Unix invariants (file
+locking, no-follow opens, owner/link-count identity), with every faithfulness
+gap against the true Unix guarantee documented inline where it exists. No
+Windows host or CI worker was available to actually run this code. Real
+Windows *runtime* validation of the permission store and the no-follow-open
+primitive is deferred to Phase 5 ("Unix PTY and Windows ConPTY"), where
+Windows execution first becomes native to this plan's own work — this is a
+deliberate scope bound recorded here, not an oversight.
+
+No unresolved finding or deferred required check enters Phase 3.
