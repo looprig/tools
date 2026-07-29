@@ -882,35 +882,6 @@ func (s *Supervisor) Start(
 		events:    events,
 	}
 
-	// Publish this process's Start-time lifecycle record: Started if the
-	// caller did not request immediate backgrounding, or Backgrounded if it
-	// did (YieldSettings.Yield == true) -- exactly one of the two, using the
-	// manifest's own pre-persisted stable EventID for whichever kind this
-	// is, never a freshly minted one (see lifecycleStartEvent's doc comment,
-	// entry.go). This is synchronous, not deferred into entry.run's
-	// lifetime-scoped goroutine: it is tied to the StateRunning transition
-	// this call just made, which already happens synchronously here. Best-
-	// effort and nil-tolerant, like every other publish/notify call in this
-	// package: a slow or failing sink must never fail Start or delay
-	// returning the Handle -- the manifest itself, already durably saved
-	// above, is the source of truth regardless of whether this notification
-	// succeeds.
-	startKind := tool.ProcessLifecycleStarted
-	startEventID := events.Started
-	if yield.Yield {
-		startKind = tool.ProcessLifecycleBackgrounded
-		startEventID = events.Backgrounded
-	}
-	if sink != nil {
-		_ = sink.publishStart(ctx, lifecycleStartEvent{
-			EventID:   startEventID,
-			Kind:      startKind,
-			Identity:  identity,
-			CreatedAt: createdAt,
-			StartedAt: startedAt,
-		})
-	}
-
 	spool, err := OpenSpool(s.spoolRoot, handle, res.spoolBytes)
 	if err != nil {
 		s.releaseQuota(res)
@@ -940,6 +911,45 @@ func (s *Supervisor) Start(
 		_ = s.manifests.Save(manifest)
 
 		return "", Wrap(CodeProcessSetupFailed, err)
+	}
+
+	// Publish this process's Start-time lifecycle record: Started if the
+	// caller did not request immediate backgrounding, or Backgrounded if it
+	// did (YieldSettings.Yield == true) -- exactly one of the two, using the
+	// manifest's own pre-persisted stable EventID for whichever kind this
+	// is, never a freshly minted one (see lifecycleStartEvent's doc comment,
+	// entry.go). This is synchronous, not deferred into entry.run's
+	// lifetime-scoped goroutine: it is tied to the StateRunning transition
+	// made above, which already happened synchronously. Best-effort and
+	// nil-tolerant, like every other publish/notify call in this package: a
+	// slow or failing sink must never fail Start or delay returning the
+	// Handle -- the manifest itself, already durably saved above, is the
+	// source of truth regardless of whether this notification succeeds.
+	//
+	// Deliberately placed here, after OpenSpool has already succeeded,
+	// rather than immediately after the StateRunning Save above (Phase Gate
+	// 2 re-review finding): publishing any earlier would let a subsequent
+	// OpenSpool failure emit a Started/Backgrounded event for a process that
+	// never gets a registered entry and therefore never reaches
+	// entry.terminalize's terminal publish -- a nonterminal event with no
+	// terminal pair. By this point every failure branch that could still
+	// abort Start is behind us, so a Started/Backgrounded publish here is
+	// always eventually followed by exactly one terminal publish once this
+	// entry's own lifetime ends.
+	startKind := tool.ProcessLifecycleStarted
+	startEventID := events.Started
+	if yield.Yield {
+		startKind = tool.ProcessLifecycleBackgrounded
+		startEventID = events.Backgrounded
+	}
+	if sink != nil {
+		_ = sink.publishStart(ctx, lifecycleStartEvent{
+			EventID:   startEventID,
+			Kind:      startKind,
+			Identity:  identity,
+			CreatedAt: createdAt,
+			StartedAt: startedAt,
+		})
 	}
 
 	// lifetimeCtx is deliberately derived from context.Background(), not the
