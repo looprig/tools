@@ -40,6 +40,7 @@ This module provides optional standard tools for looprig consumers. The harness 
 - `github.com/securego/gosec/v2` — security static analysis tool (dev/tool only)
 - `golang.org/x/vuln/cmd/govulncheck` — official Go vulnerability scanner (dev/tool only)
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
+- `golang.org/x/sys` (windows subpackage) — Windows file locking (`LockFileEx`/`UnlockFileEx`), reparse-point-aware opens (`O_NOFOLLOW` equivalent), and owner/link-count identity checks for `permission/store_windows.go`; already an approved direct dependency of the sibling `harness` module for its own Windows DACL work; approved 2026-07-29 for Phase Gate 2 of the long-running-command-supervision plan
 
 ## Testing
 
