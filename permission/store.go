@@ -10,11 +10,22 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/looprig/harness/pkg/tool"
 )
+
+// errSymlinkNotAllowed is returned by the platform openNoFollow when the
+// final path component is a symlink (or, on Windows, a reparse point) the
+// store refuses to traverse. store.go classifies it with errors.Is so it
+// never needs a platform-specific error type.
+var errSymlinkNotAllowed = errors.New("path is a symlink and may not be followed")
+
+// errLockWouldBlock is returned by the platform lockExclusiveNonBlocking
+// when the exclusive lock is already held elsewhere, mirroring flock's
+// EWOULDBLOCK/EINTR-retry behavior on Unix and LOCKFILE_FAIL_IMMEDIATELY on
+// Windows.
+var errLockWouldBlock = errors.New("lock is held by another process")
 
 // store.go is the single hardened workspace permission store.
 //
@@ -328,21 +339,21 @@ func (s *Store) replaceFile(directory string, encoded []byte) error {
 // separate Store instances contend correctly whether they live in one
 // process or many.
 func (s *Store) acquireLock(ctx context.Context, directory string) (func(), error) {
-	lockFile, err := os.OpenFile(s.path+lockSuffix, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, filePerm)
+	lockFile, err := openNoFollow(s.path+lockSuffix, os.O_CREATE|os.O_RDWR, filePerm)
 	if err != nil {
 		return nil, &FileError{Path: s.path, Reason: FileLock, Err: err}
 	}
 	for {
-		err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := lockExclusiveNonBlocking(lockFile)
 		if err == nil {
 			return func() {
 				// Best-effort release: closing the descriptor also drops the
-				// flock even if the explicit unlock fails.
-				_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+				// lock even if the explicit unlock fails.
+				_ = unlockFile(lockFile)
 				_ = lockFile.Close()
 			}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+		if !errors.Is(err, errLockWouldBlock) {
 			_ = lockFile.Close() // best-effort cleanup; the lock error is reported
 			return nil, &FileError{Path: s.path, Reason: FileLock, Err: err}
 		}
@@ -359,7 +370,7 @@ func (s *Store) acquireLock(ctx context.Context, directory string) (func(), erro
 // selects the headless-startup behavior where a configured file must
 // exist; an interactive store treats a missing file as an empty rule set.
 func (s *Store) loadFile(required bool) ([]Rule, error) {
-	file, err := os.OpenFile(s.path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	file, err := openNoFollow(s.path, os.O_RDONLY, 0)
 	if err != nil {
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
@@ -367,7 +378,7 @@ func (s *Store) loadFile(required bool) ([]Rule, error) {
 				return nil, &FileError{Path: s.path, Reason: FileMissing, Err: err}
 			}
 			return nil, nil
-		case errors.Is(err, syscall.ELOOP), errors.Is(err, syscall.EMLINK):
+		case errors.Is(err, errSymlinkNotAllowed):
 			return nil, &FileError{Path: s.path, Reason: FileSymlink, Err: err}
 		default:
 			return nil, &FileError{Path: s.path, Reason: FileIO, Err: err}
@@ -379,7 +390,7 @@ func (s *Store) loadFile(required bool) ([]Rule, error) {
 	if err != nil {
 		return nil, &FileError{Path: s.path, Reason: FileIO, Err: err}
 	}
-	if err := s.checkFileInfo(info); err != nil {
+	if err := s.checkFileInfo(file, info); err != nil {
 		return nil, err
 	}
 
@@ -401,7 +412,7 @@ func (s *Store) loadFile(required bool) ([]Rule, error) {
 // type, exact owner-only mode, expected owner, single link, and bounded
 // size. The stat comes from the open descriptor, so the checks bind to the
 // bytes actually read.
-func (s *Store) checkFileInfo(info fs.FileInfo) error {
+func (s *Store) checkFileInfo(file *os.File, info fs.FileInfo) error {
 	mode := info.Mode()
 	if !mode.IsRegular() {
 		return &FileError{Path: s.path, Reason: FileNotRegular, Err: fmt.Errorf("mode %v is not a regular file", mode)}
@@ -409,15 +420,8 @@ func (s *Store) checkFileInfo(info fs.FileInfo) error {
 	if perm := mode.Perm(); perm != filePerm {
 		return &FileError{Path: s.path, Reason: FileModeUnexpected, Err: fmt.Errorf("mode %04o, require exactly %04o", perm, filePerm)}
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return &FileError{Path: s.path, Reason: FileIO, Err: errors.New("underlying stat unavailable")}
-	}
-	if int(stat.Uid) != s.euid {
-		return &FileError{Path: s.path, Reason: FileOwnerUnexpected, Err: fmt.Errorf("owner uid %d, require %d", stat.Uid, s.euid)}
-	}
-	if stat.Nlink != 1 {
-		return &FileError{Path: s.path, Reason: FileLinkCount, Err: fmt.Errorf("link count %d, require 1", stat.Nlink)}
+	if err := s.checkFileIdentity(file, info); err != nil {
+		return err
 	}
 	if info.Size() > s.maxFileBytes {
 		return &FileError{Path: s.path, Reason: FileTooLarge, Err: fmt.Errorf("size %d exceeds %d bytes", info.Size(), s.maxFileBytes)}
@@ -437,14 +441,7 @@ func (s *Store) checkDirectory(directory string) error {
 	if perm := info.Mode().Perm(); perm&0o022 != 0 {
 		return &FileError{Path: s.path, Reason: FileModeUnexpected, Err: fmt.Errorf("store directory mode %04o is group/world writable", perm)}
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return &FileError{Path: s.path, Reason: FileIO, Err: errors.New("underlying stat unavailable")}
-	}
-	if int(stat.Uid) != s.euid {
-		return &FileError{Path: s.path, Reason: FileOwnerUnexpected, Err: fmt.Errorf("store directory owner uid %d, require %d", stat.Uid, s.euid)}
-	}
-	return nil
+	return s.checkDirIdentity(directory, info)
 }
 
 // mergeRules appends the incoming rules that are not already present,
