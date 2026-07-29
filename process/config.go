@@ -183,17 +183,28 @@ func (c Config) Validate() error {
 	}
 }
 
-// Normalize returns c with every zero field defaulted (withDefaults) and
-// then validated. The zero Config normalizes to every documented default
-// with no error. A negative field, or an explicit per-process value that
-// exceeds its explicit aggregate counterpart, returns the zero Config and a
-// *Error with CodeInvalidSettings.
+// Normalize validates c and, if valid, returns it with every zero field
+// replaced by its documented default (withDefaults). The zero Config
+// normalizes to every documented default with no error. A negative field, or
+// an explicit value that exceeds an explicit counterpart, returns the zero
+// Config and a *Error with CodeInvalidSettings.
+//
+// Validation runs on c before defaulting, not on the defaulted result:
+// Validate's cross-field checks are documented to reject only explicit
+// inconsistencies between two nonzero fields, and that "zero means unset"
+// contract only holds against the caller's original input. Two independent
+// per-field defaults are proven self-consistent with each other
+// (TestDefaultsAreSelfConsistent), but a default chosen for one field is not
+// guaranteed to stay under a smaller *explicit* value the caller set for its
+// counterpart (e.g. an explicit, low MaxRunningProcessesPerSession with
+// MaxRunningProcessesPerLoop left at zero) -- validating post-default would
+// reject that legitimate partial override merely because defaulting filled
+// in the other side.
 func (c Config) Normalize() (Config, error) {
-	out := c.withDefaults()
-	if err := out.Validate(); err != nil {
+	if err := c.Validate(); err != nil {
 		return Config{}, err
 	}
-	return out, nil
+	return c.withDefaults(), nil
 }
 
 func invalidSetting(reason string) error {
