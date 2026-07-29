@@ -79,8 +79,10 @@ type completionEvent struct {
 // (entry.terminalize), and manifests/notifications/releaseQuota are the
 // dependencies that one-shot path needs to write the terminal manifest,
 // notify completion, and release this process's quota reservation. Task 8D
-// still owns retention/LRU bookkeeping and the observation-invalidation
-// call sites.
+// adds the observation-invalidation call sites (run calls
+// invalidateObservations at spawn, at each received tool.ProcessActivity,
+// and at completion) and onTerminal, the Supervisor's terminal-LRU
+// retention hook.
 type entry struct {
 	identity Identity
 
@@ -112,6 +114,18 @@ type entry struct {
 	manifests     manifestSaver
 	notifications completionNotifier
 	releaseQuota  func(reservation)
+
+	// onTerminal is the Supervisor's terminal-LRU retention-bookkeeping hook
+	// (Task 8D, supervisor.go's recordTerminal). entry has no reference to
+	// the Supervisor's registry, so doTerminalize calls this once -- inside
+	// terminalOnce's guarded body, alongside releaseQuota/lifecycle/
+	// notifications -- to let the Supervisor record this entry as newly
+	// terminal for its owning session and evict that session's
+	// least-recently-used terminal entry if the retention limit
+	// (Config.MaxRetainedCompletedProcessesPerSession) is now exceeded.
+	// Nil-tolerant, like every other terminalize dependency, so a bare
+	// test-built entry (no Supervisor) still terminalizes cleanly.
+	onTerminal func(Handle, Owner)
 
 	// buffer is the in-memory rolling window (buffer.go) over this
 	// process's combined stdout+stderr stream, sized from
@@ -178,13 +192,15 @@ type entry struct {
 // so its drain goroutine simply observes EOF immediately and contributes no
 // bytes -- no StreamMode branch is needed here.
 //
-// run does not yet drain any tool.ProcessActivitySource activity channel
-// (the "activity" part of the spec language above): Task 8D is where the
-// observationInvalidator gets its Invalidate method and the
-// spawn/activity/completion call sites, including wiring an
-// ProcessActivitySource's channel if the process implements one. 8B left
-// that wiring out entirely rather than half-building it, and 8C does not
-// add it either.
+// run also drains a tool.ProcessActivitySource activity channel, if the
+// live tool.Process optionally implements one (drainActivity), invalidating
+// this entry's bound observation cache once per received tool.ProcessActivity.
+// run additionally invalidates observations once at the very top (spawn)
+// and once more after every drain goroutine -- stdout, stderr, and
+// activity, if any -- has finished and Wait has returned (completion),
+// matching the spec's "Workspace coordination" section: "Observation caches
+// are invalidated at process spawn, on reported filesystem activity ...,
+// and at process completion."
 //
 // Once every drain goroutine has finished and Wait has returned, run
 // classifies the ProcessResult/error Wait returned into this package's
@@ -195,21 +211,67 @@ type entry struct {
 // cancelling lifetimeCancel to interrupt an in-flight Wait) must not also
 // cause the resulting terminal manifest Save, lifecycle publish, and
 // completion notify to be skipped or fail because the same context is
-// already canceled by the time run reaches them.
+// already canceled by the time run reaches them. The completion
+// invalidateObservations call is made with context.Background() for the
+// same reason.
 func (e *entry) run(ctx context.Context) {
+	e.invalidateObservations(ctx)
+
 	var drainWG sync.WaitGroup
 	drainWG.Add(2)
 	go e.drain(&drainWG, e.process.Stdout())
 	go e.drain(&drainWG, e.process.Stderr())
 
+	// Activities is an optional capability: only start a third drain
+	// goroutine when the live tool.Process actually implements
+	// tool.ProcessActivitySource and returns a non-nil channel. Every
+	// drainWG.Add call happens here, strictly before Wait is called below,
+	// so there is no race with drainWG.Wait().
+	if source, ok := e.process.(tool.ProcessActivitySource); ok {
+		if activities := source.Activities(); activities != nil {
+			drainWG.Add(1)
+			go e.drainActivity(ctx, &drainWG, activities)
+		}
+	}
+
 	result, waitErr := e.process.Wait(ctx)
 
 	drainWG.Wait()
+
+	e.invalidateObservations(context.Background())
 
 	state, outcome := classifyWaitOutcome(result, waitErr)
 	e.terminalize(context.Background(), state, outcome, time.Now().UTC())
 
 	close(e.done)
+}
+
+// invalidateObservations calls e.observations.invalidate for this entry's
+// Handle, tolerating a nil observations dependency exactly like every other
+// entry dependency (manifests, lifecycle, notifications, releaseQuota,
+// lease, onTerminal). See run's doc comment for the three points in a
+// process's lifetime it is called from.
+func (e *entry) invalidateObservations(ctx context.Context) {
+	if e.observations == nil {
+		return
+	}
+	_ = e.observations.invalidate(ctx, e.identity.Handle)
+}
+
+// drainActivity ranges over activities, calling invalidateObservations once
+// per received tool.ProcessActivity, until activities closes. Per the
+// Harness contract (tool.ProcessActivitySource's doc comment): "The
+// activity channel must close before Process.Wait returns" -- so this
+// goroutine always finishes on its own before run's Wait call above
+// returns, and run's drainWG.Wait() call waits for it exactly like it waits
+// for the stdout/stderr drain goroutines. If activities closes having never
+// sent anything, `for range` returns immediately: this goroutine never
+// blocks forever on a channel that only closes.
+func (e *entry) drainActivity(ctx context.Context, wg *sync.WaitGroup, activities <-chan tool.ProcessActivity) {
+	defer wg.Done()
+	for range activities {
+		e.invalidateObservations(ctx)
+	}
 }
 
 // drain reads r to EOF in bounded chunks, appending every non-empty chunk
@@ -346,6 +408,9 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 	}
 	if e.lease != nil {
 		_ = e.lease.Release()
+	}
+	if e.onTerminal != nil {
+		e.onTerminal(e.identity.Handle, e.identity.Owner)
 	}
 }
 

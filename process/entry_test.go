@@ -165,6 +165,34 @@ func (f *fakeCompletionNotifier) NotifyCalls() int {
 
 var _ completionNotifier = (*fakeCompletionNotifier)(nil)
 
+// fakeObservationInvalidator is a call-counting implementation of
+// observationInvalidator (Task 8D). It lives alongside entry's other
+// package-local-interface fakes (fakeManifestSaver, fakeLifecycleSink,
+// fakeCompletionNotifier) for the same reason documented on those types:
+// observationInvalidator is a narrow, package-local interface entry.run
+// itself defines, not a Harness contract this package merely fakes an
+// implementation of.
+type fakeObservationInvalidator struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *fakeObservationInvalidator) invalidate(ctx context.Context, handle Handle) error {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	return nil
+}
+
+// InvalidateCalls reports how many times invalidate was called.
+func (f *fakeObservationInvalidator) InvalidateCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+var _ observationInvalidator = (*fakeObservationInvalidator)(nil)
+
 // callCounter is a minimal thread-safe call counter, used by
 // newRaceEntry's releaseQuota fake (entry.releaseQuota is a plain func
 // field, not an interface, so it has no fake type of its own to count

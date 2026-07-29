@@ -106,6 +106,20 @@ type fakeProcess struct {
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
+	// activities, when set, is returned verbatim by Activities, so a test
+	// can inject synthetic tool.ProcessActivity events onto entry.run's
+	// activity-drain path (Task 8D: "activity notifications trigger
+	// intermediate [observation] invalidation" -- see entry.go's
+	// drainActivity). fakeProcess unconditionally implements
+	// tool.ProcessActivitySource (mirroring how it already unconditionally
+	// implements Stdout/Stderr with a nil-default fallback above), so this
+	// field's zero value (nil) is what makes fakeProcess{} "optionally"
+	// behave as an activity source: entry.run's own nil-channel check --
+	// not a missing method -- is what treats an unset field exactly like
+	// "no activity source" and starts no drain goroutine for it. No
+	// existing fakeProcess{} literal's behavior changes.
+	activities <-chan tool.ProcessActivity
+
 	waitResult tool.ProcessResult
 	waitErr    error
 
@@ -131,6 +145,10 @@ func (p *fakeProcess) Stderr() io.ReadCloser {
 }
 
 func (p *fakeProcess) Stdin() io.WriteCloser { return nopWriteCloser{io.Discard} }
+
+// Activities implements tool.ProcessActivitySource. See the activities
+// field's doc comment for why this is unconditional and how a test opts in.
+func (p *fakeProcess) Activities() <-chan tool.ProcessActivity { return p.activities }
 
 func (p *fakeProcess) StreamMode() tool.ProcessStreamMode {
 	if p.streamMode == 0 {
@@ -162,6 +180,7 @@ func (p *fakeProcess) CloseCalls() int {
 }
 
 var _ tool.Process = (*fakeProcess)(nil)
+var _ tool.ProcessActivitySource = (*fakeProcess)(nil)
 
 // nopWriteCloser adapts an io.Writer (typically io.Discard) into an
 // io.WriteCloser whose Close is a no-op, mirroring the standard library's

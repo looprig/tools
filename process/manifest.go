@@ -488,6 +488,27 @@ func (s *ManifestStore) Save(m Manifest) error {
 	return atomicfile.Replace(path, data, 0o600)
 }
 
+// Delete removes the on-disk manifest for h, if any (spec "Eviction deletes
+// the manifest and spool atomically from the supervisor's perspective" --
+// Task 8D's terminal-LRU retention is Delete's only caller today). Delete is
+// idempotent: deleting a handle that has no manifest file -- already
+// deleted, or never written -- is a no-op rather than an error, mirroring
+// Spool.Remove's idempotence (spool.go).
+func (s *ManifestStore) Delete(h Handle) error {
+	path, err := s.path(h)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func validateManifestUpdate(existing, next Manifest) error {
 	if existing.Handle != next.Handle || !existing.Owner.Equal(next.Owner) || existing.Origin != next.Origin {
 		return &ImmutableIdentityChangedError{Handle: next.Handle}

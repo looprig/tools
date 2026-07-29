@@ -75,6 +75,29 @@ func loadOnlyManifest(t *testing.T, store *ManifestStore, dir string) Manifest {
 	return m
 }
 
+// spoolFileExists reports whether a Handle's spool file exists on disk
+// beneath spoolRoot, using the package's own resourcePath/spoolSuffix
+// (manifest.go/spool.go) rather than hand-rolling the path -- so a
+// retention-eviction test (TestSupervisorEvictsCompletedLRU) can prove
+// Supervisor.evictResources' spool.Remove call actually deleted the file.
+func spoolFileExists(t *testing.T, spoolRoot string, h Handle) bool {
+	t.Helper()
+	path, err := resourcePath(spoolRoot, h, spoolSuffix)
+	if err != nil {
+		t.Fatalf("resourcePath() err = %v, want nil", err)
+	}
+	_, err = os.Stat(path)
+	switch {
+	case err == nil:
+		return true
+	case os.IsNotExist(err):
+		return false
+	default:
+		t.Fatalf("os.Stat(%q) err = %v", path, err)
+		return false
+	}
+}
+
 // --- TestSupervisorPersistsBeforeReturningHandle ---
 
 // TestSupervisorPersistsBeforeReturningHandle proves that Start durably
@@ -769,5 +792,243 @@ func TestSupervisorPublishesStableLifecycleIDs(t *testing.T) {
 	}
 	if reloaded.Events != afterStart.Events {
 		t.Errorf("manifest Events on reload = %+v, want unchanged from %+v", reloaded.Events, afterStart.Events)
+	}
+}
+
+// --- TestSupervisorNeverEvictsRunning ---
+
+// TestSupervisorNeverEvictsRunning proves that a running entry (one whose
+// process has not yet terminalized) is never evicted by terminal-LRU
+// retention, no matter how low Config.MaxRetainedCompletedProcessesPerSession
+// is configured. Every admitted process in this test is kept "still
+// running" by never closing its stdout/stderr pipes (the same technique
+// TestSupervisorRejectsSessionAndLoopQuota and others already use), and the
+// retention limit is set to 1 -- lower than the number of concurrently
+// running processes -- so an implementation that evicted by raw count
+// rather than by State.Terminal() would wrongly evict some of them.
+func TestSupervisorNeverEvictsRunning(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		MaxRunningProcessesPerLoop:              8,
+		MaxRunningProcessesPerSession:           8,
+		MaxRetainedCompletedProcessesPerSession: 1,
+		MaxProcessInMemoryBytes:                 1 << 20,
+		MaxAggregateInMemoryBytes:               10 << 20,
+		MaxProcessSpoolBytes:                    1 << 20,
+		MaxAggregateSpoolBytes:                  10 << 20,
+	}
+	sup := newTestSupervisor(t, cfg)
+	owner := testOwner(t)
+	origin := testOrigin(t)
+
+	const running = 3
+	handles := make([]Handle, 0, running)
+	for i := 0; i < running; i++ {
+		stdoutR, stdoutW := io.Pipe()
+		stderrR, stderrW := io.Pipe()
+		t.Cleanup(func() {
+			_ = stdoutW.Close()
+			_ = stderrW.Close()
+		})
+
+		prepared := &fakePreparedProcess{process: &fakeProcess{stdout: stdoutR, stderr: stderrR}}
+		h, err := sup.Start(context.Background(), owner, origin, prepared, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{})
+		if err != nil {
+			t.Fatalf("Start() [%d] err = %v, want nil", i, err)
+		}
+		handles = append(handles, h)
+	}
+
+	for i, h := range handles {
+		sup.mu.Lock()
+		_, ok := sup.entries[h]
+		sup.mu.Unlock()
+		if !ok {
+			t.Errorf("handle %d (%q) missing from registry while still running, want it retained regardless of the retention limit", i, h)
+		}
+	}
+}
+
+// --- TestSupervisorEvictsCompletedLRU ---
+
+// TestSupervisorEvictsCompletedLRU proves terminal-LRU retention's eviction
+// behavior end to end: four processes for the same owner/session are
+// started and allowed to terminalize one at a time (each iteration waits on
+// its own entry's done channel before starting the next, so completion
+// order is exact and deterministic), against a retention limit of 2. The
+// two oldest-completed handles must be evicted -- gone from the in-memory
+// registry, their manifest no longer loadable, and their spool file removed
+// from disk -- while the two most-recently-completed handles remain fully
+// intact in all three places.
+func TestSupervisorEvictsCompletedLRU(t *testing.T) {
+	t.Parallel()
+
+	const retain = 2
+	cfg := Config{
+		MaxRunningProcessesPerLoop:              8,
+		MaxRunningProcessesPerSession:           8,
+		MaxRetainedCompletedProcessesPerSession: retain,
+		MaxProcessInMemoryBytes:                 1 << 20,
+		MaxAggregateInMemoryBytes:               10 << 20,
+		MaxProcessSpoolBytes:                    1 << 20,
+		MaxAggregateSpoolBytes:                  10 << 20,
+	}
+	manifestRoot := t.TempDir()
+	spoolRoot := t.TempDir()
+	store := NewManifestStore(manifestRoot)
+	sup, err := NewSupervisor(cfg, store, spoolRoot, nil, nil)
+	if err != nil {
+		t.Fatalf("NewSupervisor() err = %v, want nil", err)
+	}
+	owner := testOwner(t)
+	origin := testOrigin(t)
+
+	const total = 4
+	handles := make([]Handle, 0, total)
+	for i := 0; i < total; i++ {
+		// A non-empty stdout ensures a spool file actually gets created on
+		// disk (Spool.Append -- and therefore its first durable write --
+		// only ever happens when at least one byte is appended), so this
+		// test can meaningfully assert the spool file's removal below
+		// rather than asserting the absence of a file that was never
+		// written in the first place.
+		prepared := &fakePreparedProcess{process: &fakeProcess{stdout: io.NopCloser(strings.NewReader("done"))}}
+		h, err := sup.Start(context.Background(), owner, origin, prepared, &fakeLease{}, nil, nil, StorageCeiling{}, YieldSettings{})
+		if err != nil {
+			t.Fatalf("Start() [%d] err = %v, want nil", i, err)
+		}
+		e := testEntry(t, sup, h)
+		select {
+		case <-e.done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for process %d to terminalize", i)
+		}
+		handles = append(handles, h)
+	}
+
+	for i, h := range handles {
+		wantRetained := i >= total-retain
+
+		sup.mu.Lock()
+		_, inRegistry := sup.entries[h]
+		sup.mu.Unlock()
+		if inRegistry != wantRetained {
+			t.Errorf("handle %d (%q) present in registry = %v, want %v", i, h, inRegistry, wantRetained)
+		}
+
+		_, loadErr := store.Load(h)
+		manifestLoadable := loadErr == nil
+		if manifestLoadable != wantRetained {
+			t.Errorf("handle %d (%q) manifest loadable = %v (err=%v), want %v", i, h, manifestLoadable, loadErr, wantRetained)
+		}
+
+		if got := spoolFileExists(t, spoolRoot, h); got != wantRetained {
+			t.Errorf("handle %d (%q) spool file exists = %v, want %v", i, h, got, wantRetained)
+		}
+	}
+}
+
+// --- TestSupervisorInvalidatesObservations ---
+
+// TestSupervisorInvalidatesObservations proves that a process's bound
+// observation cache is invalidated at exactly the three points the spec's
+// "Workspace coordination" section requires: process spawn, each reported
+// tool.ProcessActivity, and process completion. The fake process here
+// implements tool.ProcessActivitySource via fake_process_test.go's
+// activities field and reports two synthetic activity events before its
+// channel closes, so the expected total is 1 (spawn) + 2 (activity) + 1
+// (completion) = 4.
+func TestSupervisorInvalidatesObservations(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		MaxRunningProcessesPerLoop:    4,
+		MaxRunningProcessesPerSession: 4,
+		MaxProcessInMemoryBytes:       1 << 20,
+		MaxAggregateInMemoryBytes:     10 << 20,
+		MaxProcessSpoolBytes:          1 << 20,
+		MaxAggregateSpoolBytes:        10 << 20,
+	}
+	sup := newTestSupervisor(t, cfg)
+	owner := testOwner(t)
+	origin := testOrigin(t)
+
+	activities := make(chan tool.ProcessActivity, 2)
+	activities <- tool.ProcessActivity{Kind: tool.WorkspaceActivityWrite}
+	activities <- tool.ProcessActivity{Kind: tool.WorkspaceActivityBroadWrite}
+	close(activities)
+
+	prepared := &fakePreparedProcess{process: &fakeProcess{activities: activities}}
+	lease := &fakeLease{}
+	invalidator := &fakeObservationInvalidator{}
+
+	handle, err := sup.Start(context.Background(), owner, origin, prepared, lease, nil, invalidator, StorageCeiling{}, YieldSettings{})
+	if err != nil {
+		t.Fatalf("Start() err = %v, want nil", err)
+	}
+	e := testEntry(t, sup, handle)
+
+	select {
+	case <-e.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the entry to terminalize")
+	}
+
+	if got, want := invalidator.InvalidateCalls(), 4; got != want {
+		t.Errorf("observationInvalidator.invalidate called %d times, want %d (spawn + 2 activity events + completion)", got, want)
+	}
+}
+
+// --- TestSupervisorShutdownRejectsAdmission ---
+
+// TestSupervisorShutdownRejectsAdmission proves that once closeAdmission
+// has been called, Start rejects every subsequent admission immediately
+// with CodeSupervisorShuttingDown, without ever calling
+// PreparedProcess.Start or PreparedProcess.Close, without releasing the
+// caller-supplied lease (nothing was ever reserved on its behalf), and
+// without reserving any quota.
+func TestSupervisorShutdownRejectsAdmission(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		MaxRunningProcessesPerLoop:    4,
+		MaxRunningProcessesPerSession: 4,
+		MaxProcessInMemoryBytes:       100,
+		MaxAggregateInMemoryBytes:     1000,
+		MaxProcessSpoolBytes:          200,
+		MaxAggregateSpoolBytes:        2000,
+	}
+	sup := newTestSupervisor(t, cfg)
+	owner := testOwner(t)
+	origin := testOrigin(t)
+
+	sup.closeAdmission()
+
+	prepared := &fakePreparedProcess{process: &fakeProcess{}}
+	lease := &fakeLease{}
+
+	_, err := sup.Start(context.Background(), owner, origin, prepared, lease, nil, nil, StorageCeiling{}, YieldSettings{})
+	if !errors.Is(err, New(CodeSupervisorShuttingDown)) {
+		t.Fatalf("Start() after closeAdmission err = %v, want CodeSupervisorShuttingDown", err)
+	}
+	if got := prepared.StartCalls(); got != 0 {
+		t.Errorf("PreparedProcess.Start called %d times after shutdown, want 0", got)
+	}
+	if got := prepared.CloseCalls(); got != 0 {
+		t.Errorf("PreparedProcess.Close called %d times after shutdown, want 0", got)
+	}
+	if got := lease.ReleaseCalls(); got != 0 {
+		t.Errorf("Lease.Release called %d times after shutdown, want 0", got)
+	}
+
+	sup.mu.Lock()
+	loop := sup.runningByLoop[owner.LoopID]
+	session := sup.runningBySession[owner.SessionID]
+	memory := sup.reservedMemoryBytes
+	spool := sup.reservedSpoolBytes
+	sup.mu.Unlock()
+	if loop != 0 || session != 0 || memory != 0 || spool != 0 {
+		t.Errorf("quota reserved after rejected admission: loop=%d session=%d memory=%d spool=%d, want all 0", loop, session, memory, spool)
 	}
 }

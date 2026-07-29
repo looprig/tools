@@ -83,14 +83,21 @@ type completionNotifier interface {
 	notify(ctx context.Context, event completionEvent) error
 }
 
-// observationInvalidator is Task 8's minimal placeholder for the
-// originating loop's observation-cache invalidation capability (spec
-// "Workspace coordination": "Observation caches are invalidated at process
-// spawn, on reported filesystem activity ..., and at process completion").
-// 8A accepts and stores one per admission but never calls it; Task 8D adds
-// the Invalidate method and wires the spawn/activity/completion call
-// sites.
-type observationInvalidator interface{}
+// observationInvalidator is the originating loop's observation-cache
+// invalidation capability (spec "Workspace coordination": "Observation
+// caches are invalidated at process spawn, on reported filesystem activity
+// ..., and at process completion"). 8A accepted and stored one per
+// admission but never called it; Task 8D adds the invalidate method and
+// wires the spawn/activity/completion call sites in entry.go's run.
+//
+// Every activity invalidates the complete observation cache bound to a
+// process (harness tool.ProcessActivity's doc comment: "Every activity
+// invalidates the complete bound observation cache; scoped observation
+// paths are intentionally not represented"), so invalidate carries no
+// scoping beyond which process (handle) triggered it.
+type observationInvalidator interface {
+	invalidate(ctx context.Context, handle Handle) error
+}
 
 // reservation records the exact quota amounts one admission attempt
 // reserved (reserveQuota), so releaseQuota always reverses precisely what
@@ -102,6 +109,28 @@ type reservation struct {
 	sessionID   uuid.UUID
 	memoryBytes int64
 	spoolBytes  int64
+}
+
+// terminalEntry is the Supervisor's per-terminal-entry retention bookkeeping
+// (Task 8D: terminal LRU retention), recorded by recordTerminal the instant
+// an entry terminalizes and consulted by lruVictimLocked to choose which
+// entry to evict once a session's terminal count exceeds
+// Config.MaxRetainedCompletedProcessesPerSession.
+//
+// completionSeq stands in for a genuine "last accessed" timestamp:
+// ProcessOutput and every other lookup/read path are Phase 4's job, not
+// Task 8's, so there is no caller yet that could touch a real
+// last-accessed marker on read. Until that path exists, "least recently
+// used" here means "least recently completed" -- effectively
+// FIFO-by-completion-order -- using a monotonically increasing sequence
+// number (not wall-clock time) so ordering is exact and immune to clock
+// resolution even when two entries terminalize within the same instant.
+// Once a Phase 4 lookup path exists, it should bump this same bookkeeping
+// (or a renamed lastAccessSeq) on every successful read, so eviction order
+// reflects genuine access recency rather than only completion recency.
+type terminalEntry struct {
+	sessionID     uuid.UUID
+	completionSeq int64
 }
 
 // Supervisor is the runner-free process supervisor described by the spec's
@@ -156,10 +185,31 @@ type Supervisor struct {
 	reservedSpoolBytes  int64
 
 	// entries is the registry of admitted processes, keyed by their
-	// Handle. 8A only ever adds to it (Start, on success); nothing removes
-	// an entry yet -- that starts once a process can reach a terminal
-	// state and be released/retained/evicted (Task 8B/8C/8D).
+	// Handle. Start adds to it on every successful admission; recordTerminal
+	// (Task 8D) is the only thing that ever removes an entry, when terminal
+	// LRU retention evicts it.
 	entries map[Handle]*entry
+
+	// terminal tracks retention bookkeeping for every currently-registered
+	// terminal entry, keyed by Handle (Task 8D: terminal LRU retention).
+	// recordTerminal adds a record the instant an entry terminalizes;
+	// evicting an entry removes its record from both terminal and entries
+	// together, so the two maps are always exact mirror images for the
+	// terminal subset -- every key in terminal is also a key in entries,
+	// and every terminal entries[h] has a matching terminal[h]. A running
+	// entry never appears here, which is what makes a running entry
+	// unevictable regardless of the configured retention limit.
+	terminal map[Handle]terminalEntry
+	// nextTerminalSeq is the monotonically increasing counter recordTerminal
+	// assigns to each newly terminalized entry's completionSeq (see
+	// terminalEntry's doc comment for what this stands in for).
+	nextTerminalSeq int64
+
+	// shuttingDown is set once by closeAdmission; Start checks it first and
+	// rejects admission immediately once true (Task 8D: "shutting down
+	// rejects admission and input" -- this flag covers admission only; see
+	// closeAdmission's doc comment for scope).
+	shuttingDown bool
 }
 
 // NewSupervisor returns a Supervisor governed by cfg (normalized; see
@@ -188,7 +238,107 @@ func NewSupervisor(cfg Config, manifests *ManifestStore, spoolRoot string, lifec
 		runningByLoop:    make(map[uuid.UUID]int),
 		runningBySession: make(map[uuid.UUID]int),
 		entries:          make(map[Handle]*entry),
+		terminal:         make(map[Handle]terminalEntry),
 	}, nil
+}
+
+// closeAdmission marks the supervisor as shutting down: every subsequent
+// Start call is rejected immediately with CodeSupervisorShuttingDown,
+// before reserving any quota or touching the caller-supplied
+// tool.PreparedProcess at all (TestSupervisorShutdownRejectsAdmission).
+// closeAdmission is idempotent and safe to call concurrently with Start or
+// with itself.
+//
+// closeAdmission only closes admission of new processes -- it never stops,
+// signals, or waits for any already-running entry. Coordinated shutdown
+// (tree-termination, escalation, waiting for every running entry to reach a
+// terminal state) is Task 9C's job, not this microtask's; this flag is only
+// the narrow "no new admission" prerequisite it will build on. It also does
+// not yet reject ProcessInput -- "shutting down rejects admission and
+// input" (combined-acceptance text) is only half-implemented here: Task
+// 9/17's ProcessInput call path does not exist yet, and when it is built it
+// should reuse this exact same shuttingDown flag rather than adding a
+// second one.
+func (s *Supervisor) closeAdmission() {
+	s.mu.Lock()
+	s.shuttingDown = true
+	s.mu.Unlock()
+}
+
+// recordTerminal is entry.doTerminalize's post-terminal-Save retention hook
+// (wired as onTerminal in Start), called at most once per entry --
+// terminalize's own terminalOnce already guarantees that. It records handle
+// as newly terminal for owner's session and, if that session's terminal
+// count now exceeds cfg.MaxRetainedCompletedProcessesPerSession, evicts
+// that session's least-recently-used terminal entry (lruVictimLocked):
+// removes it from both s.terminal and s.entries, then best-effort deletes
+// its durable manifest and spool (evictResources) -- "Eviction deletes the
+// manifest and spool atomically from the supervisor's perspective" (spec).
+//
+// recordTerminal never touches a running entry: only a Handle that has
+// already terminalized is ever added to s.terminal (Start never adds a
+// running entry's Handle there), so a running entry can never be chosen as
+// lruVictimLocked's victim regardless of how low the retention limit is
+// configured (TestSupervisorNeverEvictsRunning).
+func (s *Supervisor) recordTerminal(handle Handle, owner Owner) {
+	s.mu.Lock()
+	s.nextTerminalSeq++
+	s.terminal[handle] = terminalEntry{sessionID: owner.SessionID, completionSeq: s.nextTerminalSeq}
+
+	victim, evict := s.lruVictimLocked(owner.SessionID)
+	var victimEntry *entry
+	if evict {
+		victimEntry = s.entries[victim]
+		delete(s.terminal, victim)
+		delete(s.entries, victim)
+	}
+	s.mu.Unlock()
+
+	if evict {
+		s.evictResources(victim, victimEntry)
+	}
+}
+
+// lruVictimLocked reports the least-recently-used terminal entry (see
+// terminalEntry's doc comment) belonging to sessionID, and whether that
+// session's terminal count currently exceeds
+// cfg.MaxRetainedCompletedProcessesPerSession and therefore has a victim to
+// evict at all. Callers must hold s.mu.
+func (s *Supervisor) lruVictimLocked(sessionID uuid.UUID) (Handle, bool) {
+	var (
+		victim    Handle
+		victimSeq int64
+		found     bool
+		count     int
+	)
+	for h, rec := range s.terminal {
+		if rec.sessionID != sessionID {
+			continue
+		}
+		count++
+		if !found || rec.completionSeq < victimSeq {
+			victim, victimSeq, found = h, rec.completionSeq, true
+		}
+	}
+	if count <= s.cfg.MaxRetainedCompletedProcessesPerSession {
+		return "", false
+	}
+	return victim, found
+}
+
+// evictResources best-effort deletes the durable manifest and spool for an
+// evicted terminal entry. It runs outside s.mu -- disk I/O never happens
+// while holding the registry lock -- and never fails loudly: a failed
+// delete simply leaves an orphaned file behind rather than blocking or
+// panicking retention, mirroring drain/appendChunk's existing "storage
+// failures are never fatal to supervision" pattern (entry.go). e is nil
+// only if the registry was already inconsistent, which recordTerminal's own
+// bookkeeping never produces; the nil check is defensive, not expected.
+func (s *Supervisor) evictResources(handle Handle, e *entry) {
+	if e != nil && e.spool != nil {
+		_ = e.spool.Remove()
+	}
+	_ = s.manifests.Delete(handle)
 }
 
 // quotaExceeded builds the typed, model-facing quota-rejection error
@@ -387,6 +537,11 @@ func (s *Supervisor) handleExists(h Handle) bool {
 // (entry.go), driven by run's natural Wait() return today and, starting in
 // Task 9C, also by an explicit stop request, a deadline timeout, or
 // supervisor shutdown.
+//
+// If closeAdmission has already been called, Start rejects admission
+// immediately with a *Error wrapping CodeSupervisorShuttingDown, before
+// reserving any quota or touching prepared at all
+// (TestSupervisorShutdownRejectsAdmission).
 func (s *Supervisor) Start(
 	ctx context.Context,
 	owner Owner,
@@ -398,6 +553,13 @@ func (s *Supervisor) Start(
 	ceiling StorageCeiling,
 	yield YieldSettings,
 ) (Handle, error) {
+	s.mu.Lock()
+	shuttingDown := s.shuttingDown
+	s.mu.Unlock()
+	if shuttingDown {
+		return "", New(CodeSupervisorShuttingDown)
+	}
+
 	if prepared == nil {
 		return "", Wrap(CodeInvalidArguments, errors.New("prepared process is required"))
 	}
@@ -484,6 +646,29 @@ func (s *Supervisor) Start(
 		s.releaseQuota(res)
 		s.releaseLease(lease)
 		_ = proc.Close(ctx)
+
+		// Bug fix (flagged during 8C's review, fixed here in 8D): by this
+		// point prepared.Start already succeeded and returned a live
+		// tool.Process (now best-effort closed above), so without this
+		// terminal Save the manifest this call already persisted in
+		// StateRunning above would be left stuck there forever -- no
+		// terminal transition, and (before this fix) wrongly protected from
+		// Task 8D's terminal-LRU eviction forever, since eviction only ever
+		// considers entries State.Terminal() has actually reached. There is
+		// no live entry on this path (one is never registered when setup
+		// fails after spawn), so this is a plain synchronous Save, not
+		// entry.terminalize's compare-and-set -- exactly like the
+		// PreparedProcess.Start failure branch above.
+		finishedAt := time.Now().UTC()
+		manifest.State = StateFailed
+		manifest.FinishedAt = &finishedAt
+		manifest.Result = Result{Reason: reasonString(tool.ProcessTerminalFailed)}
+		// Best-effort: Start already reports CodeProcessSetupFailed
+		// regardless of whether this terminal Save itself succeeds, and
+		// there is no entry/completion-notification path to retry it
+		// through on this synchronous, single-writer path.
+		_ = s.manifests.Save(manifest)
+
 		return "", Wrap(CodeProcessSetupFailed, err)
 	}
 
@@ -501,6 +686,7 @@ func (s *Supervisor) Start(
 		manifests:      s.manifests,
 		notifications:  s.notifications,
 		releaseQuota:   s.releaseQuota,
+		onTerminal:     s.recordTerminal,
 		buffer:         NewBuffer(res.memoryBytes),
 		spool:          spool,
 		lifetimeCancel: cancel,
