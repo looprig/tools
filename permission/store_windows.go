@@ -94,26 +94,82 @@ func (s *Store) checkFileIdentity(file *os.File, info fs.FileInfo) error {
 }
 
 // checkDirIdentity enforces the owner hardening check for the store
-// directory, looked up by path (matching the os.Lstat-based check on Unix,
-// which also has no open handle).
+// directory. store.go's checkDirectory (the only caller) has already taken
+// an os.Lstat of directory before calling here, but that Lstat result
+// carries no SID -- Go's os.FileInfo.Sys() on Windows exposes neither owner
+// nor reparse-point state -- so, unlike checkFileIdentity (which reuses the
+// single handle loadFile already opened via the shared openNoFollow/
+// nofollow.Open primitive), there is no already-open handle from that Lstat
+// to thread through here.
+//
+// nofollow.Open itself is not reused for this: its Windows implementation
+// opens with plain CreateFile (no FILE_FLAG_BACKUP_SEMANTICS), which
+// real Windows rejects for a directory target, and none of nofollow.Open's
+// other callers (grep, readfile, filemutation, and this package's own file
+// checks) open directories, so extending it purely for this one directory
+// check was judged out of proportion to a Minor finding.
+//
+// To still narrow the TOCTOU the previous by-path GetNamedSecurityInfo call
+// had (it re-resolved the directory independently of the Lstat that already
+// inspected it, so the object GetNamedSecurityInfo actually read could in
+// principle have been swapped between the two calls), this function opens
+// its own no-follow handle to directory -- CreateFile with
+// FILE_FLAG_OPEN_REPARSE_POINT (refuse to transparently traverse a reparse
+// point at the final component, exactly like nofollow.Open's file-open
+// mechanism) and FILE_FLAG_BACKUP_SEMANTICS (required to open a directory at
+// all) -- and re-verifies, from that SAME handle, that the object is still a
+// plain directory and not a reparse point before fetching its owner SID
+// from that SAME handle via GetSecurityInfo, rather than
+// GetNamedSecurityInfo(path). This closes the second window (identity
+// re-check vs. SID fetch: both now come from one handle, exactly like the
+// file case). It does not close the first, inherent gap between store.go's
+// own os.Lstat and this function's CreateFile call: no portable Windows API
+// resolves identity and opens a handle atomically from a bare path, and this
+// narrower remaining gap is symmetric with what the file path's own first
+// open (loadFile's openNoFollow) already accepts as its starting point.
 func (s *Store) checkDirIdentity(directory string, info fs.FileInfo) error {
-	return s.checkOwnerPath(directory, "store directory owner")
-}
-
-// checkOwnerHandle and checkOwnerPath both resolve to the same SID
-// comparison; they differ only in how the security descriptor is fetched
-// (by open handle vs. by path), matching the two call sites' available
-// state.
-func (s *Store) checkOwnerHandle(handle windows.Handle, label string) error {
-	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	handle, err := openDirNoFollow(directory)
 	if err != nil {
 		return &FileError{Path: s.path, Reason: FileIO, Err: err}
 	}
-	return s.compareOwnerSID(sd, label)
+	defer func() { _ = windows.CloseHandle(handle) }()
+
+	var winInfo windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &winInfo); err != nil {
+		return &FileError{Path: s.path, Reason: FileIO, Err: err}
+	}
+	if winInfo.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return &FileError{Path: s.path, Reason: FileSymlink, Err: errors.New("store directory is a reparse point")}
+	}
+	if winInfo.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return &FileError{Path: s.path, Reason: FileNotRegular, Err: errors.New("store directory path is not a directory")}
+	}
+
+	return s.checkOwnerHandle(handle, "store directory owner")
 }
 
-func (s *Store) checkOwnerPath(path, label string) error {
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+// openDirNoFollow opens directory as a no-follow directory handle:
+// FILE_FLAG_BACKUP_SEMANTICS is required by CreateFile to open a directory
+// at all, and FILE_FLAG_OPEN_REPARSE_POINT refuses to transparently traverse
+// a reparse point at the final path component -- the same
+// refuse-rather-than-follow mechanism internal/nofollow.Open uses for files
+// (see checkDirIdentity's doc comment for why that shared primitive is not
+// reused directly here).
+func openDirNoFollow(directory string) (windows.Handle, error) {
+	pathPtr, err := windows.UTF16PtrFromString(directory)
+	if err != nil {
+		return 0, err
+	}
+	shareMode := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
+	attrs := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	return windows.CreateFile(pathPtr, windows.GENERIC_READ, shareMode, nil, windows.OPEN_EXISTING, attrs, 0)
+}
+
+// checkOwnerHandle resolves the SID comparison from an already-open handle
+// (used by both checkFileIdentity's file handle and checkDirIdentity's
+// directory handle above).
+func (s *Store) checkOwnerHandle(handle windows.Handle, label string) error {
+	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
 		return &FileError{Path: s.path, Reason: FileIO, Err: err}
 	}
