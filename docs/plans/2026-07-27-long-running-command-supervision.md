@@ -926,8 +926,10 @@ Test manifest invariants:
 Test spool invariants:
 
 - append order determines global cursor;
-- exact ceiling succeeds;
-- the next byte returns `output_limit`;
+- an append that would exceed the retention ceiling drops the oldest spooled
+  bytes and succeeds; `total_bytes` keeps counting the full stream;
+- a cursor below the retained window returns the earliest retained bytes with
+  `gap: true`; the process is never terminated for output volume;
 - reads are bounded and cursor-addressed;
 - truncated/corrupt files return `spool_corrupt`;
 - no path escapes the private resource directory;
@@ -1034,7 +1036,7 @@ Execute as four implementation microtasks:
 - **8B — durable handoff and stream drain:**
   `TestSupervisorPersistsBeforeReturningHandle`,
   `TestSupervisorDrainsOrderedStreams`, and
-  `TestSupervisorOutputLimitStopsProcess`.
+  `TestSupervisorSpoolCeilingDropsOldest`.
 - **8C — terminal arbiter and lifecycle IDs:**
   `TestSupervisorTerminalRaceChoosesOnce`,
   `TestSupervisorPublishesStableLifecycleIDs`, and
@@ -1056,7 +1058,7 @@ not a consolidated implementation assignment:
   `feat(process): reserve supervisor admission`.
 - **8B:** edit `process/entry.go`, `process/entry_test.go`,
   `process/supervisor.go`, and `process/supervisor_test.go`; queued phase-gate selector
-  `go test ./process -run '^TestSupervisor(PersistsBeforeReturningHandle|DrainsOrderedStreams|OutputLimitStopsProcess)$'`;
+  `go test ./process -run '^TestSupervisor(PersistsBeforeReturningHandle|DrainsOrderedStreams|SpoolCeilingDropsOldest)$'`;
   Failure rationale: durable handoff/drain is missing. Implement manifest-before-handoff and
   bounded stream ownership only, and commit
   `feat(process): persist and drain supervised processes`.
@@ -1091,7 +1093,7 @@ storage, notification, quota, and retention dependencies only. Test:
 - cancellation before handoff cancels start;
 - invocation cancellation after handoff does not cancel lifetime;
 - owner mismatch is exactly `not_found`;
-- natural exit, spawn failure, timeout, output-limit, stop, and shutdown race
+- natural exit, spawn failure, timeout, stop, and shutdown race
   through one terminal compare-and-set;
 - one terminal manifest, one completion callback, one lease release;
 - completed/lost publication uses the stable manifest IDs on every retry;
@@ -2095,7 +2097,7 @@ ProcessOutput, ProcessInput, and ProcessStop without a runner. The fake Harness
 create the same runner-free supervisor before Bash is built. Tools cannot import
 Harness `internal/sessionruntime`; real registry composition is reserved for
 Coderig Task 28. Cover foreground compatibility, background start, yield,
-incremental output, wait-many, input, stop, output limit, owner isolation,
+incremental output, wait-many, input, stop, spool retention, owner isolation,
 resource shutdown, and manifest restore.
 
 Both files begin with:
@@ -2501,32 +2503,32 @@ Files: `pkg/command/process_notification.go`,
 - `TestProcessNotificationLiveDuplicateIgnored`;
 - `TestProcessNotificationCollisionRejected`;
 - `TestProcessNotificationAppendBeforeDispatchRestoresDelivery`;
-- `TestProcessNotificationDispatchBeforeCrashDoesNotRepeatModelTurn`.
-- `TestProcessNotificationRestoreFailsWhenUnresolvedSetExceedsCap`;
-- `TestProcessNotificationAppendThenQueueFullRetryKeepsReservation`;
-- `TestProcessNotificationConcurrentFailedAndSuccessfulAppendKeepsPending`;
+- `TestProcessNotificationConsumedCommandNotRedelivered`;
+- `TestProcessNotificationInboxFullRetryAppendsOnce`;
 - `TestForeignLoopRejectsProcessNotification`.
 
-The native loop owns a bounded set of unresolved
-CommandID/payload-fingerprint entries. Restore reconstructs it by subtracting
-enduring loop events whose cause references the CommandID from the full process
-notification command replay, then re-enqueues an appended-but-undispatched
-notification. It fails closed if the unresolved set exceeds the configured cap;
-it never evicts an unresolved ID. `Appended=false` with no unresolved entry is
-already consumed and cannot begin another model turn. Before append, the loop
-atomically reserves the unresolved ID/fingerprint and bounded pending capacity.
-No slot returns retryable-full before append; append failure releases the
-reservation; append success commits it. If the ordinary inbox is full after
-append, the reservation stays pending and a same-ID retry reuses it.
-Singleflight by `(LoopID, CommandID)` gives each reservation a generation token:
-identical concurrent attempts share the leader result, only the current
-uncommitted generation can be released, and commit is idempotent. A failed
-attempt cannot erase a later successful pending obligation. The
-notification payload carries session/loop coordinates; append validates them
-against the enclosing live `CommandRecord` route. Add a transient result channel
-reporting accepted, duplicate, collision, retryable-full, or stopped. Command
-append failure remains explicit for this process-notification path; existing
-audit-only commands keep their established behavior. Queued phase-gate selector:
+Delivery is at-least-once with idempotent consumption. The supervisor appends
+the durable completion command first using the stable pre-persisted CommandID;
+24A's idempotency index makes a same-ID retry return `Appended=false` without a
+second frame, and a same-ID append with a different payload is a typed
+collision. Dispatch to the owning loop's inbox happens only after a successful
+or deduplicated append. A full inbox loses nothing: the supervisor retries
+dispatch with the same CommandID and the durable command remains authoritative;
+no pre-append reservation, pending-capacity handshake, singleflight generation
+token, or fail-closed unresolved cap exists. Restore reconstructs undelivered
+notifications by replaying process-notification commands and subtracting those
+whose CommandID already appears as the cause of a durable loop event, then
+re-enqueues the remainder; the replay set is bounded by the session's retained
+completion commands and needs no separate cap. A crash between dispatch and
+causality commit may redeliver a notification: the loop drops a duplicate whose
+causality event is already durable, and otherwise redelivery is harmless
+because the notification is metadata-only and acting on it twice costs one
+redundant ProcessOutput call. The notification payload carries session/loop
+coordinates; append validates them against the enclosing live `CommandRecord`
+route. Add a transient result channel reporting accepted, duplicate, collision,
+or stopped. Command append failure remains explicit for this
+process-notification path; existing audit-only commands keep their established
+behavior. Queued phase-gate selector:
 
 ```bash
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go test ./pkg/command ./internal/loopruntime ./internal/sessionruntime -run 'Test(ProcessNotification|ForeignLoopRejectsProcessNotification)'
@@ -2534,9 +2536,8 @@ GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go t
 
 Implement only the sealed command codec, restored projection, and owning-loop
 delivery. Queue backpressure cannot grow the inbox beyond its bound or block
-terminalization: the retained pending reservation returns retryable-full and
-the supervisor retries with the same CommandID. Remove an unresolved entry only
-after an enduring loop causality event commits. Attach this implementation
+terminalization: the supervisor retries dispatch with the same CommandID, and
+the deduplicated append guarantees no second durable frame. Attach this implementation
 behind Task 4's stable completion-notifier bridge rather than rebinding captured
 resources. Foreign engines reject process notifications; they do not silently
 drop them.
@@ -2546,7 +2547,8 @@ Queue the focused non-race selector for the owning phase gate, and commit
 **Phase acceptance behavior**
 
 Test checked publication for started/backgrounded/completed/stop/lost, append
-failure faulting, session/loop/owner validation, and at-most-once acknowledgment.
+failure faulting, session/loop/owner validation, and at-least-once delivery
+with idempotent consumption.
 The bridge receives stable IDs from Tools, installs them directly as
 EventID/CommandID, and rejects zero or replacement IDs.
 
@@ -2781,7 +2783,7 @@ Through real Coderig composition and Sandbox:
 6. send stdin and EOF;
 7. resize/use PTY where supported;
 8. interrupt, terminate, and kill;
-9. hit output limit;
+9. overflow the spool retention window and keep running;
 10. verify grant denial and effective workspace lease conflicts;
 11. observe metadata-only completion;
 12. restore completed output;
@@ -2946,7 +2948,7 @@ Cover:
 - runaway stdout/stderr;
 - input backpressure and blocked readers;
 - process, waiter, memory, and spool quota exhaustion;
-- concurrent stop/exit/timeout/output-limit/shutdown;
+- concurrent stop/exit/timeout/shutdown;
 - corrupted/truncated/swapped manifests and spools;
 - shell background, `nohup`, double fork, and `setsid`;
 - host process crash;

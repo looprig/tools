@@ -265,3 +265,43 @@ conflict without permanently shutting down session resources.
 
 This amendment is documentation-only. No test, static-analysis, vulnerability,
 build, automated diff check, or independent review was executed for it.
+
+## Post-Phase-1 design amendments: spool retention and notification delivery
+
+Two design amendments were accepted after Phase 1 (Tasks 0–4 complete) and
+before any Phase 2 implementation, chosen to invalidate no accepted work:
+
+**Spool retention replaces kill-on-output-limit.** The per-process disk spool
+is now a bounded retention window: an append beyond the ceiling drops the
+oldest spooled bytes, `total_bytes` keeps counting, and reads below the
+retained window return the earliest retained bytes with `gap: true`. A process
+is never terminated for output volume, matching reference-agent behavior
+(Claude Code and Codex truncate output rather than kill the command). The
+shipped Phase 1 `ProcessTerminalOutputLimit` reason and its event-matrix rows
+remain valid reserved wire values that the supervisor never emits; no Harness
+enum, validation, or codec change is required. The `output_limit` model-facing
+error code is removed from the taxonomy. Plan changes: Task 6 spool
+invariants, Task 8B (`TestSupervisorOutputLimitStopsProcess` →
+`TestSupervisorSpoolCeilingDropsOldest`), Task 8 acceptance race list, and the
+Task 20/28/29 coverage wording.
+
+**Notification delivery simplified to at-least-once with idempotent
+consumption.** The pre-append reservation handshake, pending-capacity
+accounting, singleflight generation tokens, and fail-closed unresolved-cap
+restore are removed from Task 24C. The retained protocol is: append the
+durable completion command first with the stable pre-persisted CommandID
+(24A's journal idempotency index deduplicates same-ID retries and rejects
+payload collisions), then dispatch to the owning loop's inbox, retrying with
+the same CommandID on backpressure; restore re-enqueues replayed
+process-notification commands whose CommandID lacks a durable causality
+event. A crash between dispatch and causality commit may redeliver a
+notification; that duplicate is deliberately acceptable because the
+notification is metadata-only and idempotent for the model. Task 24C's test
+list shrinks accordingly (`ConsumedCommandNotRedelivered` and
+`InboxFullRetryAppendsOnce` replace the reservation-protocol tests), and the
+spec's security invariant 9 now permits duplicate delivery of an unconsumed
+notification. Tasks 24A and 24B are unchanged.
+
+These amendments are documentation-only. Per the phase-boundary-only policy,
+no test, static-analysis, vulnerability, build, or independent review was
+executed for them.

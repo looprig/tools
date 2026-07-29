@@ -411,8 +411,8 @@ starting | running -> lost_on_restore during restore reconciliation
 ```
 
 Terminal states are immutable. Completion is published only after the terminal
-manifest is durably written. Concurrent exit, timeout, stop, output-limit, and
-shutdown paths race through one compare-and-set terminalization path, producing
+manifest is durably written. Concurrent exit, timeout, stop, and shutdown
+paths race through one compare-and-set terminalization path, producing
 at most one terminal state and one completion event.
 
 ## Supervisor lifetime
@@ -499,9 +499,13 @@ source of truth for completed output and cursor recovery. Writes use a single
 per-process append sequence so cursor order is deterministic even when stdout
 and stderr are read concurrently.
 
-Reaching the configured spool ceiling triggers process-tree termination and the
-terminal reason `output_limit`. The supervisor must not keep discarding live
-output while allowing an unbounded producer to run.
+The spool is a bounded retention window, not a hard cap on the process. When an
+append would exceed the configured ceiling, the supervisor drops the oldest
+spooled bytes and keeps the most recent ones; `total_bytes` continues to count
+the full stream. A cursor older than the retained window returns the earliest
+retained bytes with `gap: true`, exactly as for the in-memory window. A process
+is never terminated for producing too much output; this matches the
+reference-agent behavior of truncating output while the command keeps running.
 
 Model-visible text passes through safe-text normalization:
 
@@ -593,7 +597,11 @@ completed/exited requires an exit code, and failed/lost alone may carry the
 bounded diagnostic. Every unlisted kind/state/reason combination is invalid.
 Task 4 extends the existing `pkg/tool.ProcessTerminalReason` for failed,
 output-limit, and lost-on-restore by appending values without renumbering the
-Task 1 constants; it does not define a second reason type.
+Task 1 constants; it does not define a second reason type. The `output-limit`
+reason and its matrix rows remain valid reserved wire values — they shipped
+with the accepted Phase 1 event contract — but the current supervisor never
+emits them: spool overflow drops the oldest retained bytes instead of
+terminating the process.
 
 The public late-bound service DTOs are defined in `pkg/tool`; the concrete
 events use the same bounded `pkg/tool` enums rather than making `pkg/tool`
@@ -634,32 +642,30 @@ The Hub accepts an optional result-bearing appender. Its no-persistence appender
 reports `appended=true`; a durable duplicate reports `appended=false`, and Hub
 does not reapply or rebroadcast that event.
 
-Completion command delivery is at-least-once across a crash boundary but
-idempotent. The owning native loop keeps a bounded set of unresolved
-CommandID/payload-fingerprint entries, seeded on restore by subtracting durable
-command-causality events from the full process-notification command replay.
-Consumed IDs are not kept in an evicting cache: `appended=false` with no
-unresolved entry means the durable command was already consumed.
+Completion command delivery is at-least-once with idempotent consumption. The
+supervisor appends the durable completion command first, using the stable
+pre-persisted CommandID; the journal idempotency index makes a same-ID retry
+return the original sequence with `appended=false` and no second frame, and a
+same-ID append with a different payload remains a typed collision error. Only
+after a successful or deduplicated append is the notification dispatched to
+the owning loop's inbox. A full inbox loses nothing: the supervisor retries
+dispatch with the same CommandID and the durable command remains the source of
+truth. No pre-append reservation, pending-capacity handshake, singleflight
+generation token, or fail-closed unresolved cap exists.
 
-Live delivery uses a pre-append reservation handshake. The loop atomically
-reserves the unresolved `(CommandID, fingerprint, pending)` entry and its
-bounded capacity before Harness appends the command. No capacity returns
-retryable-full before append. Append failure releases the reservation; append
-success commits it. If the regular inbox is full after append, the pending
-reservation remains and a same-ID retry reuses it, so `appended=false` cannot be
-misclassified as consumed. Restore fails closed if the reconstructed unresolved
-set exceeds its configured cap, and no path evicts an unresolved entry.
-Reservation is singleflight per `(LoopID, CommandID)` and carries a unique
-generation token. Identical concurrent claimants share the leader's outcome;
-only the current uncommitted generation may be released, and commit is
-idempotent. A failed leader cannot delete a later successful pending obligation.
-A transient acknowledgement reports accepted, duplicate, collision,
-retryable-full, or stopped. An identical unresolved command is retried; a
-consumed duplicate is ignored; a conflicting payload is rejected. The
-notification is removed from the unresolved set only after an enduring loop
-event carrying its command cause commits. This closes both the
-append-before-dispatch and dispatch-before-crash windows without making the
-ordinary audit-only command path strict.
+On restore, the loop reconstructs undelivered notifications by replaying
+process-notification commands and subtracting those whose CommandID already
+appears as the cause of a durable loop event; the remainder are re-enqueued.
+The replay set is naturally bounded by the session's retained completion
+commands, so it needs no separate cap.
+
+A crash between dispatch and the loop's causality commit may therefore deliver
+the same notification twice. That duplicate is deliberately acceptable: a
+completion notification is metadata-only and idempotent for the model — it
+says only that a process reached a terminal state, and acting on it twice
+costs one redundant `ProcessOutput` call. The loop drops a duplicate whose
+causality event is already durable; otherwise redelivery is harmless. The
+ordinary audit-only command path keeps its established non-strict behavior.
 
 Process-enabled definitions are supported only by native Harness loops in this
 release. The immutable loop definition exposes a read-only `Engine()` view so
@@ -910,7 +916,6 @@ The public error taxonomy includes:
 - `input_backpressure`;
 - `cursor_gap`;
 - `cursor_ahead`;
-- `output_limit`;
 - `timed_out`;
 - `interrupted`;
 - `terminated`;
@@ -941,7 +946,8 @@ The implementation is unacceptable unless all of these remain true:
 9. Terminal state occurs once; lifecycle and notification publication reuse
    pre-persisted stable IDs, durable journal appends deduplicate identical IDs
    across reopen, and restored loop notification state suppresses replayed
-   commands.
+   commands that were already consumed. Duplicate delivery of an unconsumed
+   notification is permitted and idempotent.
 10. Restore never signals a PID recovered from persisted metadata.
 
 ## Delivery phases
