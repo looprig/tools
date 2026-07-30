@@ -30,6 +30,12 @@ The consumer-facing constructor is:
 tools.TaskDefinitions()
 ```
 
+The bundle is a deliberate exception to the tools module's default
+one-definition-per-tool convention. These tools are one capability family rather
+than independently selectable capabilities: they must share one store whose
+lifetime is exactly one Loop binding. A bundle expresses that ownership without
+promoting task state into the harness.
+
 The bundle is built once for each Loop binding. Its factory creates one
 mutex-protected task store and constructs all four tools over that store.
 
@@ -99,25 +105,67 @@ task's status, dependencies, and derived `blocks` list.
 ## Task Model
 
 ```go
-type Task struct {
+type taskRecord struct {
 	ID          string
 	Subject     string
 	Description string
 	ActiveForm  string
 	Status      Status
 	BlockedBy   []string
-	Metadata    map[string]any
+	Metadata    json.RawMessage
+}
+
+type Task struct {
+	ID          string          `json:"id"`
+	Subject     string          `json:"subject"`
+	Description string          `json:"description"`
+	ActiveForm  string          `json:"activeForm,omitempty"`
+	Status      Status          `json:"status"`
+	BlockedBy   []string        `json:"blockedBy,omitempty"`
+	Blocks      []string        `json:"blocks,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
 }
 ```
 
 IDs are UUID strings. Status is one of `pending`, `in_progress`, or
 `completed`.
 
-Only `BlockedBy` is stored. A task's `Blocks` list is derived by finding tasks
-whose `BlockedBy` list contains its ID. This avoids maintaining two inverse
-collections that can drift.
+Only `taskRecord` values are stored. A task's `Blocks` list is derived while
+building the returned `Task` view by finding records whose `BlockedBy` list
+contains its ID. This avoids maintaining two inverse collections that can drift
+and prevents an output-only field from entering stored state.
 
-All returned slices and metadata maps are defensive copies.
+Metadata must be a JSON object. Preparation rejects `null`, arrays, scalars,
+malformed values, and values above the metadata limit. The canonical JSON bytes
+are stored and defensively copied. On update, omission preserves metadata and an
+explicit `{}` clears it.
+
+All returned slices and metadata bytes are defensive copies.
+
+## Resource Limits
+
+The store is bounded even though it is in-memory and loop-local. V1 uses private,
+fixed limits rather than public configuration:
+
+```go
+const (
+	maxTaskArgsBytes     = 64 << 10
+	maxTasksPerLoop      = 256
+	maxSubjectBytes      = 512
+	maxDescriptionBytes  = 16 << 10
+	maxActiveFormBytes   = 512
+	maxMetadataBytes     = 16 << 10
+	maxDependencies      = 128
+	maxStoreBytes        = 2 << 20
+)
+```
+
+Preparation rejects a raw argument document above `maxTaskArgsBytes` before
+decoding it. The aggregate store size is the sum of the stored IDs, strings,
+dependency IDs, and canonical metadata bytes. Create and update validate both
+per-field limits and the aggregate candidate graph before committing. Limit
+failures leave the graph unchanged. These limits also bound `TaskList` output to
+a practical size.
 
 ## Scope and Lifetime
 
@@ -136,7 +184,10 @@ Session
 ```
 
 All modes within Loop A reuse task store A because Loop binding builds each
-definition once and reuses its concrete tools across resolved modes.
+definition once and reuses its concrete tools across resolved modes. Consumers
+that explicitly list the Tasks bundle in multiple modes must reuse the same
+`tool.Definition` value; constructing distinct definitions with the same name is
+rejected by Loop binding.
 
 A restored Loop receives a newly built, empty task store. Persistence may be
 added later behind the same private store interface without changing the
@@ -163,25 +214,42 @@ under that mutex.
 Using one graph-level critical section keeps dependency updates atomic and is
 appropriate for the bounded task counts expected within one agent Loop.
 
-## Errors and Results
+All four tools also implement `tool.Sequential`. The runner therefore executes
+task calls in model call order. This makes dependent operations deterministic:
+for example, completing a blocker and then starting its dependent in one batch
+always observes the completion first. The mutex remains necessary for direct
+callers, tests, and future execution paths.
 
-Like the existing standard tools, model-correctable failures are returned as
-tool-result strings rather than Go errors. Structured successful results are
-JSON.
+## Preparation, Execution, and Errors
 
-Failures include:
+Each concrete tool owns a typed prepared artifact that embeds
+`tool.TokenArtifact` and contains its fully decoded, validated, and normalized
+arguments. `PrepareCall`:
 
-- malformed or unknown input fields;
-- missing required fields;
-- unknown task IDs;
-- unknown dependency IDs;
-- invalid statuses;
-- self-dependencies;
-- dependency cycles;
-- attempts to start blocked tasks.
+1. strictly decodes exactly one JSON object and rejects unknown fields;
+2. validates required fields, UUID syntax, status values, metadata shape and
+   size, field sizes, and dependency-count limits;
+3. parses task IDs to canonical UUID strings, de-duplicates and sorts dependency
+   slices, and preserves accepted model-supplied text verbatim;
+4. returns a pure `tool.Request` with the concrete tool name, no requirements,
+   and the typed artifact.
 
-Schemas set `additionalProperties: false`, and runtime decoding also rejects
-unknown fields.
+`InvokableRun` never reparses `argsJSON`. It retrieves the artifact from
+`loop.PreparedCallFromContext` and fails closed with a model-visible error if
+the artifact is absent, nil, or belongs to another task tool.
+
+Preparation cannot validate facts that may change before execution. Unknown
+task IDs, unknown dependency IDs, cycles, aggregate-store limits, and blocked
+status transitions are checked atomically against live store state in
+`InvokableRun`.
+
+Preparation failures are model-safe Go errors returned by `PrepareCall`; the
+harness renders them to the model and never executes the tool. Live-state
+validation failures are model-visible tool-result strings with no Go error.
+Structured successful results are JSON.
+
+Schemas set `additionalProperties: false`, and runtime preparation independently
+rejects unknown fields.
 
 ## Compatibility
 
@@ -209,9 +277,16 @@ migrated.
 Tests cover:
 
 - exact tool names, descriptions, and JSON schemas;
+- typed preparation artifacts and normalized requests;
+- rejection during preparation of malformed, trailing, unknown, missing,
+  wrong-type, oversized, and invalid-enum inputs;
+- fail-closed execution with missing, nil, or cross-tool artifacts;
+- proof that changing raw arguments after preparation does not change execution;
 - one shared store across all four tools in one binding;
 - isolation between separate Loop bindings;
-- mode reuse through the existing definition-build cache;
+- mode reuse through the existing definition-build cache using the same
+  definition value;
+- deterministic call-order behavior through `tool.Sequential`;
 - create defaults and UUID generation;
 - patch semantics and metadata replacement;
 - get and deterministic list ordering;
@@ -221,5 +296,6 @@ Tests cover:
 - blocked transition rejection and eligibility after completion;
 - malformed JSON and unknown-field rejection;
 - defensive copies;
+- raw-argument, field-size, dependency, task-count, and aggregate-store limits;
 - concurrent access under `go test -race`;
 - the existing `Todo` compatibility surface.
