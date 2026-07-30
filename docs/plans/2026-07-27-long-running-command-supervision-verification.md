@@ -516,3 +516,50 @@ Windows execution first becomes native to this plan's own work — this is a
 deliberate scope bound recorded here, not an oversight.
 
 No unresolved finding or deferred required check enters Phase 3.
+
+## Phase 3 coordination prerequisite — partial update (2026-07-29)
+
+Sandbox stabilization handoff remains at `2a21dda` (clean worktree, confirmed
+`git status` clean, `git rev-parse HEAD` = `2a21dda3792cc33d08109372092316594a9935df`).
+Of the three mandatory stabilization gates recorded above the Phase 3 task
+list, status is:
+
+- **Module-pinned vulnerability scan: SATISFIED.** Ran
+  `GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go tool govulncheck ./...`
+  directly against `looprig/sandbox` HEAD `2a21dda` from a host with real
+  network access to `vuln.go.dev` (verified via `curl -sI vuln.go.dev` before
+  the run). Exit 0, output: "No vulnerabilities found." `govulncheck` is the
+  module's registered `go.mod` tool dependency
+  (`golang.org/x/vuln/cmd/govulncheck`), not an ad hoc install.
+- **Live privileged Linux Rung-1/Rung-2 execution: STILL BLOCKED.** Sandbox PR
+  #1 (`fix/rung1-rung2-ci-failures`, unmerged) fixes a real security bug
+  (`enumerateMountViewWithGrantPaths` ancestor-writable-rule leak defeating a
+  narrower read-only carveout) plus two stale test expectations, verified by
+  the PR author against a real Linux kernel in a privileged Docker container.
+  On PR #1's own CI run (`gh pr checks 1` against run 30493678316):
+  `test-linux-rung2` passes (confirms the PR's fix); `test-linux-rung1` still
+  fails with `##[error]The runner has received a shutdown signal...`, ~40-70s
+  in, at the same point in `internal/exec`/`internal/linux` heavier
+  Landlock/namespace tests as prior runs on both `main` and this PR — a
+  self-hosted-runner-fleet lifecycle/availability problem, not a code defect.
+  This is CI infrastructure outside this plan's or PR #1's code scope.
+- **Live `windows-restricted`/`windows-elevated` runs: STILL BLOCKED.**
+  `windows-restricted` targets `runs-on: [self-hosted, Windows, X64,
+  sandbox-standard, sandbox-disposable]` and sat `QUEUED` for the PR #1 run
+  with no runner ever picking it up. `windows-elevated` has `needs:
+  windows-restricted` in `.github/workflows/ci.yml`, so it cannot start until
+  that job completes. No self-hosted Windows runner matching either label set
+  is currently available. This is runner-fleet provisioning, not something
+  fixable from within this repository or this session.
+
+**Disposition:** one of three mandatory gates is now satisfied with real
+evidence; the other two require self-hosted runner infrastructure
+(availability/lifecycle for the Linux fleet, provisioning for the Windows
+fleet) that is outside this session's reach. Per the plan's explicit
+Phase 3 coordination-prerequisite text ("Obtain and review those native run
+IDs/logs at this phase boundary before Task 10... Those native run IDs/logs
+and the vulnerability result remain a hard coordination prerequisite before
+Sandbox async implementation begins"), Task 10 has not started. This is a
+documentation-only update — the phase-boundary-only heavy-verification
+policy is otherwise unchanged, and this partial evidence does not open
+Phase 3 implementation on its own.
