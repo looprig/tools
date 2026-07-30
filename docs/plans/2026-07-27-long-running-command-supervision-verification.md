@@ -563,3 +563,201 @@ Sandbox async implementation begins"), Task 10 has not started. This is a
 documentation-only update — the phase-boundary-only heavy-verification
 policy is otherwise unchanged, and this partial evidence does not open
 Phase 3 implementation on its own.
+
+## Phase 4 — Model-facing Bash and process tools
+
+**Decision:** Accepted. Tasks 14-20 (all lettered/sub-scoped work included),
+one mid-phase architectural fix an implementer self-diagnosed and I dispatched
+before Task 20, Phase Gate 4's complete command matrix, two independent
+phase-level reviews, and one blocking-finding fix all passed. Phase 3 (Sandbox
+async pipe execution) remains blocked on external CI/runner infrastructure
+(see the section above) and was correctly not required for Phase 4 — verified
+directly against the plan text before starting: Phase 4 depends only on
+Phase 1's already-complete Harness contracts, and explicitly forbids `tools`
+from importing Sandbox at all.
+
+**Repository head**
+
+- Tools: `b4788080be347dea495adaa195c1916a5ac45f59`
+
+Commit range `b6c0ff2..HEAD`, 12 commits (excluding `b6c0ff2` itself, which is
+the Phase 3 govulncheck ledger note, not Phase 4 work). Every task ran
+subagent-driven, one fresh implementer per task/microtask, test-first with
+execution deferred to this gate, per the plan's own stated protocol.
+
+**Implemented scope**
+
+- `bash/bash.go`/`bash/prepare.go` (Task 14): presence-aware
+  `Timeout`/`Background`/`YieldTimeMS`/`TTY`/`MaxOutputBytes` schema fields,
+  explicit-supervision detection (`Background || YieldTimeMS != nil`),
+  supervised `timeout:0` = no-deadline, a conservative detached-syntax guard
+  applied only to supervised calls, and frozen (JSON-mutation-proof) prepared
+  artifact fields. Legacy calls with none of these fields (or all false/absent)
+  are byte-for-byte unchanged — proven by dedicated characterization tests, not
+  merely assumed;
+- `bash/supervised.go`/`bash/result.go` (Task 15, later hardened by two gate
+  fixes): supervised routing — `PrepareProcess` before lease acquisition,
+  prepared authoritative access determines the lifetime lease, `Start` only
+  after the lease is held, full reservation/lease rollback on any failure path,
+  `lifetime_enforcement_unavailable` fail-closed when the runner/registry/
+  lifetime-coordinator aren't wired, live-vs-terminal-vs-timeout-budget
+  branching, a detached `watchAndInvalidate` goroutine covering the
+  spawn/completion/intermediate observation-invalidation acceptance criteria
+  (via `Supervisor.Wait`'s condition-driven blocking API, not busy-polling,
+  since `process`'s `lifecycleSink`/`observationInvalidator` are
+  package-private and unreachable from `bash` in this phase — flagged and
+  accepted by spec review, Finding 6 below);
+- `process/output_tool.go`/`input_tool.go`/`stop_tool.go` (Tasks 16-18): the
+  three companion tools, sharing `resolveEntry`/`readOne` for consistent
+  owner-isolation (`not_found` for both missing and cross-owner handles) and
+  metadata-safe error rendering; ProcessOutput's poll/wait-any/wait-all with
+  `cursor < total_bytes || terminal` satisfaction, safe_text/base64 symmetry,
+  opaque path-free artifacts; ProcessInput's per-handle serialized bounded
+  writes, PTY-only resize, pipe-vs-PTY EOF semantics, omitted-cursor
+  pre-write-end snapshots; ProcessStop's confirmed-exit-before-success
+  semantics, single terminate-then-kill escalation, and terminal idempotence;
+- `definitions.go`/`dependency_test.go` (Task 19): `BashDefinition` (resolves
+  the async runner exactly once per Build from the validated `bindings.LoopID`,
+  never from invocation provenance) plus three argument-free companion
+  definitions, all four sharing one runner-free `process.Supervisor` per
+  session regardless of build order; the `tools/process` sibling-import
+  exemption scoped to exactly the `bash` package (verified: `AND`-combined
+  with the exact import path, not a blanket relaxation; Sandbox/Harness-
+  internal prohibition untouched);
+- `process/session_resource.go` (mid-phase fix, commit `4aa423b`): Task 19's
+  own implementer self-diagnosed that `bash/supervised.go` and `definitions.go`
+  each carried a private, differently-typed `SessionResource` wrapper around
+  the identical registry key — whichever won `GetOrCreate`'s race left the
+  other unable to type-assert the cached resource, failing closed. Fixed
+  before Task 20 (which is test-only and could not have fixed this itself) by
+  adding one exported `SupervisorResource`/`NewSupervisorResource`/
+  `SupervisorResourceKey`, adopted by both consumers, with zero dangling
+  references to the deleted private types anywhere in the module;
+- `bash/integration_test.go`/`process/integration_test.go` (Task 20):
+  `TestIntegrationBashSupervisedWorkflow` and `TestIntegrationProcessToolsRestore`,
+  both real-subprocess-backed (mirroring `process/supervisor_integration_test.go`'s
+  established pattern), covering foreground compatibility, background start,
+  yield (live and terminal), incremental output, wait-many with proven
+  companion-creates-supervisor-before-Bash race-direction, input, stop, spool
+  retention, owner isolation, resource shutdown, and manifest restore.
+
+**Phase-gate RED and repair evidence**
+
+- Focused per-task selectors (Tasks 14, 16, 17, 18, 19) passed clean on first
+  run. Task 15's selector (`TestSupervisedBash*`) flaked: 4 of ~19 subtests hit
+  `TempDir RemoveAll cleanup: directory not empty` — the identical root cause
+  Phase 2 already solved once (a background entry-termination goroutine still
+  writing manifest/spool when `t.TempDir()`'s registered cleanup fired), one
+  layer up: `bash`'s tests have no access to `process`'s unexported
+  `entry`/`waitEntryDone`, only `Supervisor.Wait`'s public API. Fixed (commit
+  `b8384dc`) with a `waitProcessDone` helper (bounded `Supervisor.Wait(WaitAll)`
+  call, harmless no-op for a deliberately-still-running process) applied as the
+  last statement in each of the 8 exposed tests. Verified: `-race -count=20`
+  clean (was previously undercounted by a single run, mirroring Phase 2's own
+  20-iteration precedent).
+- Tagged integration run surfaced three further issues, all in Task 20's own
+  new test code, none in production code (fixed in commit `172cd1e`, verified
+  `-race -count=5` clean plus a full non-tagged `-race ./...` re-run):
+  - a genuine data race in `bash/integration_test.go`'s `fakeObservations`
+    (doc comment claimed "race-safe", implementation was a plain non-atomic
+    `int64++` racing against `watchAndInvalidate`'s detached goroutine) — fixed
+    with `atomic.Int64`, mirroring `bash/supervised_test.go`'s own
+    already-correct `syncWorkspaceObservations` double;
+  - a `wait:all` assertion stronger than the API's documented contract: the
+    test omitted per-target cursors, so ProcessOutput's own `cursor <
+    total_bytes || terminal` "already satisfied" shortcut could legitimately
+    return before both twin processes were terminal — fixed by learning each
+    twin's true byte count via an initial poll, then reissuing `wait:all` at
+    that cursor so only genuine terminal advancement can satisfy it;
+  - a `StartCursor == 0, want > 0` assertion based on a false premise:
+    `process/render.go` documents `StartCursor` as echoing the caller's
+    requested cursor, never "the earliest retained byte" — removed the wrong
+    assertion, added a correct one (`NextCursor == TotalBytes`,
+    `len(Output) == 16` matching the configured spool ceiling) in its place.
+  - `make secure` found 2 new gosec G118 findings (`watchAndInvalidate`'s two
+    `go` call sites using `context.Background()`) — a deliberate design choice
+    (the watcher must outlive the request since it tracks a
+    backgrounded/detached process), not a defect; suppressed with documented
+    `#nosec G118` comments (commit `c2df67b`) following Phase 2's own
+    established precedent for the identical finding class in
+    `process/supervisor.go`.
+
+**Final GREEN evidence** (all commands re-run after every fix above; this
+section reflects the post-fix head, not any intermediate RED state)
+
+- Every Task 14-20 focused selector: exit 0.
+- `go test -race ./...` (whole module): exit 0.
+- `go test -tags integration -list '^Test(SupervisorIntegration|Integration(BashSupervisedWorkflow|ProcessToolsRestore))' ./bash ./process` printed all 4 required names before any ran; tagged `-race` execution: exit 0 (re-verified at `-count=5`).
+- `go test ./internal/safetext -run '^$' -fuzz '^FuzzNormalize$' -fuzztime=10s`: exit 0, 275k+ execs, 2 new interesting inputs added to the corpus, no failures.
+- `make secure` (format, Vet, Staticcheck, Gosec, `go mod verify`, Govulncheck): exit 0. Gosec: 64 files / 15,607 lines / 15 documented `#nosec` suppressions / 0 issues. `go mod verify`: all modules verified. Govulncheck: no vulnerabilities found.
+- `CGO_ENABLED=0 go build -trimpath ./...`: native, `linux/amd64`, and `windows/amd64` all exit 0 for the complete module.
+- `git diff --check`: exit 0.
+
+**Review disposition**
+
+- Independent spec-compliance review (full report on file, not reproduced
+  here): 7 of 8 checked areas (legacy characterization, owner checks, binding
+  sharing/dedup, trusted-channel isolation, Task 15's and Task 18's
+  self-flagged scope questions, general diff review) compliant with cited
+  file:line evidence. One **blocking** finding: a fast-exiting `yield_time_ms`
+  supervised Bash call's terminal result never populated `Output` — no path
+  ever read the process's actual stdout/stderr before discarding the handle,
+  contradicting the design spec's terminal JSON example and regressing below
+  legacy Bash (which always returns output) with no recovery path (the
+  terminal shape correctly omits `process_id` per spec, so there's no
+  after-the-fact way to fetch it). Two non-blocking follow-up notes: `reason`
+  is populated on the terminal shape though neither the spec's literal example
+  nor `result.go`'s own doc comment lists it (harmless, additive, worth a doc
+  fix); `watchAndInvalidate`'s per-process `Supervisor.Wait(WaitAny)` loop
+  permanently occupies one of the session's `MaxPendingWaiters` slots for the
+  life of every background/yielded process, competing with `ProcessOutput`'s
+  own wait quota — an accepted side effect of Task 15's documented
+  `lifecycleSink` workaround, to revisit once real event-sink wiring lands.
+- Independent code-quality/security review (full report on file): 5 of 6
+  checked areas (concurrency correctness — including a direct `-race
+  -count=15`/`-count=10` rerun and a full trace of every background-call test
+  site against the tempdir-race class, confirming consistent application, not
+  just spot-checked; error handling; boundary compliance — re-read
+  `dependency_test.go` directly, confirmed the exemption is correctly
+  `AND`-scoped; the two new gosec suppressions checked against and found
+  consistent with Phase 2's precedent) clean. One **Important, non-blocking**
+  finding: `process/input_tool.go`'s `writeBounded` deliberately abandons a
+  goroutine mid-write when a target process never reads its stdin (no
+  portable way to cancel an in-flight `io.Writer.Write`); nothing caps the
+  number of concurrently abandoned writers per process/session, so repeated
+  `ProcessInput` calls against a stalled process could accumulate unbounded
+  blocked goroutines and up to `MaxPendingInputBytes` (1 MiB default) each —
+  explicitly acknowledged in code/tests as a known, documented tradeoff
+  satisfying the letter of the spec, not an oversight, but flagged to track
+  before this path sees untrusted high-volume traffic. Two **Minor** code-
+  quality notes (three near-identical `process*PrepareError` types worth
+  factoring; `Supervisor.resolveEntry`/`snapshotHandle` live in
+  `output_tool.go` rather than `supervisor.go`/`entry.go`) and one **Minor**
+  test-fragility note (`bash/supervised_test.go`'s reliance on `t.Cleanup`
+  LIFO-ordering to avoid the tempdir race for still-running processes, rather
+  than an explicit helper) — all follow-up-only, not blocking.
+- Fix (commit `b478808`): the blocking finding was resolved by reusing
+  `process.NewProcessOutput`'s own public `tool.InvokableTool` interface from
+  `bash` — exactly the path a real model-issued `ProcessOutput` call would
+  take — rather than duplicating spool-read/safe-text rendering logic in
+  `bash`. `terminalSupervisedResult` gained an `Output` field bounded by the
+  same `DefaultMaxInlineResultBytes` (32 KiB) `ProcessOutput` itself defaults
+  to; the spec's terminal shape has no `gap`/truncation field (unlike
+  ProcessOutput's per-process shape), so none was added. Re-verified directly
+  (not re-reviewed by a third round, given the fix's narrow, additive,
+  single-field nature and its reuse of already-independently-reviewed
+  rendering code): full race suite, tagged integration suite, and `make
+  secure` (still 0 issues) all passed clean after this fix, reflected in the
+  Final GREEN evidence above (which is the post-fix head, `b4788080`).
+
+**Deliberately deferred, not blocking this gate:** the `ProcessInput`
+unbounded-abandoned-writer tradeoff, the two Minor code-quality notes, the one
+Minor test-fragility note, and the `watchAndInvalidate` waiter-quota
+contention — all recorded above with enough detail to action independently;
+none contradicts the plan or the design spec, and all were explicit,
+reasoned severity calls by the independent reviewers, not omissions.
+
+No unresolved *blocking* finding or deferred *required* check enters Phase 5.
+Phase 5 ("Unix PTY and Windows ConPTY") does not itself depend on Phase 3
+(Sandbox); its own dependency structure should be checked against the plan
+text before starting, the same way Phase 4's was, rather than assumed.
