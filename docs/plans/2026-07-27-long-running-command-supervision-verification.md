@@ -795,3 +795,286 @@ command matrix (native privileged-worker runs, live Windows job runs) still
 cannot be satisfied until that infrastructure is available, so Phase 3 gate
 closure itself remains blocked even though implementation is now proceeding
 ahead of it, on the user's explicit instruction.
+
+## Phase 3 — Sandbox asynchronous pipe execution
+
+**Decision: IMPLEMENTATION COMPLETE AND REVIEWED UNDER EXPLICIT OVERRIDE —
+NOT FULLY GATE-CLOSED.** Tasks 10 (10A-10D), 11, 12 (12A-12D), and 13 are all
+implemented, committed, and covered by two independent phase-level reviews
+with all findings resolved or explicitly recorded as non-blocking follow-ups.
+Every check obtainable on the available hardware (this darwin host, plus a
+real Docker-Desktop Linux kernel) is green. Per the user's 2026-07-30 override
+(recorded above), this phase proceeded without waiting for the two
+still-outstanding legs of its coordination prerequisite — live privileged
+Linux Rung-1/Rung-2 execution on an approved worker, and live
+`windows-restricted`/`windows-elevated` runs — which remain genuinely
+outstanding and are NOT satisfied by anything in this section. Do not treat
+this section as Phase Gate 3 closure in the plan's original sense; treat it
+as the complete, reviewed state as of the override, with an explicit list of
+what still needs a real Linux CI worker and a real Windows worker before this
+phase could be called fully closed.
+
+**Repository head**
+
+- Sandbox: `9bca5d42dbeeed8a1362ce33104c78f56a9f76b6`
+
+Commit range `fd02271..HEAD`, 14 commits (`fd02271` is PR #1's last real
+security-fix commit — merged into this worktree's branch, fast-forward, before
+Task 10 began, specifically so Task 10-12 built on the corrected
+`enumerateMountViewWithGrantPaths` grant/path logic rather than the known-buggy
+pre-PR-#1 state). Every task ran subagent-driven, one fresh implementer per
+task/microtask. Unlike the `tools` module's phase-boundary-only execution
+policy, Sandbox's implementers were explicitly authorized to run tests for
+real as they worked (darwin-native throughout; Docker-based real-Linux-kernel
+verification from Task 12B onward, once confirmed available) — this
+materially changed the RED/repair rhythm versus prior phases: most RED was
+caught and fixed within the implementing task itself, not only at this gate.
+
+**Implemented scope**
+
+- `internal/exec/process.go` (Task 10A-B, `16d489e`/`049bfca`): public
+  `ProcessOptions`/`Process`/`PreparedProcess`/`ProcessResult` types,
+  structurally mirroring (never importing) Harness's `tool.Process` reference
+  shape; manual `os.Pipe()`-based spawning (deliberately avoiding
+  `cmd.StdoutPipe()`/`StderrPipe()`/`StdinPipe()`, whose exit-triggered
+  auto-close would break concurrent Wait/stream-reading); cached
+  concurrency-safe `Wait`; setup-vs-lifetime context split (`Start`'s ctx
+  governs the spawn window only — closed a real narrow pre-`cmd.Start()`
+  cancellation race found and fixed in 10B);
+- `internal/exec/executor.go` (Task 10C, `3ea872c`): the existing
+  synchronous `RunCommand`/`RunArgv`/granted-run path refactored onto the
+  shared `spawnProcess` primitive with proven zero behavior change (143
+  pre-existing test names diffed identical, before vs. after);
+- `internal/enforce/enforce.go` + `internal/windows/elevated_*_windows.go`
+  (Task 10D, `e68a9a9`, hardened by `9bca5d4`): `enforce.Spec.Launch`
+  restructured to return an owned `Execution` (deferred `Wait`, never a
+  goroutine-wrapped blocking call) with a 4-state linearized ownership
+  machine for the Windows elevated broker lease + compiled-spec `active.Done`
+  retirement. Found and fixed a real pre-existing bug along the way: failures
+  after `CreateJob` previously had no Job-empty proof at all and released the
+  broker lease unconditionally;
+- `internal/exec/process.go`/`process_quarantine.go`/`executor_set.go` +
+  `internal/policy/pathhandle*.go` (Task 11, `63f700c`): real grant/path/
+  route/backend resolution wired into `PrepareProcess` (replacing 10A's
+  placeholder access computation), the existing `quarantinedSpawn` capsule
+  generalized from Windows-specific to platform-neutral, `ExecutorSet.Close`
+  extended to terminate/clean up both abandoned prepared-but-unstarted and
+  started-but-abandoned handles. Verified end-to-end against the real
+  darwin Seatbelt backend via a genuine tagged integration test. Found and
+  fixed a real 3-fd-per-execution leak in the Windows elevated bridge's
+  success path;
+- `internal/exec/process.go` + `process_tree_signal_test.go` (Task 12A,
+  `049f050`): a platform-neutral interrupt/terminate-escalate-once/kill
+  state machine against a fake process tree, with an injectable grace-timer
+  seam for deterministic testing;
+- `internal/exec/lifetime_unix.go`/`process_tree_linux.go`/
+  `internal/linux/cgroup.go` (Task 12B, `9c974ef`): real Unix signal
+  delivery (group-targeted, reusing the existing `terminate()` mechanism);
+  mandatory Linux containment — Rung-1 PID namespace or a delegated cgroup
+  with exact empty proof, `Pdeathsig` alone never sufficient; a new
+  result-bearing `KillAndWait` replacing void/best-effort cgroup teardown,
+  never coercing a read failure to "empty", routing any failed/indeterminate
+  proof into the existing quarantine machinery unmodified;
+- `internal/exec/process_tree_darwin.go` (Task 12C, `d61f58d`): found and
+  closed a real gap — Darwin async spawns previously succeeded **silently
+  unconfined** (the pre-12C stub was a hard `return nil, nil`). Now fails
+  closed with `enforce.ErrLifetimeContainmentUnavailable` before `cmd.Start()`
+  for the real Seatbelt backend specifically (scoped to not break Unconfined/
+  test-double paths that never claimed real confinement);
+- `internal/exec/process_tree_windows.go` + elevated bridge/launcher files
+  (Task 12D, `e49c89d`, hardened by `9bca5d4`): characterized both restricted
+  and elevated Windows paths (Job-empty confirmation before Close was already
+  structurally sound on both — the real gap was signal delivery, never
+  wired); wired `GenerateConsoleCtrlEvent`/`TerminateJobObject` for restricted,
+  `TerminateJobObject` via a new mutex-guarded `terminateJob()` for elevated;
+  elevated `sendInterrupt` deliberately fails closed
+  (`errElevatedRunnerInterruptUnsupported`) rather than fabricating a
+  primitive that would need touching a file outside this task's scope;
+- `scripts/test-async-ci-workflow.sh` + `.github/workflows/ci.yml` +
+  `Makefile` (Task 13, `4047276`): a strict guard script (negative-tested:
+  confirmed it fails loudly when a required selector is removed) extending
+  the 5 existing platform jobs with async selectors — never inventing
+  replacement job keys; the macOS job intentionally narrow (only the
+  Darwin fail-closed selector, no pipe/grant claim, matching 12C).
+
+**Docker-based real-Linux-kernel verification (novel to this phase)**
+
+Docker Desktop's linuxkit VM (`6.10.14-linuxkit`, privileged containers
+confirmed working) was used throughout Tasks 12B-13 and this gate for real
+kernel-level evidence, not just cross-compilation. Two genuine, precisely
+diagnosed environment limits of this specific VM (confirmed against
+pre-existing, unmodified code before attributing them to this phase's
+changes):
+
+- **Landlock LSM is entirely absent** from this kernel
+  (`/sys/kernel/security/landlock/enabled` doesn't exist; no boot-time flag
+  can add it). Effect: `platform.Backend()` always returns `RungNone` in this
+  container, so `NewExecutorSet` fails with `enforce.ErrUnavailable` and
+  every real-backend test (old and new) skips via `skipIfNoRealBackend`
+  rather than running for real.
+- **cgroup v2 process-population is broken** in this VM's delegation
+  (`EOPNOTSUPP` on both a raw `cgroup.procs` migration and a real
+  `clone3(CLONE_INTO_CGROUP)` join, tried with `--privileged`,
+  `--cgroupns=host`, and additional `subtree_control` controllers enabled —
+  same result every time).
+
+What real, positive Docker-kernel evidence WAS obtained: real Unix signal
+delivery (SIGINT/SIGTERM/SIGKILL genuinely reaching a live spawned process
+and its group); the Rung-1/Rung-2/reject containment-selection logic for
+real, including a real cgroup creation for the Rung-2 branch; and — during
+this gate's own security review — an independent empirical reproduction
+(`unshare --pid --fork --mount-proc`, a `setsid`'d grandchild scheduled to
+write a marker file at t+3s) confirming the security-critical claim
+`linuxNamespaceProof.terminateAndWait()` relies on: the kernel force-kills
+every process in a PID namespace, including detached/double-forked
+descendants, synchronously before `wait()` on the namespace-init process
+returns — the marker was never written and the grandchild was already gone
+in ~0.3s.
+
+**Phase-gate RED and repair evidence** (found during this gate's own
+verification pass, beyond what individual tasks already caught)
+
+- `TestIntegrationProcessPreparedGrantLifetime` (Task 11's own integration
+  test) hard-FAILED on darwin with `lifetime_enforcement_unavailable`
+  instead of skipping — its doc comment predated Task 12C's Darwin
+  fail-closed contract and still claimed real darwin execution. Fixed
+  (`d33a676`) with a `runtime.GOOS == "darwin"` + exact-sentinel skip guard,
+  narrowly scoped (any other error still fails the test).
+- The same test then hard-FAILED again in the Docker Linux environment with
+  `NewExecutorSet: sandbox: OS confinement unavailable` — it called
+  `NewExecutorSet` directly without the `skipIfNoRealBackend` guard the
+  sibling escape tests in the same package already used for exactly this
+  environment-limited scenario. Fixed (`1ef1572`) by reusing that existing
+  helper, restoring symmetry with the other three tests in the same file.
+- `make secure` found 2 issues: a staticcheck SA4006 (a defensive-copy test's
+  `paths = append(...)` reassignment flagged as dead, since the variable was
+  never read afterward — the append's mutation-detection side effect still
+  occurs regardless; fixed by discarding the result explicitly) and a gosec
+  G118 on `go p.supervise(proc)` (the async primitive's own detached
+  supervisor goroutine, deliberately outliving Start's request-scoped ctx per
+  Task 10B's own contract) — suppressed with a documented `#nosec G118`,
+  matching the `tools` module's own established precedent for the identical
+  finding class. Both fixed in `b67a51a`; `make secure` re-ran clean after.
+- Independent security review found 2 Minor Windows-only findings (verified
+  directly by re-reading the code before fixing, not merely trusting the
+  review): `elevatedRunnerLauncher.Launch`'s `launcher == nil ||
+  launcher.api == nil` branch was the one pre-Job failure path that skipped
+  `spec.ReleaseLease()` while every sibling branch called it — practically
+  unreachable in production (`newElevatedRunnerLauncher` enforces
+  `api != nil` at construction) but a real violation of Task 10D's own
+  "release exactly once on every pre-Job failure" invariant; fixed to match
+  every other branch. Separately, the `execution.mu` and `terminateJob` doc
+  comments implied that mutex alone prevented a `Signal`-driven
+  `terminateJob()` from racing `Wait`'s own `job.Close()`/`job.Terminate()`
+  calls, which in fact happen OUTSIDE `execution.mu`'s critical section —
+  independently re-verified by reading `Job.Terminate`/`Job.Close` in
+  `internal/windows/job_windows.go` directly: both serialize through
+  *Job's own* internal mutex, and `Close` zeroes `job.handle` under that
+  lock before actually closing, so the real safety net is Job's locking, not
+  `execution.mu`. No functional bug — fixed the comments to state this
+  accurately. Both in `9bca5d4`.
+
+**Final GREEN evidence** (post-fix head `9bca5d4`; darwin-native unless
+otherwise noted)
+
+- `go build ./...` / `go vet ./...`: clean.
+- `go test -race -count=1 ./...` (whole module, darwin-native): all packages
+  `ok`, zero regressions across the full 14-commit diff.
+- `go test -tags integration -race ./internal/exec -run
+  'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree)'`
+  (darwin-native): `ok` — `TestIntegrationProcessTreeDarwinSetsidFailsClosed`
+  PASSes for real (genuine 7s wait proving no delayed child/marker); the
+  other four skip cleanly and for the expected, documented reasons (no
+  `setsid` binary on macOS; Darwin has no async containment primitive to
+  exercise for the grant-lifetime test).
+- Identical command re-run inside the Docker Linux container: `ok` — all
+  five skip cleanly via `skipIfNoRealBackend`/`ErrUnavailable`, consistent
+  with this VM's confirmed lack of Landlock.
+- `go test -race -count=30 ./internal/exec -run
+  '^TestProcessSignal|^TestUnixProcessSignal'` (darwin-native, security
+  review's own stress rerun of the signal state machine after real Unix
+  wiring landed): clean, 82s.
+- `make secure` (format, Vet, Staticcheck, Gosec, `go mod verify`,
+  Govulncheck): exit 0. Gosec: 70 files / 12,674 lines / 29 documented
+  `#nosec` suppressions / 0 issues (the review independently re-ran
+  `go tool gosec ./...` and confirmed the only other findings anywhere in
+  the module — 3 in `internal/windows/testdata/escapeprobe/main.go` —
+  predate this phase entirely). `go mod verify`: all modules verified.
+  Govulncheck: no vulnerabilities found (ran with real network access to
+  `vuln.go.dev`, confirmed reachable).
+- `CGO_ENABLED=0 go build -trimpath ./...`: native, `linux/amd64`, and
+  `windows/amd64` all exit 0. `GOOS=windows go test -c` links real test
+  binaries for `./internal/exec` and `./internal/windows` (compile/link
+  proof only, never executed — no Windows host available).
+- `git diff --check`: exit 0.
+- `sh scripts/test-async-ci-workflow.sh`: PASS, independently negative-tested
+  by the spec reviewer (mutated a scratch copy of `ci.yml` twice, confirmed
+  loud `FAIL` exit 1 both times) before being trusted.
+
+**Review disposition**
+
+- Independent spec-compliance review (full report on file): compliant
+  across the structural-mirroring/import-boundary check, all of Tasks
+  10-13's acceptance-list items (each spot-checked against real test
+  bodies, not just names), the Task 10D/12D ownership cross-check (12D's
+  additions never reopen 10D's linearized invariants), and Task 13's CI
+  wiring (independently negative-tested). Two notable-but-defensible
+  findings, neither blocking: (1) Task 10's literal
+  `internal/exec/process_acceptance_test.go`/`TestIntegrationProcessPipeLifecycle`
+  was never created as a separate tagged file — the plan's own Step 1 test
+  list landed instead as untagged tests inside `process_test.go` (they
+  already run under plain `go test ./...`), a substitution self-documented
+  in `scripts/test-async-ci-workflow.sh`'s own comments but not previously
+  reconciled against Task 13's "fail this task if not present" instruction —
+  recorded here now; (2) the elevated Windows `sendInterrupt` fail-closed
+  path has no dedicated unit test asserting its exact return value (a
+  one-line follow-up, not a functional gap).
+- Independent code-quality/security review (full report on file; ran with
+  the safety classifier unavailable, so its two concrete findings were
+  independently re-verified by direct code reading before acting on them,
+  not trusted at face value): clean across grant/resource-lifecycle
+  atomicity (hand-traced every failure path in `resolveGrantedProcessResources`),
+  `ExecutorSet.Close` linearization against abandoned prepared/started
+  handles (hand-traced every interleaving against the dedicated
+  `TestExecutorSetCloseWaitsForBothLivePreparedAndStartedHandles`), the
+  Windows elevated-broker ownership machine (traced by hand, plus the
+  independent empirical PID-namespace kernel reproduction described above),
+  concurrency correctness elsewhere, error-handling fail-closed discipline,
+  code quality, and all three gate-repair commits' narrowness. Two Minor
+  findings (both Windows-only, both independently re-verified and fixed as
+  described above), zero Critical or Important.
+- No third review round was run for the two post-review Windows fixes
+  (`9bca5d4`) — their narrow, mechanical nature (one added function call
+  matching an existing pattern; two doc-comment corrections with zero
+  behavior change) plus direct independent verification of both underlying
+  claims before fixing was judged sufficient, consistent with how prior
+  phases in this plan have handled narrow, well-understood gate-repair
+  fixes.
+
+**What remains outstanding before Phase 3 could be called fully closed** (not
+resolved by anything in this section — this is the honest gap, not a
+formality)
+
+1. Live privileged Linux Rung-1/Rung-2 execution on an approved worker with
+   real Landlock and working cgroup v2 delegation (this session's Docker
+   environment has neither) — specifically to run
+   `TestIntegrationProcessTreeParentDeath`/`DoubleFork`/`SetsidEscape` and
+   the `TestCgroupLifetime*` suite's currently-skipped subtests for real.
+   The user's own Ubuntu host (referenced elsewhere in project memory as the
+   standing venue for this exact class of test) is the natural next venue.
+2. Live `windows-restricted` and `windows-elevated` CI runs on real disposable
+   Windows workers — everything Windows-specific in this phase (Tasks 10D,
+   12D, and this gate's two follow-up fixes) is compile/vet/link-verified
+   only and has never executed against a real Windows Job Object, suspended
+   process, or broker syscall.
+3. The two notable-but-defensible spec findings above (missing literal
+   `TestIntegrationProcessPipeLifecycle`, missing elevated-interrupt unit
+   test) are cheap, well-scoped follow-ups, not blockers, but are not yet
+   done.
+
+Phase 4 ("Model-facing Bash and process tools") is already complete and
+gate-closed (see its own section above) and does not depend on any of this
+outstanding work. Phase 5 ("Unix PTY and Windows ConPTY") DOES depend on
+Phase 3 (see the dependency note above) and should not begin until at least
+item 1 and item 2 above are addressed, or the user extends the same explicit
+override to Phase 5.
