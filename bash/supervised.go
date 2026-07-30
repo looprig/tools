@@ -15,9 +15,13 @@ package bash
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
+	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/internal/definition"
 	"github.com/looprig/tools/internal/workspace"
@@ -177,7 +181,8 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	}
 
 	status, exitCode, reason, finishedAt := readTerminalOutcome(sr, handle)
-	return terminalSupervisedResult(status, exitCode, reason, startedAt, finishedAt), nil
+	output := readTerminalOutput(ctx, sr, b.owner, handle)
+	return terminalSupervisedResult(status, exitCode, reason, startedAt, finishedAt, output), nil
 }
 
 // waitForTerminal blocks, in a sequence of process.Supervisor.Wait(WaitAny)
@@ -274,6 +279,84 @@ func readTerminalOutcome(sr *process.SupervisorResource, handle process.Handle) 
 		finishedAt = *manifest.FinishedAt
 	}
 	return string(manifest.State), manifest.Result.ExitCode, manifest.Result.Reason, finishedAt
+}
+
+// readTerminalOutput reads handle's bounded, safe-text-rendered combined
+// stdout+stderr through process's own model-facing ProcessOutput tool
+// (process/output_tool.go's ProcessOutputTool) -- the exact same rendering
+// path (spool read, safe-text normalization, DefaultMaxInlineResultBytes
+// cap) a model-issued ProcessOutput call over this same handle would use,
+// never a second, parallel reimplementation of it. This is safe to call
+// only because the entry is still resolvable in the shared Supervisor's
+// registry at this point: recordTerminal (process/supervisor.go) adds a
+// just-terminalized entry to retention bookkeeping and evicts only when a
+// session's retained-completed-process count already exceeds its
+// configured limit, so the entry this call just observed going terminal is
+// never its own session's eviction victim.
+//
+// terminalOutputArgs's process_id is the only field ever set: cursor,
+// limit_bytes, and encoding are left at PrepareCall's own documented
+// defaults (0, DefaultMaxInlineResultBytes, safe_text) -- the spec's shown
+// terminal Bash result carries a plain "output" string with no cursor, gap,
+// or truncation indicator of its own, so this call asks for nothing beyond
+// that plain rendered text.
+//
+// Best-effort: PrepareCall failing, InvokableRun returning a whole-call
+// structural error, or this one result carrying its own per-process error
+// (e.g. a not_found this call's own eviction-avoidance reasoning above
+// makes theoretical, not a case worth failing the outer Bash call over)
+// all yield the empty string rather than failing runSupervised's already-
+// terminal outcome -- mirroring readTerminalOutcome's own
+// never-fail-the-outer-call discipline.
+func readTerminalOutput(ctx context.Context, sr *process.SupervisorResource, owner process.Owner, handle process.Handle) string {
+	out := process.NewProcessOutput(sr.Supervisor, owner)
+
+	argsJSON, err := json.Marshal(terminalOutputArgs{ProcessID: string(handle)})
+	if err != nil {
+		return ""
+	}
+
+	// PrepareCall ignores both its ctx and executionID parameters (see its
+	// own doc comment), so a zero uuid.UUID is exactly as good as a freshly
+	// minted one here.
+	req, artifact, err := out.PrepareCall(ctx, uuid.UUID{}, string(argsJSON))
+	if err != nil {
+		return ""
+	}
+	runCtx := loop.WithPreparedCall(ctx, tool.PreparedCall{Request: req, Artifact: artifact})
+
+	result, err := out.InvokableRun(runCtx, string(argsJSON))
+	if err != nil || result == nil || len(result.Content) == 0 {
+		return ""
+	}
+	block, ok := result.Content[0].(*content.TextBlock)
+	if !ok {
+		return ""
+	}
+
+	var decoded terminalOutputResult
+	if err := json.Unmarshal([]byte(block.Text), &decoded); err != nil || decoded.Error != "" {
+		return ""
+	}
+	return decoded.Output
+}
+
+// terminalOutputArgs is the minimal ProcessOutput argsJSON readTerminalOutput
+// sends: exactly the single required field, letting PrepareCall apply every
+// other documented default itself.
+type terminalOutputArgs struct {
+	ProcessID string `json:"process_id"`
+}
+
+// terminalOutputResult decodes only the two fields readTerminalOutput cares
+// about out of ProcessOutput's full per-process JSON shape (output_tool.go's
+// processOutputResult) -- every other field it renders (cursors, gap,
+// artifact, manifest metadata) is already sourced independently by
+// readTerminalOutcome/loadStartedAt from the same durable Manifest, so this
+// decode target intentionally stays narrow.
+type terminalOutputResult struct {
+	Output string `json:"output"`
+	Error  string `json:"error"`
 }
 
 // processDeadline maps the prepared, frozen supervision settings to

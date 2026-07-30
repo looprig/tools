@@ -91,11 +91,18 @@ func liveSupervisedResult(processID string, nextCursor int64, output string, sta
 // timestamps), never from a value Bash computed or guessed itself. Per the
 // spec's shown example, a terminal result carries no process_id (the
 // process has already fully completed; there is nothing left to reference
-// with a follow-up ProcessOutput/ProcessInput/ProcessStop call).
+// with a follow-up ProcessOutput/ProcessInput/ProcessStop call) and no
+// next_cursor/gap/truncation indicator of any kind -- unlike the LIVE
+// shape's output, the spec's terminal example shows a plain "output" string
+// and nothing else. output is the process's own bounded, safe-text-rendered
+// combined stdout+stderr, read by supervised.go's readTerminalOutput through
+// process's own ProcessOutput rendering path -- never fabricated or left
+// empty just because the caller has no process_id to page from afterward.
 // duration_ms is populated only when both timestamps are known.
-func terminalSupervisedResult(status string, exitCode *int, reason string, startedAt, finishedAt time.Time) *tool.ToolResult {
+func terminalSupervisedResult(status string, exitCode *int, reason string, startedAt, finishedAt time.Time, output string) *tool.ToolResult {
 	result := supervisedResult{
 		Status:     status,
+		Output:     output,
 		ExitCode:   exitCode,
 		Reason:     reason,
 		StartedAt:  formatTime(startedAt),

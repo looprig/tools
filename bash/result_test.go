@@ -44,7 +44,7 @@ func TestRenderSupervisedResultTerminalShape(t *testing.T) {
 	code := 3
 	startedAt := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
 	finishedAt := startedAt.Add(250 * time.Millisecond)
-	res := terminalSupervisedResult("exited", &code, "exited", startedAt, finishedAt)
+	res := terminalSupervisedResult("exited", &code, "exited", startedAt, finishedAt, "hello\n")
 	text := textOf(t, res)
 	var out supervisedResult
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
@@ -68,6 +68,12 @@ func TestRenderSupervisedResultTerminalShape(t *testing.T) {
 	if out.DurationMS == nil || *out.DurationMS != 250 {
 		t.Errorf("DurationMS = %v, want 250", out.DurationMS)
 	}
+	if out.Output != "hello\n" {
+		t.Errorf("Output = %q, want %q", out.Output, "hello\n")
+	}
+	if out.NextCursor != 0 {
+		t.Errorf("NextCursor = %d, want 0 (the spec's terminal shape has no cursor/gap/truncation field)", out.NextCursor)
+	}
 }
 
 // TestTerminalSupervisedResultOmitsDurationWithoutBothTimestamps asserts
@@ -75,7 +81,7 @@ func TestRenderSupervisedResultTerminalShape(t *testing.T) {
 // are known — never a fabricated or partial value.
 func TestTerminalSupervisedResultOmitsDurationWithoutBothTimestamps(t *testing.T) {
 	t.Parallel()
-	res := terminalSupervisedResult("failed", nil, "failed", time.Time{}, time.Now())
+	res := terminalSupervisedResult("failed", nil, "failed", time.Time{}, time.Now(), "")
 	text := textOf(t, res)
 	var out supervisedResult
 	if err := json.Unmarshal([]byte(text), &out); err != nil {

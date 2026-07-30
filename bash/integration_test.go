@@ -534,6 +534,9 @@ func TestIntegrationBashSupervisedWorkflow(t *testing.T) {
 	if yieldedTerminal.ExitCode == nil || *yieldedTerminal.ExitCode != 0 {
 		t.Fatalf("yielded (exited within budget) ExitCode = %v, want 0", yieldedTerminal.ExitCode)
 	}
+	if yieldedTerminal.Output != "yielded" {
+		t.Fatalf("yielded (exited within budget) Output = %q, want %q (the command's actual printed output, not empty)", yieldedTerminal.Output, "yielded")
+	}
 
 	// A slow command with a short budget returns a LIVE result: a handle and
 	// backgrounded:true, without waiting for completion.

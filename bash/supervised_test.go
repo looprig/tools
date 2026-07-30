@@ -418,17 +418,22 @@ func TestSupervisedBashExplicitBackgroundReturnsAfterDurableRegistration(t *test
 // TestSupervisedBashYieldedExitsWithinBudgetReturnsTerminalJSON asserts a
 // `yield_time_ms` call whose command exits before the budget elapses
 // returns a TERMINAL result carrying the real exit code from the process's
-// own durable manifest.
+// own durable manifest AND the process's own actual printed output --
+// otherwise a fast-exiting supervised command would give the model no way
+// to ever see what it printed (this file's TestSupervisedBashYielded...
+// bug-fix coverage; see bash/result.go's terminalSupervisedResult doc
+// comment).
 func TestSupervisedBashYieldedExitsWithinBudgetReturnsTerminalJSON(t *testing.T) {
 	t.Parallel()
 	proc := newFakeProcess(3)
+	proc.stdout = io.NopCloser(strings.NewReader("hello from stdout\n"))
 	prepared := &fakePreparedProcess{access: freshWorkspaceAccess(), process: proc}
 	runner := &fakeAsyncRunner{prepared: prepared}
 	coord := &recordingLifetimeCoordinator{}
 	obs := &syncWorkspaceObservations{}
 	b, _ := newSupervisedTestTool(t, runner, coord, obs)
 
-	out, _, _ := runSupervisedCall(t, b, `{"command":"true","yield_time_ms":2000}`, nil)
+	out, _, _ := runSupervisedCall(t, b, `{"command":"echo hello from stdout","yield_time_ms":2000}`, nil)
 
 	if out.Backgrounded {
 		t.Errorf("Backgrounded = true, want false for a call that exited within budget")
@@ -447,6 +452,42 @@ func TestSupervisedBashYieldedExitsWithinBudgetReturnsTerminalJSON(t *testing.T)
 	}
 	if out.DurationMS == nil {
 		t.Errorf("DurationMS = nil, want a computed duration")
+	}
+	if out.Output != "hello from stdout\n" {
+		t.Errorf("Output = %q, want %q (the command's actual printed output, not empty)", out.Output, "hello from stdout\n")
+	}
+	if out.NextCursor != 0 {
+		t.Errorf("NextCursor = %d, want 0 (the spec's terminal shape has no cursor field)", out.NextCursor)
+	}
+}
+
+// TestSupervisedBashYieldedExitsWithinBudgetTruncatesOversizedOutput asserts
+// a fast-exiting supervised command whose output exceeds the spec's 32 KiB
+// inline-result cap (process.DefaultMaxInlineResultBytes) still returns a
+// terminal result -- bounded to that cap, never the whole oversized output,
+// and never a failure -- exercising the same bound ProcessOutput itself
+// enforces (process/render.go), reused rather than reimplemented here.
+func TestSupervisedBashYieldedExitsWithinBudgetTruncatesOversizedOutput(t *testing.T) {
+	t.Parallel()
+	oversized := strings.Repeat("a", int(process.DefaultMaxInlineResultBytes)+4096)
+	proc := newFakeProcess(0)
+	proc.stdout = io.NopCloser(strings.NewReader(oversized))
+	prepared := &fakePreparedProcess{access: freshWorkspaceAccess(), process: proc}
+	runner := &fakeAsyncRunner{prepared: prepared}
+	coord := &recordingLifetimeCoordinator{}
+	obs := &syncWorkspaceObservations{}
+	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+
+	out, _, _ := runSupervisedCall(t, b, `{"command":"produce-lots-of-output","yield_time_ms":2000}`, nil)
+
+	if out.Status != string(process.StateExited) {
+		t.Errorf("Status = %q, want %q", out.Status, process.StateExited)
+	}
+	if int64(len(out.Output)) > process.DefaultMaxInlineResultBytes {
+		t.Errorf("len(Output) = %d, want <= %d (DefaultMaxInlineResultBytes)", len(out.Output), process.DefaultMaxInlineResultBytes)
+	}
+	if out.Output == "" {
+		t.Errorf("Output = %q, want a non-empty bounded prefix of the oversized output", out.Output)
 	}
 }
 
