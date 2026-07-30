@@ -1078,3 +1078,185 @@ outstanding work. Phase 5 ("Unix PTY and Windows ConPTY") DOES depend on
 Phase 3 (see the dependency note above) and should not begin until at least
 item 1 and item 2 above are addressed, or the user extends the same explicit
 override to Phase 5.
+
+## Phase 6, Tasks 24-25 — Harness lifecycle events, notifications, and shutdown/restore ordering
+
+**Decision: TASKS 24-25 COMPLETE AND REVIEWED — NOT A FULL PHASE GATE 6
+CLOSE.** Phase 6 has five tasks (24-28). Tasks 26-28 ("Adapt Sandbox processes
+to Harness in Coderig", "Install the four process definitions in Coderig",
+"full Coderig integration tests") require Sandbox's real async executor,
+which is not yet available, and were NOT attempted. Tasks 24-25 are pure
+Harness work with no Sandbox dependency — checked, verified against the plan
+text before starting, the same way Phase 4's independence from Phase 3 was
+checked — and were pulled forward on that basis, matching the pattern already
+used for Phase 4.
+
+Unlike Phase 3 (Sandbox), this work is **fully, natively verifiable on this
+host** — no platform gaps, no Docker workaround needed, no outstanding native
+evidence. Every check below actually ran and is genuinely green.
+
+**Repository head**
+
+- Harness: `aaefa01c2b8bfbd0007e634fd27d444f3e9201a5`
+
+Commit range `d8f8d429..HEAD`, 9 commits, 40 files, ~3900 insertions. Every
+task ran subagent-driven, one fresh implementer per task/microtask, following
+this module's standard no-execution-during-task discipline (test-first,
+defer verification to the gate) — the same protocol used for the `tools`
+module's own Phase 4, not the live-execution exception granted to Sandbox's
+OS-level work.
+
+**Implemented scope**
+
+- `pkg/journal/idempotency.go` + `pkg/sessionstore/journal.go`/`replay.go`
+  (24A, `20167160`): `AppendResult`/`IdempotentJournal`/`AppendIdempotent`,
+  fingerprint-based collision detection (kind + marshaled body, excluding
+  transient `CommandRecord` routing), full-ledger hydration before the
+  opening fence, raw-path fencing so a repeated lease epoch still advances,
+  and `BlobPointerIDMismatchError` catching an outer/inner blob-pointer ID
+  drift on replay. `*sessionJournal.Append` and `AppendIdempotent` share one
+  core (`appendChecked`), so duplicate-frame rejection applies to every
+  existing caller, not only ones that opt into the richer method — this
+  turned out to matter well beyond process notifications (see gate-repair
+  fixes below).
+- `internal/sessionruntime/process_lifecycle.go` + `pkg/hub/deps.go`/`hub.go`
+  (24B, `87b0e997`): checked publication for all five lifecycle kinds behind
+  Task 4's stable `sessionProcessServiceBridge`, `Appended`-gated Hub
+  apply/broadcast (a deduplicated retry durably "succeeds" but broadcasts
+  nothing), backward-compatible optional `eventAppenderResult` extension (a
+  plain appender is treated as "every append is new").
+- `pkg/command/process_notification.go` + `internal/loopruntime`/
+  `internal/sessionruntime` restore wiring (24C, `4a6d2ffc`): a sealed,
+  metadata-only `ProcessNotification` command (`DisallowUnknownFields`,
+  recursively guarding the nested DTO — no output/stdin/host-path/PID field
+  exists to leak), append-before-dispatch with the stable pre-persisted
+  CommandID, a bounded per-loop live-dedup set (deliberately separate from
+  the turn inbox), restore reconstruction via a generic
+  replay-and-subtract-by-causality fold, and structural (not silent-drop)
+  foreign-loop rejection.
+- `internal/sessionruntime/{session,shutdown_cleanup,workspace_restore,
+  restore_constructor}.go` (25, `c925066b`): a bounded-timeout
+  `session_resources` shutdown phase; shutdown ordering (resources terminate
+  while the hub is still live, before hub-stop/lease-release/context-cancel);
+  matching construction-abort ordering; a non-nondestructive
+  `suspendAdmission`/`resumeAdmission` pair for workspace restore (chosen
+  after the implementer's first draft — destructively stopping every
+  registry entry — was caught by an existing integration test proving
+  registry entries are long-lived, session-scoped supervisors); orphaned
+  "lost" process reconciliation from Harness's own durable events only
+  (never an OS PID, which the DTOs don't carry); and — the single most
+  consequential finding of this pair of tasks — **discovering and fixing
+  that 24B/24C's bridge-attach methods were never wired into real session
+  construction**, only called from test code. Before this fix, every
+  session built on 24A-24C alone would have silently sat on the bridge's
+  "services unavailable" stub in production; `activateProcessServiceBridge`
+  now runs on both the live-construction and restore paths, before
+  `resources.Activate` and before `RestoreDone`.
+
+**Phase-gate RED and repair evidence** (all found and fixed during this
+gate's own verification pass; every task's own focused selector had already
+passed before the gate, same as prior phases in this plan)
+
+- The full-module `-race` run surfaced a real fingerprint-retry bug in
+  `notifyProcessCompletion`: it stamped a fresh `Header.CreatedAt` via
+  `s.stampNow()` on every call — correct for every other (audit-only)
+  command in this codebase, but wrong for this one strict/checked path,
+  since 24A's fingerprint hashes the full marshaled command including the
+  timestamp. A genuine retry of the identical notification (same stable
+  CommandID, same content) therefore produced a different fingerprint each
+  time and was misclassified as a collision instead of a dedup — exactly the
+  scenario `TestProcessNotificationInboxFullRetryAppendsOnce` exists to
+  prove. Root-caused as a caller-side construction issue, not a flaw in
+  24A's fingerprint contract (deliberately literal-byte-based by design) or
+  a test bug. Fixed (`519447a2`) by dropping `CreatedAt` from
+  `ProcessNotification`'s Header entirely, after grepping every reader to
+  confirm nothing depends on it.
+- Two of Task 25's own new tests failed with `resource storage invalid`: a
+  Go stdlib detail (`t.TempDir()`'s own directories are created mode 0755,
+  not 0700) collided with Harness's strict owner-only storage-root check.
+  Fixed (`171369af`) by minting an explicit 0700 subdirectory, mirroring an
+  already-established pattern in `session_resources_test.go`. Fixing that
+  exposed a second, related issue in the same tests: their side-effect-only
+  tool factories returned `nil, nil`/an empty slice, violating both the
+  "no nil tool slice" and "produced tool names must match the definition's
+  declared name" contracts — fixed by returning a minimal stub tool matching
+  the declared name, mirroring an established pattern from
+  `process_services_test.go`.
+- 24A's now-universal duplicate-ID rejection (applying to every `Append`
+  call, not only checked ones) surfaced two unrelated, PRE-EXISTING test
+  fixtures — predating this whole plan — that had always reused one
+  EventID across genuinely different payloads, silently tolerated before
+  there was any collision detection at all: `pkg/sessionstore/replay_test.go`'s
+  `buildGateFixture` (one EventID shared across GatePrepared/GateOpened/
+  GateResolved) and `pkg/serve/catalogreader/reader_test.go`'s `turnDone`
+  helper (one fixed EventID regardless of the caller's arguments). Both
+  fixed (`43935c96`, `c26f231a`) by giving each genuinely-distinct event its
+  own EventID — confirmed by both independent reviewers as real,
+  pre-existing fixture bugs correctly exposed by better tooling, not
+  evidence that 24A's collision detection is miscalibrated.
+- `make secure` found one gosec G118 on Task 25's own new bounded-timeout
+  `stopSessionResources` goroutine — the same deliberate
+  outlives-its-deadline-to-still-reach-completion pattern already
+  established and suppressed elsewhere in this plan (`tools`' `supervise`,
+  `sandbox`'s `watchAndInvalidate`). Suppressed with a documented `#nosec
+  G118` (`aaefa01c`); both independent reviewers re-ran `gosec` directly and
+  confirmed the suppression is genuinely justified, not masking a leak.
+
+**Final GREEN evidence** (post-fix head `aaefa01c`)
+
+- `go test -race -count=1 ./...` (whole module): every package `ok`, zero
+  regressions.
+- Every task's own focused selector (24A/24B/24C/25) re-run individually:
+  all pass, full test names/counts unchanged from each task's own report.
+- `go test -tags integration -race -run
+  '^TestProcessServicesIntegrationNewRestoreAndLease$' ./internal/sessionruntime`:
+  pass (the one genuine `//go:build integration` test this scope owns; it
+  predates 24-25 but exercises the same registry/bridge machinery).
+- `go vet ./...`: clean.
+- `make secure` (format, Vet, Staticcheck, Gosec, `go mod verify`,
+  Govulncheck): exit 0. Gosec: 220 files / 51,832 lines / 8 documented
+  `#nosec` suppressions / 0 issues. `go mod verify`: all modules verified.
+  Govulncheck: no vulnerabilities found.
+- `CGO_ENABLED=0 go build -trimpath ./...`: native, `linux/amd64`, and
+  `windows/amd64` all exit 0 for the complete module.
+- `git diff --check`: exit 0.
+
+**Review disposition**
+
+- Independent spec-compliance review (full report on file): **PASSES**, no
+  findings of any severity. Every acceptance item across Tasks 24A/24B/24C/25
+  independently re-verified by direct code reading and by re-running the
+  relevant focused selectors, not by trusting implementer reports. The
+  production-wiring bug and its fix were independently confirmed correct and
+  correctly ordered on both the live and restore paths. All 5 gate-repair
+  fixes independently confirmed genuine and correctly scoped.
+- Independent code-quality/security review (full report on file): **PASSES
+  WITH NOTED FINDINGS**, zero Critical or Important findings. Traced 24A's
+  `IdempotencyIndex` locking discipline by hand (no TOCTOU window; every
+  access under the caller's serializing lock) and confirmed with a real
+  16-goroutine concurrent-append test under `-race`. Independently re-verified
+  the `519447a2` CreatedAt fix by grepping every reader itself. Two Minor,
+  non-blocking follow-ups: (1) no true end-to-end test constructs a session
+  via the real production `newSessionTopology`/`RestoreTopology` path and
+  asserts a live subscriber actually receives a lifecycle event or
+  notification — the exact structural gap that let the pre-Task-25
+  bridge-wiring bug go undetected by 24B/24C's own test suites (which attach
+  the bridge by hand, bypassing real construction); worth one such test so a
+  similarly-shaped future bridge can't reintroduce the same class of gap;
+  (2) `stopSessionResources`'s bounded-timeout goroutine depends on every
+  `tool.SessionResource.Shutdown(ctx)` implementation honoring `ctx` and
+  returning — documented in a comment (and the gosec suppression) but not
+  enforced anywhere; worth a lint/test convention as more resources are
+  added.
+
+**Deliberately deferred, not blocking this milestone:** the two Minor
+follow-ups above, both recorded with enough detail to action independently.
+
+**What remains before Phase 6 could be called fully closed:** Tasks 26-28
+(Sandbox adapter, process-definition installation, full Coderig integration
+tests) — all three need a Sandbox executor with actual native CI evidence
+behind it (see the Phase 3 section above), not just the darwin/Docker-verified
+implementation this session produced under override. Phase Gate 6's own
+combined journal/lifecycle/notification race verification (explicitly
+deferred by Task 24's own plan text to "Phase Gate 6") is likewise not yet
+run, since that gate covers all five tasks together.
