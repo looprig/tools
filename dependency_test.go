@@ -147,9 +147,20 @@ func TestProductionDependencyBoundary(t *testing.T) {
 			// encodings (TreeMatch etc.) are the pinned contract between tool
 			// preparation and stored-rule matching, so preparation code may
 			// import it.
+			//
+			// bash is additionally permitted to import process: bash/
+			// supervised.go routes a SUPERVISED Bash call through the shared,
+			// runner-free process.Supervisor (Task 19's long-running-command-
+			// supervision work). Like permission, process is a shared,
+			// standalone mechanics library here, not a sibling tool package
+			// Bash bundles — this exemption is scoped to the bash package
+			// only and does not widen any other package's allowed imports,
+			// and Sandbox/Harness-internal imports remain forbidden above.
+			allowedSiblingImport := importPath == "github.com/looprig/tools/permission" ||
+				(importPath == "github.com/looprig/tools/process" && filepath.Dir(path) == "bash")
 			if path != "definitions.go" && strings.HasPrefix(importPath, "github.com/looprig/tools/") &&
 				!strings.HasPrefix(importPath, "github.com/looprig/tools/internal/") &&
-				importPath != "github.com/looprig/tools/permission" {
+				!allowedSiblingImport {
 				t.Errorf("%s imports sibling public tool package %q", path, importPath)
 			}
 		}
