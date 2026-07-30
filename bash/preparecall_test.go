@@ -418,3 +418,69 @@ func TestBashSchemaDeclaresAccess(t *testing.T) {
 		t.Error("'access' must be optional (not in required)")
 	}
 }
+
+// TestBashPreparedArtifactLegacyDefaults pins the prepared artifact for a bare
+// legacy call (only the pre-existing "command" field): every supervision-facing
+// field normalizes to its legacy zero value, and timeout equals the exact
+// clamp clampBashTimeout always produced for an absent/zero timeout, byte for
+// byte identical to pre-Task-14 behavior.
+func TestBashPreparedArtifactLegacyDefaults(t *testing.T) {
+	t.Parallel()
+	b := NewBash(t.TempDir())
+	_, prepared := prepareBash(t, b, `{"command":"echo hi"}`)
+	art, ok := prepared.(*bashArtifact)
+	if !ok || art == nil {
+		t.Fatalf("artifact = %#v, want *bashArtifact", prepared)
+	}
+	if art.supervised || art.background || art.yieldRequested || art.tty || art.hasMaxOutputBytes || art.noDeadline {
+		t.Errorf("legacy artifact = %+v, want every supervision field at its zero value", art)
+	}
+	if art.timeout != clampBashTimeout(0) {
+		t.Errorf("legacy artifact timeout = %s, want %s (the unchanged default clamp)", art.timeout, clampBashTimeout(0))
+	}
+}
+
+// TestBashPreparedArtifactRetainsSupervisionSettings proves PrepareCall
+// normalizes and FREEZES every new supervision-facing argument into the
+// artifact, and that mutating the raw JSON bytes after preparation changes
+// nothing (the artifact never retains a reference into argsJSON's backing
+// storage).
+func TestBashPreparedArtifactRetainsSupervisionSettings(t *testing.T) {
+	t.Parallel()
+	b := NewBash(t.TempDir())
+	raw := []byte(`{"command":"sleep 999","background":true,"yield_time_ms":250,"tty":true,"max_output_bytes":4096,"timeout":0}`)
+	argsJSON := string(raw)
+
+	req, prepared := prepareBash(t, b, argsJSON)
+	if req.Command != "sleep 999" {
+		t.Fatalf("Request.Command = %q, want the normalized command", req.Command)
+	}
+	art, ok := prepared.(*bashArtifact)
+	if !ok || art == nil {
+		t.Fatalf("artifact = %#v, want *bashArtifact", prepared)
+	}
+
+	// Mutate the ORIGINAL byte slice after preparation. If the artifact (or the
+	// decoded bashArgs feeding it) shared backing storage with argsJSON, this
+	// would corrupt the frozen settings.
+	for i := range raw {
+		raw[i] = 'x'
+	}
+
+	switch {
+	case !art.supervised:
+		t.Error("supervised = false, want true (background:true)")
+	case !art.background:
+		t.Error("background = false, want true")
+	case !art.yieldRequested || art.yieldTimeMS != 250:
+		t.Errorf("yieldRequested/yieldTimeMS = %v/%d, want true/250", art.yieldRequested, art.yieldTimeMS)
+	case !art.tty:
+		t.Error("tty = false, want true")
+	case !art.hasMaxOutputBytes || art.maxOutputBytes != 4096:
+		t.Errorf("hasMaxOutputBytes/maxOutputBytes = %v/%d, want true/4096", art.hasMaxOutputBytes, art.maxOutputBytes)
+	case !art.noDeadline:
+		t.Error("noDeadline = false, want true (timeout:0 under supervision)")
+	case art.command != "sleep 999":
+		t.Errorf("command = %q, want the normalized command frozen at prepare time", art.command)
+	}
+}

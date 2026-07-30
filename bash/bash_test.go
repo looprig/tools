@@ -254,6 +254,97 @@ func TestBashAuditSummary(t *testing.T) {
 	}
 }
 
+// recordingWorkspaceCoordinator is a minimal tool.WorkspaceCoordinator test
+// double: it records every Acquire (operation + canonical path) and every
+// permit Release.
+type recordingWorkspaceCoordinator struct {
+	acquireOp   tool.WorkspaceOperation
+	acquirePath string
+	acquired    int
+	released    int
+}
+
+func (c *recordingWorkspaceCoordinator) Acquire(_ context.Context, op tool.WorkspaceOperation, path string) (tool.WorkspacePermit, error) {
+	c.acquireOp = op
+	c.acquirePath = path
+	c.acquired++
+	return &recordingWorkspacePermit{c: c}, nil
+}
+
+func (c *recordingWorkspaceCoordinator) Healthy() error { return nil }
+
+type recordingWorkspacePermit struct {
+	c *recordingWorkspaceCoordinator
+}
+
+func (p *recordingWorkspacePermit) Release() { p.c.released++ }
+
+// recordingWorkspaceObservations is a minimal tool.WorkspaceObservations test
+// double: it records whether InvalidateAll was called.
+type recordingWorkspaceObservations struct{ invalidated int }
+
+func (*recordingWorkspaceObservations) WithPath(string, func(*tool.FileObservation) error) error {
+	return nil
+}
+func (o *recordingWorkspaceObservations) InvalidateAll() { o.invalidated++ }
+
+// TestBashLegacyPermitAndObservationUnaffectedByNewFields proves a legacy-only
+// call and the SAME call carrying the new supervision fields at their
+// legacy-equivalent zero values (background:false, tty:false) take and
+// release the identical exclusive whole-workspace mutation permit and
+// invalidate the observation set identically — the new fields do not perturb
+// the existing permit/observation behavior of the synchronous path.
+func TestBashLegacyPermitAndObservationUnaffectedByNewFields(t *testing.T) {
+	t.Parallel()
+	requireSh(t)
+
+	tests := []struct {
+		name string
+		args map[string]any
+	}{
+		{name: "legacy-only fields", args: map[string]any{"command": "echo hi"}},
+		{name: "explicit-false supervision fields", args: map[string]any{"command": "echo hi", "background": false, "tty": false}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			coord := &recordingWorkspaceCoordinator{}
+			obs := &recordingWorkspaceObservations{}
+			b := NewBash(root, WithWorkspaceCoordinator(coord), WithObservations(obs))
+
+			id := mustUUID(t)
+			raw, err := json.Marshal(tt.args)
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			req, art, err := b.PrepareCall(context.Background(), id, string(raw))
+			if err != nil {
+				t.Fatalf("PrepareCall() error = %v", err)
+			}
+			ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
+			res, err := b.InvokableRun(ctx, string(raw))
+			if err != nil {
+				t.Fatalf("InvokableRun() error = %v", err)
+			}
+			if out := textOf(t, res); !strings.Contains(out, "[exit code: 0]") {
+				t.Fatalf("result = %q, want a normal exit-0 result", out)
+			}
+
+			if coord.acquired != 1 || coord.released != 1 {
+				t.Errorf("coordinator acquired/released = %d/%d, want exactly 1/1", coord.acquired, coord.released)
+			}
+			if coord.acquireOp != tool.WorkspaceOperationWholeMutation || coord.acquirePath != "" {
+				t.Errorf("coordinator op/path = %v/%q, want WholeMutation with an empty path", coord.acquireOp, coord.acquirePath)
+			}
+			if obs.invalidated != 1 {
+				t.Errorf("observations invalidated = %d, want exactly 1", obs.invalidated)
+			}
+		})
+	}
+}
+
 func TestBashClampTimeout(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

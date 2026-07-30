@@ -69,14 +69,19 @@ const (
 )
 
 // bashSchema is the JSON Schema for Bash's argument object. The field names
-// (command/workdir/timeout/access) are the model-facing contract PrepareCall
-// decodes; nothing else ever parses these arguments.
+// (command/workdir/timeout/background/yield_time_ms/tty/max_output_bytes/
+// access) are the model-facing contract PrepareCall decodes; nothing else
+// ever parses these arguments.
 const bashSchema = `{
   "type": "object",
   "properties": {
     "command": {"type": "string", "description": "The shell command to run via 'sh -c'. May use pipes, globs, redirects, and '&&'."},
     "workdir": {"type": "string", "description": "Workspace-relative working directory for the command (optional; defaults to the workspace root)."},
-    "timeout": {"type": "integer", "minimum": 1, "maximum": 120, "description": "Maximum runtime in seconds (optional; default 30, hard cap 120)."},
+    "timeout": {"type": "integer", "minimum": 0, "description": "Maximum runtime in seconds (optional; default 30, hard cap 120 for a plain foreground call). 0 is valid only together with 'background' or 'yield_time_ms' and means 'run until session shutdown'."},
+    "background": {"type": "boolean", "description": "Start the command under session supervision and return as soon as it is durably registered, without waiting for it to finish (optional, default false)."},
+    "yield_time_ms": {"type": "integer", "minimum": 0, "description": "Optional initial wait budget in milliseconds under session supervision. If the command exits within the budget its terminal result is returned; otherwise a process handle plus the output observed so far is returned."},
+    "tty": {"type": "boolean", "description": "Request a real PTY/ConPTY for the command (optional, default false). Requires 'background' or 'yield_time_ms'; failure to allocate one never falls back to pipes."},
+    "max_output_bytes": {"type": "integer", "minimum": 1, "description": "Optional per-process disk retention ceiling in bytes for a supervised command; may not exceed the configured supervisor ceiling."},
     "access": {
       "type": "object",
       "description": "Optional structured access declaration for this command. It REQUESTS authority (each declared delta joins the same approval as the command); it never grants it. An omitted gated delta stays OS-blocked; after such a block, retry with a new call that declares the needed capability.",
@@ -95,11 +100,23 @@ const bashDesc = "Run a single shell command via 'sh -c' inside the workspace. S
 // bashArgs is the typed decode of Bash's untrusted argsJSON. Grant tokens are
 // deliberately NOT a model-facing argument: they travel only in the
 // tool.PreparedCall the runner binds to the call after the gate decision.
+//
+// Timeout, YieldTimeMS, and MaxOutputBytes are PRESENCE-aware (pointers): a
+// call using only the pre-existing fields decodes them as nil, exactly
+// preserving legacy behavior, and an explicit `timeout: 0` (only meaningful
+// together with Background or a present YieldTimeMS) is distinguishable from
+// an omitted timeout. Background, YieldTimeMS, and TTY are the new
+// supervision-facing arguments (spec, "Bash API"); normalizeSupervision
+// (prepare.go) is their single validation/normalization point.
 type bashArgs struct {
-	Command string      `json:"command"`
-	Workdir string      `json:"workdir"`
-	Timeout int         `json:"timeout"`
-	Access  *accessDecl `json:"access,omitempty"`
+	Command        string      `json:"command"`
+	Workdir        string      `json:"workdir"`
+	Timeout        *int        `json:"timeout"`
+	Background     bool        `json:"background"`
+	YieldTimeMS    *int        `json:"yield_time_ms"`
+	TTY            bool        `json:"tty"`
+	MaxOutputBytes *int64      `json:"max_output_bytes"`
+	Access         *accessDecl `json:"access,omitempty"`
 }
 
 // BashTool runs a single shell command in a workspace-contained directory. It

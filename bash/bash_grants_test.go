@@ -115,6 +115,48 @@ func TestBashGrantsCommandRunnerOnlyFallsBack(t *testing.T) {
 	}
 }
 
+// TestBashLegacyGrantDispatchUnaffectedByNewFields proves grant-aware
+// dispatch (issued PreparedCall tokens routing to RunCommandWithGrants) is
+// identical whether the call carries only the pre-existing fields or ALSO
+// carries the new supervision fields at their legacy-equivalent zero values.
+// Task 14 adds no runner routing change, so both calls must route to the
+// grants method identically with the same tokens, dir, and command.
+func TestBashLegacyGrantDispatchUnaffectedByNewFields(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		argsRaw string
+	}{
+		{name: "legacy-only fields", argsRaw: `{"command":"echo hi"}`},
+		{name: "explicit-false supervision fields", argsRaw: `{"command":"echo hi","background":false,"tty":false}`},
+	}
+	grants := []string{"tok-a", "tok-b"}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			fake := &fakeGrantedRunner{out: []byte("ROUTED\n"), exit: 0}
+			b := NewBash(root, WithRunner(fake))
+
+			out := runPrepared(t, b, tt.argsRaw, grants)
+
+			if !fake.ranGrants || fake.ranPlain {
+				t.Fatalf("dispatch = grants:%v plain:%v, want the granted runner path", fake.ranGrants, fake.ranPlain)
+			}
+			if !slices.Equal(fake.gotGrants, grants) {
+				t.Errorf("grants handed to runner = %#v, want %#v", fake.gotGrants, grants)
+			}
+			if fake.gotCommand != "echo hi" || fake.gotDir != root {
+				t.Errorf("runner saw command/dir %q/%q, want %q/%q", fake.gotCommand, fake.gotDir, "echo hi", root)
+			}
+			if !strings.Contains(out, "ROUTED") {
+				t.Errorf("result %q missing the runner's output", out)
+			}
+		})
+	}
+}
+
 // TestBashGrantsNilRunnerDirectExec asserts grants present with NO injected
 // runner (the bare-harness default) still direct-execs via sh -c without
 // panicking; the grants are ignored at the exec layer.

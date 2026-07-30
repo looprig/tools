@@ -64,12 +64,27 @@ type fsDecl struct {
 
 // bashArtifact binds the validated preparation output to one call. Execution
 // consumes it verbatim — the raw args are never reparsed.
+//
+// The supervision-facing fields (supervised/background/yieldRequested/
+// yieldTimeMS/tty/maxOutputBytes/noDeadline) are normalized and frozen here
+// by Task 14 but not yet consumed by InvokableRun: routing a supervised call
+// to the shared process supervisor is Task 15's job. timeout remains the
+// legacy synchronous-path clamp (meaningless when noDeadline is true).
 type bashArtifact struct {
 	tool.TokenArtifact
 	command    string
 	workdirRel string
 	dirAbs     string
 	timeout    time.Duration
+
+	supervised        bool
+	background        bool
+	yieldRequested    bool
+	yieldTimeMS       int
+	tty               bool
+	hasMaxOutputBytes bool
+	maxOutputBytes    int64
+	noDeadline        bool
 }
 
 // bashPrepareError is the typed preparation failure; its message is model-safe.
@@ -98,6 +113,13 @@ func (b *BashTool) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSO
 	if err != nil {
 		return tool.Request{}, nil, err
 	}
+	supervision, err := normalizeSupervision(a)
+	if err != nil {
+		return tool.Request{}, nil, err
+	}
+	if supervision.Supervised && hasDetachedSyntax(command) {
+		return tool.Request{}, nil, prepareFail("command uses detached shell syntax, which is not allowed for a supervised call: %s", command)
+	}
 	dir, err := resolveSpawnDir(b.root, a.Workdir)
 	if err != nil {
 		return tool.Request{}, nil, prepareFail("workdir is outside the workspace: %s", a.Workdir)
@@ -122,12 +144,127 @@ func (b *BashTool) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSO
 		Requirements:       requirements,
 	}
 	artifact := &bashArtifact{
-		command:    command,
-		workdirRel: a.Workdir,
-		dirAbs:     dir,
-		timeout:    clampBashTimeout(a.Timeout),
+		command:           command,
+		workdirRel:        a.Workdir,
+		dirAbs:            dir,
+		timeout:           supervision.Timeout,
+		supervised:        supervision.Supervised,
+		background:        supervision.Background,
+		yieldRequested:    supervision.YieldRequested,
+		yieldTimeMS:       supervision.YieldTimeMS,
+		tty:               supervision.TTY,
+		hasMaxOutputBytes: supervision.HasMaxOutputBytes,
+		maxOutputBytes:    supervision.MaxOutputBytes,
+		noDeadline:        supervision.NoDeadline,
 	}
 	return request, artifact, nil
+}
+
+// supervisionArgs is the normalized, frozen form of Bash's supervision-facing
+// arguments (long-running-command-supervision spec, "Bash API"). A zero value
+// (Supervised == false) is the legacy synchronous call. Routing a supervised
+// call to the shared process supervisor is a later task; PrepareCall freezes
+// this value into the bashArtifact regardless, so mutating the raw args
+// afterward changes nothing.
+type supervisionArgs struct {
+	Supervised        bool
+	Background        bool
+	YieldRequested    bool
+	YieldTimeMS       int
+	TTY               bool
+	HasMaxOutputBytes bool
+	MaxOutputBytes    int64
+	NoDeadline        bool          // timeout:0 under supervision: run until session shutdown.
+	Timeout           time.Duration // clamped hard lifetime deadline; meaningless when NoDeadline.
+}
+
+// normalizeSupervision decodes and validates Bash's presence-aware
+// supervision arguments. Explicit supervision is detected from `background`
+// or a PRESENT `yield_time_ms` (the spec: "timeout: 0 is valid only when
+// background or yield_time_ms enables supervision") — `tty` and an explicit
+// `timeout: 0` both REQUIRE that supervision rather than granting it
+// themselves, so a foreground call using only the pre-existing fields decodes
+// identically to before (Supervised stays false, Timeout is the same clamp
+// clampBashTimeout always produced).
+func normalizeSupervision(a bashArgs) (supervisionArgs, error) {
+	settings := supervisionArgs{
+		Supervised: a.Background || a.YieldTimeMS != nil,
+		Background: a.Background,
+		TTY:        a.TTY,
+	}
+
+	if a.YieldTimeMS != nil {
+		if *a.YieldTimeMS < 0 {
+			return supervisionArgs{}, prepareFail("yield_time_ms must be >= 0")
+		}
+		settings.YieldRequested = true
+		settings.YieldTimeMS = *a.YieldTimeMS
+	}
+
+	if a.TTY && !settings.Supervised {
+		return supervisionArgs{}, prepareFail("tty requires background or yield_time_ms")
+	}
+
+	if a.MaxOutputBytes != nil {
+		if *a.MaxOutputBytes <= 0 {
+			return supervisionArgs{}, prepareFail("max_output_bytes must be > 0")
+		}
+		settings.HasMaxOutputBytes = true
+		settings.MaxOutputBytes = *a.MaxOutputBytes
+	}
+
+	switch {
+	case a.Timeout == nil:
+		settings.Timeout = clampBashTimeout(0)
+	case *a.Timeout < 0:
+		return supervisionArgs{}, prepareFail("timeout must be >= 0")
+	case *a.Timeout == 0:
+		if !settings.Supervised {
+			return supervisionArgs{}, prepareFail("timeout: 0 requires background or yield_time_ms")
+		}
+		settings.NoDeadline = true
+	default:
+		settings.Timeout = clampBashTimeout(*a.Timeout)
+	}
+
+	return settings, nil
+}
+
+// detachedSyntaxTokens are shell utilities whose entire purpose is to detach a
+// descendant from its parent's process group/session. Detecting them is
+// intentionally conservative (a token match, not a shell parse): supervised
+// process-tree containment is the real security boundary (spec, "Cross-
+// platform process trees"), and this check exists only to reject an obvious
+// attempt to defeat it before the call is ever admitted.
+var detachedSyntaxTokens = []string{"nohup", "setsid", "disown"}
+
+// hasDetachedSyntax conservatively reports whether command ends with a shell
+// background operator ('&', as opposed to the '&&' AND-operator) or contains
+// one of detachedSyntaxTokens as a whitespace-delimited word. It is applied
+// only to calls that request supervision (spec: "Conservative detached-syntax
+// rejection applies only when a call requests supervision"); legacy
+// foreground execution keeps its existing shell compatibility unchanged.
+func hasDetachedSyntax(command string) bool {
+	if hasTrailingBackgroundOperator(command) {
+		return true
+	}
+	for _, field := range strings.Fields(command) {
+		trimmed := strings.Trim(field, "();|&")
+		for _, token := range detachedSyntaxTokens {
+			if trimmed == token {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasTrailingBackgroundOperator reports whether command ends with a shell '&'
+// job-control operator backgrounding its final pipeline, as opposed to the
+// '&&' AND-operator.
+func hasTrailingBackgroundOperator(command string) bool {
+	trimmed := strings.TrimRight(command, " \t")
+	return strings.HasSuffix(trimmed, "&") && !strings.HasSuffix(trimmed, "&&")
 }
 
 // normalizeBashCommand produces the exact normalized command every match,

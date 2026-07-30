@@ -125,6 +125,48 @@ func TestBashWithRunnerStartError(t *testing.T) {
 	}
 }
 
+// TestBashLegacyRunnerDispatchUnaffectedByNewFields proves the injected-runner
+// dispatch (which runner, which dir/command it sees) is identical whether the
+// call carries only the pre-existing fields or ALSO carries the new
+// supervision fields at their legacy-equivalent zero values (background:false,
+// tty:false, no yield_time_ms/max_output_bytes/timeout). Task 14 adds no
+// runner routing change, so both calls must exercise plain RunCommand
+// identically.
+func TestBashLegacyRunnerDispatchUnaffectedByNewFields(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		argsRaw string
+	}{
+		{name: "legacy-only fields", argsRaw: `{"command":"echo hi"}`},
+		{name: "explicit-false supervision fields", argsRaw: `{"command":"echo hi","background":false,"tty":false}`},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			fake := &fakeCommandRunner{out: []byte("ROUTED-OUTPUT\n"), exit: 0}
+			b := NewBash(root, WithRunner(fake))
+
+			out := runPrepared(t, b, tt.argsRaw, nil)
+
+			if fake.calls != 1 {
+				t.Fatalf("runner calls = %d, want 1 (command must route through the plain RunCommand path)", fake.calls)
+			}
+			if fake.gotCommand != "echo hi" {
+				t.Errorf("runner saw command %q, want %q", fake.gotCommand, "echo hi")
+			}
+			if fake.gotDir != root {
+				t.Errorf("runner saw dir %q, want %q", fake.gotDir, root)
+			}
+			if !strings.Contains(out, "ROUTED-OUTPUT") || !strings.Contains(out, "[exit code: 0]") {
+				t.Errorf("result %q missing the runner's output/exit marker", out)
+			}
+		})
+	}
+}
+
 // TestBashNilRunnerDirectExec asserts NewBash(root) (no runner) still direct-execs
 // via sh -c, byte-for-byte the pre-existing behavior.
 func TestBashNilRunnerDirectExec(t *testing.T) {
