@@ -21,6 +21,7 @@ import (
 	"github.com/looprig/tools/internal/definition"
 	"github.com/looprig/tools/internal/workspace"
 	"github.com/looprig/tools/permission"
+	"github.com/looprig/tools/process"
 )
 
 // bash.go implements the Bash tool: it runs a single shell command via `sh -c`
@@ -132,6 +133,17 @@ type BashTool struct {
 	obs            tool.WorkspaceObservations
 	familyEligible permission.FamilyEligibility
 	initErr        error
+
+	// asyncRunner, registry, and owner are supervised.go's supervision-only
+	// fields: NewSupervisedFactory is the only constructor that ever sets
+	// them (a plain NewBash/NewFactory tool leaves all three at their zero
+	// value, so any supervised call it receives fails closed with
+	// lifetime_enforcement_unavailable — see runSupervised). asyncRunner is
+	// resolved exactly once, at Build; InvokableRun never re-resolves it
+	// from ctx or invocation provenance.
+	asyncRunner tool.AsyncProcessRunner
+	registry    tool.SessionResourceRegistry
+	owner       process.Owner
 }
 
 // BashOption configures a BashTool at construction (functional-options pattern).
@@ -296,6 +308,15 @@ func (b *BashTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	}
 	if dir != art.dirAbs {
 		return tool.TextResult("error: workdir resolution changed since approval: " + art.workdirRel), nil
+	}
+
+	// A SUPERVISED call (background or yield_time_ms, frozen at preparation
+	// by normalizeSupervision) routes through the shared, runner-free
+	// process.Supervisor instead of the synchronous path below — see
+	// supervised.go's runSupervised. Every other (legacy) call falls
+	// through to the unchanged synchronous `sh -c`/injected-runner path.
+	if art.supervised {
+		return b.runSupervised(ctx, call, art, dir)
 	}
 
 	// Take the EXCLUSIVE whole-workspace mutation permit for the run: Bash may change

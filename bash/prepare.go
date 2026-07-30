@@ -67,9 +67,11 @@ type fsDecl struct {
 //
 // The supervision-facing fields (supervised/background/yieldRequested/
 // yieldTimeMS/tty/maxOutputBytes/noDeadline) are normalized and frozen here
-// by Task 14 but not yet consumed by InvokableRun: routing a supervised call
-// to the shared process supervisor is Task 15's job. timeout remains the
-// legacy synchronous-path clamp (meaningless when noDeadline is true).
+// by Task 14 and consumed by InvokableRun's supervised dispatch
+// (bash.go/supervised.go's runSupervised) for a call where supervised is
+// true. timeout remains the legacy synchronous-path clamp (meaningless when
+// noDeadline is true) and also backs runSupervised's processDeadline for a
+// supervised call that did not request `timeout: 0`.
 type bashArtifact struct {
 	tool.TokenArtifact
 	command    string
@@ -162,10 +164,10 @@ func (b *BashTool) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSO
 
 // supervisionArgs is the normalized, frozen form of Bash's supervision-facing
 // arguments (long-running-command-supervision spec, "Bash API"). A zero value
-// (Supervised == false) is the legacy synchronous call. Routing a supervised
-// call to the shared process supervisor is a later task; PrepareCall freezes
-// this value into the bashArtifact regardless, so mutating the raw args
-// afterward changes nothing.
+// (Supervised == false) is the legacy synchronous call; a supervised call
+// routes through the shared process supervisor (bash.go/supervised.go's
+// runSupervised). PrepareCall freezes this value into the bashArtifact
+// regardless, so mutating the raw args afterward changes nothing.
 type supervisionArgs struct {
 	Supervised        bool
 	Background        bool
