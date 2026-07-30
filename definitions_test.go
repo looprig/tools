@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/bash"
+	"github.com/looprig/tools/process"
 	"github.com/looprig/tools/websearch"
 )
 
@@ -661,29 +662,28 @@ func TestProcessCompanionDefinitionsDifferentSessionsGetDifferentSupervisors(t *
 	resourceB := registryB.resource
 	registryB.mu.Unlock()
 
-	supervisorA, ok := resourceA.(*processSupervisorResource)
+	supervisorA, ok := resourceA.(*process.SupervisorResource)
 	if !ok {
-		t.Fatalf("registryA resource type = %T, want *processSupervisorResource", resourceA)
+		t.Fatalf("registryA resource type = %T, want *process.SupervisorResource", resourceA)
 	}
-	supervisorB, ok := resourceB.(*processSupervisorResource)
+	supervisorB, ok := resourceB.(*process.SupervisorResource)
 	if !ok {
-		t.Fatalf("registryB resource type = %T, want *processSupervisorResource", resourceB)
+		t.Fatalf("registryB resource type = %T, want *process.SupervisorResource", resourceB)
 	}
-	if supervisorA.supervisor == supervisorB.supervisor {
+	if supervisorA.Supervisor == supervisorB.Supervisor {
 		t.Fatal("two different sessions' registries produced the same *process.Supervisor")
 	}
 }
 
 // TestProcessSupervisorResourceKeyMatchesBashSupervisedKey pins
-// processSupervisorResourceKey against silent drift. bash/supervised.go's
-// own unexported supervisorResourceKey must stay byte-for-byte identical for
-// "any of the four definitions may win get-or-create" to hold; this test
-// cannot reach across packages to compare the two constants directly (bash's
-// is unexported), so it pins the known-good literal instead.
+// process.SupervisorResourceKey against silent drift. bash/supervised.go's
+// runSupervised resolves this exact same exported symbol (there is no
+// private per-package copy on either side anymore), so this test now simply
+// guards the literal's value itself against an accidental change.
 func TestProcessSupervisorResourceKeyMatchesBashSupervisedKey(t *testing.T) {
 	t.Parallel()
-	const bashSupervisorResourceKey = "github.com/looprig/tools/process.supervisor"
-	if processSupervisorResourceKey != bashSupervisorResourceKey {
-		t.Fatalf("processSupervisorResourceKey = %q, want %q (must match bash/supervised.go's unexported supervisorResourceKey)", processSupervisorResourceKey, bashSupervisorResourceKey)
+	const wantSupervisorResourceKey = "github.com/looprig/tools/process.supervisor"
+	if process.SupervisorResourceKey != wantSupervisorResourceKey {
+		t.Fatalf("process.SupervisorResourceKey = %q, want %q", process.SupervisorResourceKey, wantSupervisorResourceKey)
 	}
 }

@@ -20,12 +20,12 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-// newRunnerFreeTestSupervisor builds a *Supervisor exactly the way a
-// tool.SessionResourceRegistry.GetOrCreate factory does (mirrors bash/
-// supervised.go's own newSupervisorResource and this module's root
-// definitions.go newProcessSupervisorResource): from only a reserved storage
-// directory, with no lifecycle publisher, no completion notifier, and no
-// tool.AsyncProcessRunner anywhere in the call.
+// newRunnerFreeTestSupervisor builds a *Supervisor exactly the way the
+// exported NewSupervisorResource factory (session_resource.go) does — the
+// same factory bash/supervised.go and this module's root definitions.go both
+// obtain through tool.SessionResourceRegistry.GetOrCreate: from only a
+// reserved storage directory, with no lifecycle publisher, no completion
+// notifier, and no tool.AsyncProcessRunner anywhere in the call.
 func newRunnerFreeTestSupervisor(t *testing.T) *Supervisor {
 	t.Helper()
 	dir := t.TempDir()

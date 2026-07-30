@@ -24,14 +24,6 @@ import (
 	"github.com/looprig/tools/process"
 )
 
-// supervisorResourceKey names the ONE shared process.Supervisor session
-// resource every supervised Bash call (and, from Task 16/17/18 on, every
-// ProcessOutput/ProcessInput/ProcessStop call in the same session) obtains
-// through tool.SessionResourceRegistry.GetOrCreate: "any of the four
-// definitions may win get-or-create" (Task 19's own combined-acceptance
-// text) requires all of them to key on this exact same string.
-const supervisorResourceKey = "github.com/looprig/tools/process.supervisor"
-
 // SupervisedFactory builds a session-supervised BashTool bound to bindings
 // and the caller's already-resolved, validated tool.AsyncProcessRunner.
 // bindings must satisfy tool.RequiresWorkspace|tool.RequiresProcessServices
@@ -120,14 +112,14 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	// Step 3: obtain the ONE shared, runner-free Supervisor session
 	// resource. A failure here still holds the lease and the preparation —
 	// both must be released/closed before returning.
-	resource, err := b.registry.GetOrCreate(ctx, supervisorResourceKey, newSupervisorResource)
+	resource, err := b.registry.GetOrCreate(ctx, process.SupervisorResourceKey, process.NewSupervisorResource)
 	if err != nil {
 		permit.Release()
 		_ = prepared.Close()
 		return supervisedErrorResult(string(process.CodeProcessSetupFailed)), nil
 	}
-	sr, ok := resource.(*supervisorResource)
-	if !ok || sr == nil || sr.supervisor == nil {
+	sr, ok := resource.(*process.SupervisorResource)
+	if !ok || sr == nil || sr.Supervisor == nil {
 		permit.Release()
 		_ = prepared.Close()
 		return supervisedErrorResult(string(process.CodeProcessSetupFailed)), nil
@@ -143,7 +135,7 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	ceiling := storageCeiling(art)
 	yield := process.YieldSettings{Yield: art.background}
 
-	handle, err := sr.supervisor.Start(ctx, b.owner, origin, prepared, lease, nil, nil, ceiling, yield)
+	handle, err := sr.Supervisor.Start(ctx, b.owner, origin, prepared, lease, nil, nil, ceiling, yield)
 	if err != nil {
 		return supervisedErrorResult(classifyProcessError(err, process.CodeSpawnFailed)), nil
 	}
@@ -162,18 +154,18 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	if art.background {
 		// Explicit background: return immediately, exactly as soon as
 		// registration is durable, without waiting for any output at all.
-		go b.watchAndInvalidate(sr.supervisor, handle)
+		go b.watchAndInvalidate(sr.Supervisor, handle)
 		return liveSupervisedResult(string(handle), 0, "", startedAt), nil
 	}
 
 	budget := time.Duration(art.yieldTimeMS) * time.Millisecond
-	terminal, waitErr := waitForTerminal(ctx, sr.supervisor, b.owner, handle, budget, b.invalidateObservations)
+	terminal, waitErr := waitForTerminal(ctx, sr.Supervisor, b.owner, handle, budget, b.invalidateObservations)
 	if waitErr != nil || !terminal {
 		// Either the budget elapsed with the command still running, or the
 		// invocation ctx ended first — either way the process itself keeps
 		// running untouched; hand off to the detached watcher and report a
 		// LIVE result.
-		go b.watchAndInvalidate(sr.supervisor, handle)
+		go b.watchAndInvalidate(sr.Supervisor, handle)
 		return liveSupervisedResult(string(handle), 0, "", startedAt), nil
 	}
 
@@ -254,8 +246,8 @@ func (b *BashTool) watchAndInvalidate(supervisor *process.Supervisor, handle pro
 // loadStartedAt reads handle's own durable Manifest.StartedAt, best-effort:
 // a reload failure or a not-yet-started manifest yields the zero Time,
 // which supervisedResult's formatTime/omitempty simply omits.
-func loadStartedAt(sr *supervisorResource, handle process.Handle) time.Time {
-	manifest, err := sr.manifests.Load(handle)
+func loadStartedAt(sr *process.SupervisorResource, handle process.Handle) time.Time {
+	manifest, err := sr.Manifests.Load(handle)
 	if err != nil || manifest.StartedAt == nil {
 		return time.Time{}
 	}
@@ -266,8 +258,8 @@ func loadStartedAt(sr *supervisorResource, handle process.Handle) time.Time {
 // process.State, process.Result, and Manifest.FinishedAt — never a value
 // Bash computed or guessed itself. A reload failure conservatively reports
 // "failed" rather than fabricating a success.
-func readTerminalOutcome(sr *supervisorResource, handle process.Handle) (status string, exitCode *int, reason string, finishedAt time.Time) {
-	manifest, err := sr.manifests.Load(handle)
+func readTerminalOutcome(sr *process.SupervisorResource, handle process.Handle) (status string, exitCode *int, reason string, finishedAt time.Time) {
+	manifest, err := sr.Manifests.Load(handle)
 	if err != nil {
 		return string(process.StateFailed), nil, "failed", time.Time{}
 	}
@@ -325,45 +317,13 @@ func (l leaseFromPermit) Release() error {
 	return nil
 }
 
-// supervisorResource adapts the *process.Supervisor this session's supervised
-// Bash (and, from Task 16/17/18, ProcessOutput/ProcessInput/ProcessStop)
-// calls share to tool.SessionResource, so it can be obtained through
-// tool.SessionResourceRegistry.GetOrCreate.
-type supervisorResource struct {
-	supervisor *process.Supervisor
-	manifests  *process.ManifestStore
-}
-
-// Activate is intentionally a no-op today: the Supervisor this resource
-// wraps is constructed notification-free (newSupervisorResource passes nil
-// for both NewSupervisor's lifecycle and notifications parameters — both
-// package-private process types Bash cannot implement from outside package
-// process; see leaseFromPermit's doc comment for the one seam it CAN cross).
-// Task 24 ("Publish lifecycle events and deliver metadata-only
-// notifications") is the task that wires services's real capabilities
-// through to a live Supervisor.
-func (r *supervisorResource) Activate(context.Context, tool.SessionResourceServices) error {
-	return nil
-}
-
-// Shutdown releases every resource the shared Supervisor still holds.
-func (r *supervisorResource) Shutdown(ctx context.Context) error {
-	return r.supervisor.Shutdown(ctx)
-}
-
-// newSupervisorResource is the tool.SessionResourceRegistry.GetOrCreate
-// factory for supervisorResourceKey: it is runner-free (constructs no
-// tool.AsyncProcessRunner and calls none of PrepareProcess/Start), exactly
-// as the spec requires so any of the four process-backed definitions may
-// win the get-or-create race. dir is the private per-session storage
-// directory the registry reserves for this key.
-func newSupervisorResource(dir string) (tool.SessionResource, error) {
-	manifests := process.NewManifestStore(dir)
-	supervisor, err := process.NewSupervisor(process.Config{}, manifests, dir, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	return &supervisorResource{supervisor: supervisor, manifests: manifests}, nil
-}
-
-var _ tool.SessionResource = (*supervisorResource)(nil)
+// The shared *process.Supervisor session resource every supervised Bash call
+// (and every ProcessOutput/ProcessInput/ProcessStop call in the same
+// session) obtains is the single exported process.SupervisorResource
+// (process/session_resource.go), keyed by process.SupervisorResourceKey and
+// constructed by process.NewSupervisorResource — not a private type of this
+// package's own. This module's root definitions.go resolves the identical
+// symbols for its three companion definitions, so any of the four
+// process-backed definitions may win tool.SessionResourceRegistry's
+// get-or-create race and every later caller still type-asserts the result
+// to the same concrete type.

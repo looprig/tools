@@ -133,17 +133,6 @@ func Bash(options ...bash.BashOption) tool.Definition {
 // provenance.
 type AsyncProcessRunnerResolver func(context.Context, uuid.UUID) (tool.AsyncProcessRunner, error)
 
-// processSupervisorResourceKey MUST stay byte-for-byte identical to bash's
-// own unexported supervisorResourceKey (bash/supervised.go): Bash's
-// runSupervised and this package's own ProcessOutputDefinition/
-// ProcessInputDefinition/ProcessStopDefinition resolve the SAME
-// tool.SessionResourceRegistry entry only by keying on the identical string
-// (bash/supervised.go's doc comment: "'any of the four definitions may win
-// get-or-create' ... requires all of them to key on this exact same
-// string"). TestProcessSupervisorResourceKeyMatchesBashSupervisedKey pins
-// this literal against drift.
-const processSupervisorResourceKey = "github.com/looprig/tools/process.supervisor"
-
 // BashDefinition builds the session-supervised Bash tool: unlike Bash, a
 // SUPERVISED call (background, or a present yield_time_ms — bash/prepare.go's
 // normalizeSupervision) routes through the shared, runner-free
@@ -182,7 +171,7 @@ func BashDefinition(resolver AsyncProcessRunnerResolver, options ...bash.BashOpt
 // output_tool.go). Argument-free: unlike BashDefinition it captures no
 // resolver and no options — a caller's owned process is read through the
 // same registry entry Bash and its two sibling definitions share, keyed by
-// processSupervisorResourceKey alone.
+// process.SupervisorResourceKey alone.
 func ProcessOutputDefinition() tool.Definition {
 	return tool.NewDefinition("ProcessOutput", tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		supervisor, err := resolveProcessSupervisor(ctx, bindings)
@@ -223,84 +212,34 @@ func ProcessStopDefinition() tool.Definition {
 }
 
 // resolveProcessSupervisor obtains this session's ONE shared, runner-free
-// process.Supervisor session resource, keyed by processSupervisorResourceKey,
-// through bindings.Process.Registry — the keyed registry, never a package
-// global. Harness's own Definition.Build already validated that
-// bindings.Process and its Registry are present before this factory ever
-// runs (tool.RequiresProcessServices' bindings validation), so the only
-// failures reachable here are the registry's own (e.g. session closing) or an
-// unexpected resource already occupying this key.
+// process.Supervisor session resource, keyed by
+// process.SupervisorResourceKey, through bindings.Process.Registry — the
+// keyed registry, never a package global. Harness's own Definition.Build
+// already validated that bindings.Process and its Registry are present
+// before this factory ever runs (tool.RequiresProcessServices' bindings
+// validation), so the only failures reachable here are the registry's own
+// (e.g. session closing) or an unexpected resource already occupying this
+// key.
+//
+// bash/supervised.go's runSupervised independently resolves the SAME
+// registry entry the first time a supervised Bash call actually executes.
+// Both call sites key on process.SupervisorResourceKey and type-assert the
+// result to the identical exported process.SupervisorResource — there is no
+// longer a private per-package wrapper type on either side — so whichever of
+// the four process-backed definitions' GetOrCreate call reaches this key
+// FIRST still hands every later caller, regardless of package, a resource it
+// can type-assert successfully.
 func resolveProcessSupervisor(ctx context.Context, bindings tool.Bindings) (*process.Supervisor, error) {
-	resource, err := bindings.Process.Registry.GetOrCreate(ctx, processSupervisorResourceKey, newProcessSupervisorResource)
+	resource, err := bindings.Process.Registry.GetOrCreate(ctx, process.SupervisorResourceKey, process.NewSupervisorResource)
 	if err != nil {
 		return nil, &DefinitionBuildError{Definition: "Process", Dependency: "process_registry", Cause: err}
 	}
-	sr, ok := resource.(*processSupervisorResource)
-	if !ok || sr == nil || sr.supervisor == nil {
+	sr, ok := resource.(*process.SupervisorResource)
+	if !ok || sr == nil || sr.Supervisor == nil {
 		return nil, &DefinitionBuildError{Definition: "Process", Dependency: "process_registry"}
 	}
-	return sr.supervisor, nil
+	return sr.Supervisor, nil
 }
-
-// processSupervisorResource adapts the shared *process.Supervisor to
-// tool.SessionResource for this package's own GetOrCreate calls (the three
-// companion definitions above).
-//
-// bash/supervised.go independently resolves and wraps the SAME registry
-// entry — processSupervisorResourceKey and bash's own private
-// supervisorResourceKey are the identical string — the first time a
-// supervised Bash call actually executes, using its own unexported wrapper
-// type. Whichever of the four process-backed definitions' GetOrCreate call
-// reaches this key FIRST determines the concrete tool.SessionResource value
-// every later caller with that key receives back, including a caller in a
-// different package.
-//
-// KNOWN LIMITATION, out of this task's file scope: because bash's wrapper
-// type is unexported to package bash, a companion definition here that wins
-// the race hands bash's own runSupervised a resource it cannot type-assert
-// to its own *supervisorResource, and bash's supervised path then fails
-// closed (process_setup_failed) for that session. The design spec
-// ("Bash, ProcessOutput, ProcessInput, and ProcessStop can each win the
-// registry's get-or-create race because the supervisor contains no runner")
-// requires a single shared resource type across both packages to hold in
-// every ordering; today that type still lives twice, once here and once in
-// bash/supervised.go. Closing this gap needs an exported shared type/factory
-// (most naturally added to package process) that bash/supervised.go also
-// adopts — both are outside definitions.go/dependency_test.go's file scope
-// for this task and are flagged here for the owning phase gate.
-type processSupervisorResource struct {
-	supervisor *process.Supervisor
-}
-
-// Activate is intentionally a no-op: the Supervisor this resource wraps is
-// constructed notification-free (newProcessSupervisorResource passes nil for
-// both NewSupervisor's lifecycle and notifications parameters), mirroring
-// bash/supervised.go's own supervisorResource.Activate.
-func (r *processSupervisorResource) Activate(context.Context, tool.SessionResourceServices) error {
-	return nil
-}
-
-// Shutdown releases every resource the shared Supervisor still holds.
-func (r *processSupervisorResource) Shutdown(ctx context.Context) error {
-	return r.supervisor.Shutdown(ctx)
-}
-
-// newProcessSupervisorResource is the tool.SessionResourceRegistry.GetOrCreate
-// factory for processSupervisorResourceKey: it is runner-free (constructs no
-// tool.AsyncProcessRunner and calls neither PrepareProcess nor Start), so any
-// of ProcessOutputDefinition/ProcessInputDefinition/ProcessStopDefinition may
-// win the get-or-create race for a session's shared supervisor. dir is the
-// private per-session storage directory the registry reserves for this key.
-func newProcessSupervisorResource(dir string) (tool.SessionResource, error) {
-	manifests := process.NewManifestStore(dir)
-	supervisor, err := process.NewSupervisor(process.Config{}, manifests, dir, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	return &processSupervisorResource{supervisor: supervisor}, nil
-}
-
-var _ tool.SessionResource = (*processSupervisorResource)(nil)
 
 func loopObservations(shared tool.WorkspaceObservations) tool.WorkspaceObservations {
 	if workspace.IsNil(shared) {
