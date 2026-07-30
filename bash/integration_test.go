@@ -43,6 +43,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,11 +146,14 @@ var (
 	_ tool.WorkspaceLifetimeCoordinator = (*fakeCoordinator)(nil)
 )
 
-// fakeObservations is a race-safe tool.WorkspaceObservations test double.
-type fakeObservations struct{ invalidated int64 }
+// fakeObservations is a race-safe tool.WorkspaceObservations test double: a
+// supervised call's detached watchAndInvalidate goroutine can call
+// InvalidateAll concurrently with a later supervised call in the same test
+// (mirroring bash/supervised_test.go's syncWorkspaceObservations).
+type fakeObservations struct{ invalidated atomic.Int64 }
 
 func (*fakeObservations) WithPath(string, func(*tool.FileObservation) error) error { return nil }
-func (o *fakeObservations) InvalidateAll()                                         { o.invalidated++ }
+func (o *fakeObservations) InvalidateAll()                                         { o.invalidated.Add(1) }
 
 var _ tool.WorkspaceObservations = (*fakeObservations)(nil)
 
@@ -544,7 +548,33 @@ func TestIntegrationBashSupervisedWorkflow(t *testing.T) {
 	if twinA.ProcessID == "" || twinB.ProcessID == "" {
 		t.Fatalf("twin background results = %+v / %+v, want non-empty handles", twinA, twinB)
 	}
-	waitAllText := runCall(t, processOutput, fmt.Sprintf(`{"process_ids":[%q,%q],"wait":"all","timeout_ms":5000}`, twinA.ProcessID, twinB.ProcessID))
+
+	// process/output_tool.go's awaitTargets treats a target as already
+	// satisfied when "cursor < total_bytes || terminal" (its own doc
+	// comment), and a process_ids call carries exactly one shared `cursor`
+	// for every target (processOutputArgs has a single `Cursor *int64`,
+	// never a per-target one). Waiting with the default cursor:0 is
+	// therefore trivially satisfied the instant EITHER twin has produced
+	// any output at all -- it proves nothing about blocking until
+	// terminal. To actually exercise "blocks until terminal", first learn
+	// each twin's own fully-written byte count via an individual wait:any
+	// poll (printf writes its whole argument in one spool append, so by
+	// the time this returns, TotalBytes is that twin's FINAL byte count,
+	// with no more output still to arrive), then reissue wait:all with
+	// that count as the shared cursor: cursor == total_bytes can no
+	// longer be satisfied by "has new output", so a terminal result below
+	// can only mean wait:all genuinely waited for terminal.
+	firstA := decodeProcessResult(t, runCall(t, processOutput, fmt.Sprintf(`{"process_id":%q,"cursor":0,"wait":"any","timeout_ms":5000}`, twinA.ProcessID)))
+	firstB := decodeProcessResult(t, runCall(t, processOutput, fmt.Sprintf(`{"process_id":%q,"cursor":0,"wait":"any","timeout_ms":5000}`, twinB.ProcessID)))
+	if firstA.TotalBytes == 0 || firstB.TotalBytes == 0 {
+		t.Fatalf("twin first-output snapshots = %+v / %+v, want nonzero total_bytes for both", firstA, firstB)
+	}
+	if firstA.TotalBytes != firstB.TotalBytes {
+		t.Fatalf("twin total_bytes = %d / %d, want equal (printf twinA and printf twinB are both 5-byte outputs) so one shared wait:all cursor is valid for both", firstA.TotalBytes, firstB.TotalBytes)
+	}
+	sharedCursor := firstA.TotalBytes
+
+	waitAllText := runCall(t, processOutput, fmt.Sprintf(`{"process_ids":[%q,%q],"cursor":%d,"wait":"all","timeout_ms":5000}`, twinA.ProcessID, twinB.ProcessID, sharedCursor))
 	var multi processCallResults
 	if err := json.Unmarshal([]byte(waitAllText), &multi); err != nil {
 		t.Fatalf("decode wait:all result %q: %v", waitAllText, err)
@@ -557,7 +587,7 @@ func TestIntegrationBashSupervisedWorkflow(t *testing.T) {
 	}
 	for _, r := range multi.Results {
 		if !process.State(r.Status).Terminal() {
-			t.Errorf("wait:all entry %+v, want a terminal status (wait:all blocks until every target is terminal or has new output)", r)
+			t.Errorf("wait:all entry %+v, want a terminal status (cursor == each twin's already-observed total_bytes, so no new output can satisfy the wait -- wait:all can only have returned because every target reached terminal)", r)
 		}
 	}
 

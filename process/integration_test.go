@@ -428,11 +428,27 @@ func TestIntegrationProcessToolsRestore(t *testing.T) {
 		if !res.Gap {
 			t.Fatalf("Gap = false, want true: a 20-byte process with a 16-byte spool ceiling must have dropped its earliest retained bytes")
 		}
-		if res.StartCursor == 0 {
-			t.Fatalf("StartCursor = 0, want > 0 (the earliest still-retained byte, not the requested cursor 0)")
+		// StartCursor is documented (process/render.go's SafeTextResult and
+		// RenderSafeText doc comments) as "the cursor Read was called with
+		// (before any gap adjustment)" -- it always echoes the caller's
+		// requested cursor back unchanged, never the earliest still-retained
+		// byte. This call requested cursor 0, so StartCursor correctly comes
+		// back as 0; there is no assertion to make on it here.
+		//
+		// The real "earliest retained byte" invariant is provable from the
+		// retained window's actual length: 20 bytes were written against a
+		// 16-byte spool ceiling, so the earliest 4 bytes were dropped and
+		// exactly 16 remain, with the gap-adjusted read reaching the end of
+		// the stream (NextCursor == TotalBytes, since nothing further was
+		// ever written).
+		if res.NextCursor != res.TotalBytes {
+			t.Fatalf("NextCursor = %d, want %d (TotalBytes; the read reaches the end of the retained stream)", res.NextCursor, res.TotalBytes)
 		}
 		if res.Output == "" || strings.Trim(res.Output, "A") != "" {
 			t.Fatalf("Output = %q, want a non-empty run of only %q characters", res.Output, "A")
+		}
+		if len(res.Output) != 16 {
+			t.Fatalf("len(Output) = %d, want 16 (the configured spool ceiling: 20 bytes written, the earliest 4 dropped, 16 retained)", len(res.Output))
 		}
 	})
 
