@@ -761,3 +761,37 @@ No unresolved *blocking* finding or deferred *required* check enters Phase 5.
 Phase 5 ("Unix PTY and Windows ConPTY") does not itself depend on Phase 3
 (Sandbox); its own dependency structure should be checked against the plan
 text before starting, the same way Phase 4's was, rather than assumed.
+
+**Update (2026-07-29/30): Phase 5 dependency checked, confirmed blocked.**
+Phase 5's Task 21 modifies `sandbox/internal/exec/process.go` and
+`process_tree_unix.go` — the same files Phase 3's Task 10/12 create/modify —
+and Phase Gate 5's own tagged-integration selector
+(`TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree|ProcessPTY|ConPTY)`)
+is explicitly cumulative with Phase 3's. Phase 5 genuinely requires Phase 3
+first; it is not a second independent track the way Phase 4 was.
+
+Phase 6's Tasks 24-25 (`../harness/pkg/journal`, `pkg/hub`, `pkg/sessionstore`,
+`pkg/command`, `internal/sessionruntime`, `internal/loopruntime` — lifecycle
+event publication, metadata-only notifications, shutdown/construction-abort/
+restore ordering) were checked and confirmed Harness-only, no Sandbox files,
+independent of Phase 3 the same way Phase 4 was. Only Phase 6's Tasks 26-28
+("Adapt Sandbox processes to Harness in Coderig", "Install the four process
+definitions in Coderig", "full Coderig integration tests") need the real
+Sandbox executor.
+
+**Explicit user override, recorded 2026-07-30:** offered the choice between
+pulling Tasks 24-25 forward (the Phase-4-style independent-track option) or
+pausing, the user instead explicitly directed overriding the Phase 3
+coordination-prerequisite gate itself and starting Task 10 now, despite two
+of its three mandatory checks remaining unmet (live privileged Linux
+Rung-1/Rung-2 execution and live `windows-restricted`/`windows-elevated`
+runs — see the "Phase 3 coordination prerequisite — partial update" section
+above; only the govulncheck leg was satisfied). This is a deliberate,
+explicit, twice-confirmed user decision (a clarifying question was asked and
+answered "Yes — override the gate, start Task 10 now" before proceeding), not
+an oversight or a plan violation on the implementer's part. Task 10 begins
+without native Rung-1/Rung-2 or Windows runner evidence; Phase Gate 3's own
+command matrix (native privileged-worker runs, live Windows job runs) still
+cannot be satisfied until that infrastructure is available, so Phase 3 gate
+closure itself remains blocked even though implementation is now proceeding
+ahead of it, on the user's explicit instruction.
