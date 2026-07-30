@@ -154,7 +154,13 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	if art.background {
 		// Explicit background: return immediately, exactly as soon as
 		// registration is durable, without waiting for any output at all.
-		go b.watchAndInvalidate(sr.Supervisor, handle)
+		//
+		// watchAndInvalidate is deliberately rooted in context.Background(),
+		// never ctx: the whole point of background/yielded supervision is
+		// that the process (and this watcher) keeps running after this
+		// invocation's own request-scoped ctx ends when InvokableRun
+		// returns, hence the explicit #nosec below.
+		go b.watchAndInvalidate(sr.Supervisor, handle) // #nosec G118 -- watcher deliberately outlives the request ctx; see comment above
 		return liveSupervisedResult(string(handle), 0, "", startedAt), nil
 	}
 
@@ -164,8 +170,9 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 		// Either the budget elapsed with the command still running, or the
 		// invocation ctx ended first — either way the process itself keeps
 		// running untouched; hand off to the detached watcher and report a
-		// LIVE result.
-		go b.watchAndInvalidate(sr.Supervisor, handle)
+		// LIVE result. Same deliberate context.Background() rationale as
+		// the explicit-background branch above.
+		go b.watchAndInvalidate(sr.Supervisor, handle) // #nosec G118 -- watcher deliberately outlives the request ctx; see comment above
 		return liveSupervisedResult(string(handle), 0, "", startedAt), nil
 	}
 
