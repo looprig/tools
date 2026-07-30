@@ -301,13 +301,65 @@ func runSupervisedCall(t *testing.T, b *BashTool, argsJSON string, grants []stri
 		t.Fatalf("InvokableRun() returned a Go error %v; Bash returns tool-result strings", err)
 	}
 	text := textOf(t, res)
+	return decodeSupervisedResult(t, text), text, call
+}
+
+// decodeSupervisedResult strictly decodes text as a supervisedResult —
+// DisallowUnknownFields means ANY extra top-level key (a host path, an OS
+// PID, anything not in supervisedResult's closed field set) fails the
+// decode. Factored out of runSupervisedCall so a caller that drives
+// InvokableRun directly (TestSupervisedBashRunnerSelectionFixedAtBuildNotFromContext,
+// which must reuse a single base ctx across two calls, and so can't go
+// through runSupervisedCall's own PrepareCall/loop.WithPreparedCall
+// sequencing) can still recover a handle worth synchronizing on with
+// waitProcessDone.
+func decodeSupervisedResult(t *testing.T, text string) supervisedResult {
+	t.Helper()
 	dec := json.NewDecoder(strings.NewReader(text))
 	dec.DisallowUnknownFields()
 	var out supervisedResult
 	if err := dec.Decode(&out); err != nil {
 		t.Fatalf("result %q is not the expected supervisedResult JSON: %v", text, err)
 	}
-	return out, text, call
+	return out
+}
+
+// waitProcessDone blocks briefly on registry's cached *process.Supervisor
+// until processID's entry reaches a terminal state, letting its entry's
+// background termination goroutine finish the SAME manifest/spool writes
+// into this test's t.TempDir()-rooted registry directory before that
+// TempDir's cleanup runs — closing the exact "TempDir RemoveAll cleanup:
+// directory not empty" race process/supervisor_test.go's waitEntryDone doc
+// comment describes, but through Supervisor.Wait's exported API: unlike
+// package process's own tests, bash has no access to the unexported
+// entry/done this package's Supervisor wraps.
+//
+// processID == "" (a TERMINAL or ERROR result names no live process — its
+// own background goroutine, if any, has already fully terminalized before
+// runSupervised ever returns; see supervised.go's waitForTerminal) and a
+// registry that never reached GetOrCreate are both no-ops: there is nothing
+// to wait on.
+//
+// The wait is bounded and its outcome deliberately ignored: a process a
+// test keeps deliberately running (an unclosed proc.ready) simply times out
+// here, which must never fail the test — this exists only to close the
+// race for a process that actually finishes, not to force every caller to
+// wait out a live process's full lifetime.
+func waitProcessDone(t *testing.T, registry *fakeSessionResourceRegistry, owner process.Owner, processID string) {
+	t.Helper()
+	if processID == "" {
+		return
+	}
+	registry.mu.Lock()
+	resource := registry.resource
+	registry.mu.Unlock()
+	sr, ok := resource.(*process.SupervisorResource)
+	if !ok || sr == nil || sr.Supervisor == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = sr.Supervisor.Wait(ctx, owner, process.WaitAll, []process.WaitTarget{{Handle: process.Handle(processID)}})
 }
 
 // waitForCount polls get with a short bounded retry until it reports at
@@ -442,10 +494,10 @@ func TestSupervisedBashHardLifetimeTimeoutReachesRequestDeadline(t *testing.T) {
 	runner := &fakeAsyncRunner{prepared: prepared}
 	coord := &recordingLifetimeCoordinator{}
 	obs := &syncWorkspaceObservations{}
-	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+	b, registry := newSupervisedTestTool(t, runner, coord, obs)
 
 	before := time.Now()
-	_, _, _ = runSupervisedCall(t, b, `{"command":"true","background":true,"timeout":5}`, nil)
+	out, _, _ := runSupervisedCall(t, b, `{"command":"true","background":true,"timeout":5}`, nil)
 	after := time.Now()
 
 	if runner.lastReq.Deadline.IsZero() {
@@ -456,6 +508,7 @@ func TestSupervisedBashHardLifetimeTimeoutReachesRequestDeadline(t *testing.T) {
 	if runner.lastReq.Deadline.Before(wantMin) || runner.lastReq.Deadline.After(wantMax) {
 		t.Errorf("Deadline = %v, want between %v and %v", runner.lastReq.Deadline, wantMin, wantMax)
 	}
+	waitProcessDone(t, registry, b.owner, out.ProcessID)
 }
 
 // TestSupervisedBashTimeoutZeroUnderSupervisionMeansNoDeadline asserts
@@ -468,13 +521,14 @@ func TestSupervisedBashTimeoutZeroUnderSupervisionMeansNoDeadline(t *testing.T) 
 	runner := &fakeAsyncRunner{prepared: prepared}
 	coord := &recordingLifetimeCoordinator{}
 	obs := &syncWorkspaceObservations{}
-	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+	b, registry := newSupervisedTestTool(t, runner, coord, obs)
 
-	_, _, _ = runSupervisedCall(t, b, `{"command":"true","background":true,"timeout":0}`, nil)
+	out, _, _ := runSupervisedCall(t, b, `{"command":"true","background":true,"timeout":0}`, nil)
 
 	if !runner.lastReq.Deadline.IsZero() {
 		t.Errorf("Deadline = %v, want zero", runner.lastReq.Deadline)
 	}
+	waitProcessDone(t, registry, b.owner, out.ProcessID)
 }
 
 // TestSupervisedBashPTYAndMaxOutputBytesReachRunnerAndCeiling asserts `tty`
@@ -488,13 +542,14 @@ func TestSupervisedBashPTYAndMaxOutputBytesReachRunnerAndCeiling(t *testing.T) {
 	runner := &fakeAsyncRunner{prepared: prepared}
 	coord := &recordingLifetimeCoordinator{}
 	obs := &syncWorkspaceObservations{}
-	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+	b, registry := newSupervisedTestTool(t, runner, coord, obs)
 
-	_, _, _ = runSupervisedCall(t, b, `{"command":"true","background":true,"tty":true,"max_output_bytes":4096}`, nil)
+	out, _, _ := runSupervisedCall(t, b, `{"command":"true","background":true,"tty":true,"max_output_bytes":4096}`, nil)
 
 	if !runner.lastReq.PTY {
 		t.Errorf("ProcessRequest.PTY = false, want true")
 	}
+	waitProcessDone(t, registry, b.owner, out.ProcessID)
 }
 
 // TestSupervisedBashStorageCeilingFromMaxOutputBytes unit-tests
@@ -525,14 +580,15 @@ func TestSupervisedBashPrepareProcessRunsBeforeLeaseAndDoesNotSpawn(t *testing.T
 	runner := &fakeAsyncRunner{log: log, prepared: prepared}
 	coord := &recordingLifetimeCoordinator{log: log}
 	obs := &syncWorkspaceObservations{}
-	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+	b, registry := newSupervisedTestTool(t, runner, coord, obs)
 
-	_, _, _ = runSupervisedCall(t, b, `{"command":"true","background":true}`, nil)
+	out, _, _ := runSupervisedCall(t, b, `{"command":"true","background":true}`, nil)
 
 	want := []string{"prepare", "acquire_lifetime", "start"}
 	if got := log.snapshot(); !slices.Equal(got, want) {
 		t.Fatalf("call order = %v, want %v", got, want)
 	}
+	waitProcessDone(t, registry, b.owner, out.ProcessID)
 }
 
 // TestSupervisedBashLeaseUsesPreparedAuthoritativeAccess asserts the
@@ -547,9 +603,9 @@ func TestSupervisedBashLeaseUsesPreparedAuthoritativeAccess(t *testing.T) {
 	runner := &fakeAsyncRunner{prepared: prepared}
 	coord := &recordingLifetimeCoordinator{}
 	obs := &syncWorkspaceObservations{}
-	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+	b, registry := newSupervisedTestTool(t, runner, coord, obs)
 
-	_, _, _ = runSupervisedCall(t, b, `{"command":"true","background":true}`, nil)
+	out, _, _ := runSupervisedCall(t, b, `{"command":"true","background":true}`, nil)
 
 	if coord.gotAccess.Kind != tool.WorkspaceAccessScopedWrite {
 		t.Errorf("AcquireLifetime access.Kind = %v, want %v", coord.gotAccess.Kind, tool.WorkspaceAccessScopedWrite)
@@ -557,6 +613,7 @@ func TestSupervisedBashLeaseUsesPreparedAuthoritativeAccess(t *testing.T) {
 	if got := coord.gotAccess.WritePaths(); !slices.Equal(got, []string{"/workspace/a"}) {
 		t.Errorf("AcquireLifetime access.WritePaths() = %v, want [/workspace/a]", got)
 	}
+	waitProcessDone(t, registry, b.owner, out.ProcessID)
 }
 
 // TestSupervisedBashStartOnlyAfterLeaseConsumesPreparationOnce asserts
@@ -571,9 +628,9 @@ func TestSupervisedBashStartOnlyAfterLeaseConsumesPreparationOnce(t *testing.T) 
 	runner := &fakeAsyncRunner{prepared: prepared}
 	coord := &recordingLifetimeCoordinator{}
 	obs := &syncWorkspaceObservations{}
-	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+	b, registry := newSupervisedTestTool(t, runner, coord, obs)
 
-	_, _, _ = runSupervisedCall(t, b, `{"command":"true","background":true}`, nil)
+	out, _, _ := runSupervisedCall(t, b, `{"command":"true","background":true}`, nil)
 
 	if prepared.startCalls != 1 {
 		t.Errorf("Start called %d times, want exactly 1", prepared.startCalls)
@@ -581,6 +638,7 @@ func TestSupervisedBashStartOnlyAfterLeaseConsumesPreparationOnce(t *testing.T) 
 	if prepared.closeCalls != 0 {
 		t.Errorf("Close called %d times, want 0 on the success path", prepared.closeCalls)
 	}
+	waitProcessDone(t, registry, b.owner, out.ProcessID)
 }
 
 // TestSupervisedBashFailureClosesPreparationAndReleasesReservations covers
@@ -696,7 +754,7 @@ func TestSupervisedBashRunnerSelectionFixedAtBuildNotFromContext(t *testing.T) {
 	runner := &fakeAsyncRunner{prepared: prepared}
 	coord := &recordingLifetimeCoordinator{}
 	obs := &syncWorkspaceObservations{}
-	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+	b, registry := newSupervisedTestTool(t, runner, coord, obs)
 
 	type provenanceKey struct{}
 	argsJSON := `{"command":"true","background":true}`
@@ -708,9 +766,12 @@ func TestSupervisedBashRunnerSelectionFixedAtBuildNotFromContext(t *testing.T) {
 			t.Fatalf("PrepareCall() error = %v", err)
 		}
 		ctx := loop.WithPreparedCall(base, tool.PreparedCall{ExecutionID: id, Request: req, Artifact: art})
-		if _, err := b.InvokableRun(ctx, argsJSON); err != nil {
+		res, err := b.InvokableRun(ctx, argsJSON)
+		if err != nil {
 			t.Fatalf("InvokableRun() error = %v", err)
 		}
+		out := decodeSupervisedResult(t, textOf(t, res))
+		waitProcessDone(t, registry, b.owner, out.ProcessID)
 	}
 
 	if runner.calls != 2 {
@@ -728,10 +789,10 @@ func TestSupervisedBashRequestCarriesExecutionIDAndGrantsExactly(t *testing.T) {
 	runner := &fakeAsyncRunner{prepared: prepared}
 	coord := &recordingLifetimeCoordinator{}
 	obs := &syncWorkspaceObservations{}
-	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+	b, registry := newSupervisedTestTool(t, runner, coord, obs)
 
 	grants := []string{"grant-x", "grant-y"}
-	_, _, call := runSupervisedCall(t, b, `{"command":"true","background":true}`, grants)
+	out, _, call := runSupervisedCall(t, b, `{"command":"true","background":true}`, grants)
 
 	if runner.lastReq.OriginExecutionID != call.ExecutionID {
 		t.Errorf("OriginExecutionID = %v, want %v", runner.lastReq.OriginExecutionID, call.ExecutionID)
@@ -739,6 +800,7 @@ func TestSupervisedBashRequestCarriesExecutionIDAndGrantsExactly(t *testing.T) {
 	if !slices.Equal(runner.lastReq.Grants, grants) {
 		t.Errorf("Grants = %v, want %v", runner.lastReq.Grants, grants)
 	}
+	waitProcessDone(t, registry, b.owner, out.ProcessID)
 }
 
 // TestSupervisedBashSpawnActivityAndCompletionInvalidateObservations asserts
