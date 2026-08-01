@@ -31,12 +31,14 @@ contracts the harness defines. This file is the short guide for working in
 - **`permission` is the shared rule library, not a tool.** Its canonical
   requirement-match encodings are the pinned contract between tool
   preparation and stored-rule matching. Rule-file load failures are errors.
-- **Respect the module boundaries.** Export one `tool.Definition` per tool
-  — never bundle unrelated tools. Read workspace root, observations,
-  coordinators, ceiling, and delegates from `tool.Bindings`. Depend on
-  harness contracts, never harness internals. Never import sandbox or
-  confinement directly; accept their behavior through the harness runner
-  and permission interfaces.
+- **Respect the module boundaries.** Export one `tool.Definition` per
+  independently selectable capability by default — never bundle unrelated
+  tools. `Tasks` is the deliberate related-family exception because its four
+  operations share one Loop-local graph. Read workspace root, observations,
+  coordinators, ceiling, and delegates from `tool.Bindings`. Depend on harness
+  contracts, never harness internals. Never import sandbox or confinement
+  directly; accept their behavior through the harness runner and permission
+  interfaces.
 - **Tasks are a deliberate related-family bundle.** `TaskDefinitions()` produces
   four model-facing operations backed by one Loop-local graph per definition
   build. Modes in one Loop share that graph; parent and child Loops do not.
