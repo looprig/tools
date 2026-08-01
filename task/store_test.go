@@ -355,3 +355,408 @@ func TestStoreLimitsAggregateBytesRejectAtomically(t *testing.T) {
 	}
 	assertRecordsUnchanged(t, store, before)
 }
+
+func stringPointer(value string) *string {
+	return &value
+}
+
+func statusPointer(value Status) *Status {
+	return &value
+}
+
+func metadataPointer(value string) *json.RawMessage {
+	metadata := json.RawMessage(value)
+	return &metadata
+}
+
+func mustUpdate(t *testing.T, store *store, input updateInput) Task {
+	t.Helper()
+	updated, deleted, err := store.update(input)
+	if err != nil {
+		t.Fatalf("store.update() error = %v", err)
+	}
+	if deleted {
+		t.Fatal("store.update() unexpectedly deleted task")
+	}
+	return updated
+}
+
+func TestStoreUpdateOmittedFieldsRemainUnchanged(t *testing.T) {
+	dependencyID := testUUID(1)
+	taskID := testUUID(2)
+	store := newStore(sequenceIDs(dependencyID, taskID))
+	mustCreate(t, store, validCreateInput("dependency"))
+	input := validCreateInput("original subject")
+	input.ActiveForm = "working on original"
+	input.BlockedBy = []string{dependencyID.String()}
+	input.Metadata = json.RawMessage(`{"owner":"original"}`)
+	mustCreate(t, store, input)
+
+	updated := mustUpdate(t, store, updateInput{
+		TaskID:  taskID.String(),
+		Subject: stringPointer("updated subject"),
+	})
+	if updated.Subject != "updated subject" {
+		t.Fatalf("updated Subject = %q, want %q", updated.Subject, "updated subject")
+	}
+	if updated.Description != "description" {
+		t.Fatalf("omitted Description = %q, want %q", updated.Description, "description")
+	}
+	if updated.ActiveForm != "working on original" {
+		t.Fatalf("omitted ActiveForm = %q, want %q", updated.ActiveForm, "working on original")
+	}
+	if updated.Status != StatusPending {
+		t.Fatalf("omitted Status = %q, want %q", updated.Status, StatusPending)
+	}
+	if want := []string{dependencyID.String()}; !reflect.DeepEqual(updated.BlockedBy, want) {
+		t.Fatalf("omitted BlockedBy = %#v, want %#v", updated.BlockedBy, want)
+	}
+	if string(updated.Metadata) != `{"owner":"original"}` {
+		t.Fatalf("omitted Metadata = %q, want original metadata", updated.Metadata)
+	}
+}
+
+func TestStoreMetadataUpdateReplacesExistingMetadata(t *testing.T) {
+	taskID := testUUID(1)
+	store := newStore(sequenceIDs(taskID))
+	input := validCreateInput("subject")
+	input.Metadata = json.RawMessage(`{"owner":"original"}`)
+	mustCreate(t, store, input)
+
+	updated := mustUpdate(t, store, updateInput{
+		TaskID:   taskID.String(),
+		Metadata: metadataPointer(`{"owner":"replacement","priority":2}`),
+	})
+	if got, want := string(updated.Metadata), `{"owner":"replacement","priority":2}`; got != want {
+		t.Fatalf("updated Metadata = %q, want %q", got, want)
+	}
+}
+
+func TestStoreMetadataEmptyObjectClearsMetadata(t *testing.T) {
+	taskID := testUUID(1)
+	store := newStore(sequenceIDs(taskID))
+	input := validCreateInput("subject")
+	input.Metadata = json.RawMessage(`{"owner":"original"}`)
+	mustCreate(t, store, input)
+
+	updated := mustUpdate(t, store, updateInput{
+		TaskID:   taskID.String(),
+		Metadata: metadataPointer(`{}`),
+	})
+	if updated.Metadata != nil {
+		t.Fatalf("empty metadata object produced %q, want nil", updated.Metadata)
+	}
+	again, err := store.get(taskID.String())
+	if err != nil {
+		t.Fatalf("store.get() error = %v", err)
+	}
+	if again.Metadata != nil {
+		t.Fatalf("stored empty metadata object = %q, want nil", again.Metadata)
+	}
+}
+
+func TestStoreUpdateRejectsUnknownStatusAndTaskIDAtomically(t *testing.T) {
+	taskID := testUUID(1)
+	store := newStore(sequenceIDs(taskID))
+	mustCreate(t, store, validCreateInput("subject"))
+	unknownStatus := Status("unknown")
+
+	tests := []struct {
+		name  string
+		input updateInput
+	}{
+		{
+			name:  "unknown status",
+			input: updateInput{TaskID: taskID.String(), Status: &unknownStatus},
+		},
+		{
+			name:  "unknown task ID",
+			input: updateInput{TaskID: testUUID(99).String(), Subject: stringPointer("changed")},
+		},
+		{
+			name:  "invalid task ID",
+			input: updateInput{TaskID: "not-a-uuid", Subject: stringPointer("changed")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := snapshotRecords(t, store)
+			if _, _, err := store.update(tt.input); err == nil {
+				t.Fatal("store.update() succeeded, want error")
+			}
+			assertRecordsUnchanged(t, store, before)
+		})
+	}
+}
+
+func TestStoreDependencyUpdateRejectsUnknownAndSelfDependencyAtomically(t *testing.T) {
+	taskID := testUUID(1)
+	store := newStore(sequenceIDs(taskID))
+	mustCreate(t, store, validCreateInput("subject"))
+
+	tests := []struct {
+		name string
+		deps []string
+	}{
+		{name: "unknown dependency", deps: []string{testUUID(99).String()}},
+		{name: "self dependency", deps: []string{taskID.String()}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := snapshotRecords(t, store)
+			if _, _, err := store.update(updateInput{TaskID: taskID.String(), AddBlockedBy: tt.deps}); err == nil {
+				t.Fatal("store.update() accepted an invalid dependency")
+			}
+			assertRecordsUnchanged(t, store, before)
+		})
+	}
+}
+
+func TestStoreCycleRejectsTwoNodeCycleAtomically(t *testing.T) {
+	firstID := testUUID(1)
+	secondID := testUUID(2)
+	store := newStore(sequenceIDs(firstID, secondID))
+	mustCreate(t, store, validCreateInput("first"))
+	mustCreate(t, store, validCreateInput("second"))
+	mustUpdate(t, store, updateInput{TaskID: firstID.String(), AddBlockedBy: []string{secondID.String()}})
+
+	before := snapshotRecords(t, store)
+	if _, _, err := store.update(updateInput{TaskID: secondID.String(), AddBlockedBy: []string{firstID.String()}}); err == nil {
+		t.Fatal("store.update() accepted a two-node dependency cycle")
+	}
+	assertRecordsUnchanged(t, store, before)
+}
+
+func TestStoreCycleRejectsThreeNodeCycleAtomically(t *testing.T) {
+	firstID := testUUID(1)
+	secondID := testUUID(2)
+	thirdID := testUUID(3)
+	store := newStore(sequenceIDs(firstID, secondID, thirdID))
+	mustCreate(t, store, validCreateInput("first"))
+	mustCreate(t, store, validCreateInput("second"))
+	mustCreate(t, store, validCreateInput("third"))
+	mustUpdate(t, store, updateInput{TaskID: firstID.String(), AddBlockedBy: []string{secondID.String()}})
+	mustUpdate(t, store, updateInput{TaskID: secondID.String(), AddBlockedBy: []string{thirdID.String()}})
+
+	before := snapshotRecords(t, store)
+	if _, _, err := store.update(updateInput{TaskID: thirdID.String(), AddBlockedBy: []string{firstID.String()}}); err == nil {
+		t.Fatal("store.update() accepted a three-node dependency cycle")
+	}
+	assertRecordsUnchanged(t, store, before)
+}
+
+func TestStoreDependencyUpdatesNormalizeDuplicatesAndRemovalWins(t *testing.T) {
+	firstID := testUUID(1)
+	secondID := testUUID(2)
+	taskID := testUUID(3)
+	store := newStore(sequenceIDs(firstID, secondID, taskID))
+	mustCreate(t, store, validCreateInput("first"))
+	mustCreate(t, store, validCreateInput("second"))
+	mustCreate(t, store, validCreateInput("target"))
+
+	updated := mustUpdate(t, store, updateInput{
+		TaskID:          taskID.String(),
+		AddBlockedBy:    []string{secondID.String(), firstID.String(), firstID.String(), secondID.String()},
+		RemoveBlockedBy: []string{firstID.String(), firstID.String()},
+	})
+	if want := []string{secondID.String()}; !reflect.DeepEqual(updated.BlockedBy, want) {
+		t.Fatalf("normalized BlockedBy = %#v, want %#v", updated.BlockedBy, want)
+	}
+
+	updated = mustUpdate(t, store, updateInput{
+		TaskID:          taskID.String(),
+		AddBlockedBy:    []string{firstID.String(), secondID.String(), secondID.String()},
+		RemoveBlockedBy: []string{secondID.String(), secondID.String()},
+	})
+	if want := []string{firstID.String()}; !reflect.DeepEqual(updated.BlockedBy, want) {
+		t.Fatalf("second normalized BlockedBy = %#v, want %#v", updated.BlockedBy, want)
+	}
+}
+
+func TestStoreBlockedTaskCannotTransitionToInProgress(t *testing.T) {
+	blockerID := testUUID(1)
+	taskID := testUUID(2)
+	store := newStore(sequenceIDs(blockerID, taskID))
+	mustCreate(t, store, validCreateInput("blocker"))
+	input := validCreateInput("blocked")
+	input.BlockedBy = []string{blockerID.String()}
+	mustCreate(t, store, input)
+
+	before := snapshotRecords(t, store)
+	if _, _, err := store.update(updateInput{TaskID: taskID.String(), Status: statusPointer(StatusInProgress)}); err == nil {
+		t.Fatal("store.update() transitioned a blocked task to in_progress")
+	}
+	assertRecordsUnchanged(t, store, before)
+}
+
+func TestStoreInProgressTaskCannotAcquireIncompleteBlocker(t *testing.T) {
+	taskID := testUUID(1)
+	blockerID := testUUID(2)
+	store := newStore(sequenceIDs(taskID, blockerID))
+	mustCreate(t, store, validCreateInput("target"))
+	mustUpdate(t, store, updateInput{TaskID: taskID.String(), Status: statusPointer(StatusInProgress)})
+	mustCreate(t, store, validCreateInput("incomplete blocker"))
+
+	before := snapshotRecords(t, store)
+	if _, _, err := store.update(updateInput{TaskID: taskID.String(), AddBlockedBy: []string{blockerID.String()}}); err == nil {
+		t.Fatal("store.update() added an incomplete blocker to an in_progress task")
+	}
+	assertRecordsUnchanged(t, store, before)
+}
+
+func TestStoreCompletedBlockerPermitsLaterTransitionWithoutAutoStartingDependents(t *testing.T) {
+	blockerID := testUUID(1)
+	firstDependentID := testUUID(2)
+	secondDependentID := testUUID(3)
+	store := newStore(sequenceIDs(blockerID, firstDependentID, secondDependentID))
+	mustCreate(t, store, validCreateInput("blocker"))
+	firstInput := validCreateInput("first dependent")
+	firstInput.BlockedBy = []string{blockerID.String()}
+	mustCreate(t, store, firstInput)
+	secondInput := validCreateInput("second dependent")
+	secondInput.BlockedBy = []string{blockerID.String()}
+	mustCreate(t, store, secondInput)
+
+	mustUpdate(t, store, updateInput{TaskID: blockerID.String(), Status: statusPointer(StatusCompleted)})
+	first, err := store.get(firstDependentID.String())
+	if err != nil {
+		t.Fatalf("store.get(first dependent) error = %v", err)
+	}
+	second, err := store.get(secondDependentID.String())
+	if err != nil {
+		t.Fatalf("store.get(second dependent) error = %v", err)
+	}
+	if first.Status != StatusPending || second.Status != StatusPending {
+		t.Fatalf("completing blocker auto-started dependents: first=%q second=%q", first.Status, second.Status)
+	}
+
+	updated := mustUpdate(t, store, updateInput{TaskID: firstDependentID.String(), Status: statusPointer(StatusInProgress)})
+	if updated.Status != StatusInProgress {
+		t.Fatalf("dependent Status = %q, want %q", updated.Status, StatusInProgress)
+	}
+	second, err = store.get(secondDependentID.String())
+	if err != nil {
+		t.Fatalf("store.get(second dependent after transition) error = %v", err)
+	}
+	if second.Status != StatusPending {
+		t.Fatalf("transitioning one dependent auto-started another: %q", second.Status)
+	}
+}
+
+func TestStoreDeleteRemovesTaskAndInboundReferences(t *testing.T) {
+	victimID := testUUID(1)
+	firstDependentID := testUUID(2)
+	secondDependentID := testUUID(3)
+	store := newStore(sequenceIDs(victimID, firstDependentID, secondDependentID))
+	mustCreate(t, store, validCreateInput("victim"))
+	firstInput := validCreateInput("first dependent")
+	firstInput.BlockedBy = []string{victimID.String()}
+	mustCreate(t, store, firstInput)
+	secondInput := validCreateInput("second dependent")
+	secondInput.BlockedBy = []string{victimID.String()}
+	mustCreate(t, store, secondInput)
+
+	deleted, wasDeleted, err := store.update(updateInput{TaskID: victimID.String(), Status: statusPointer(StatusCommandDeleted)})
+	if err != nil {
+		t.Fatalf("store.update(delete) error = %v", err)
+	}
+	if !wasDeleted {
+		t.Fatal("store.update(delete) deleted = false, want true")
+	}
+	if !reflect.DeepEqual(deleted, Task{}) {
+		t.Fatalf("deleted task response = %#v, want zero Task", deleted)
+	}
+	if _, err := store.get(victimID.String()); err == nil {
+		t.Fatal("deleted task remained in store")
+	}
+	for _, id := range []string{firstDependentID.String(), secondDependentID.String()} {
+		remaining, err := store.get(id)
+		if err != nil {
+			t.Fatalf("store.get(%s) error = %v", id, err)
+		}
+		if len(remaining.BlockedBy) != 0 {
+			t.Fatalf("inbound reference to deleted task remained on %s: %#v", id, remaining.BlockedBy)
+		}
+	}
+}
+
+func TestStoreUpdateFieldLimitsRejectAtomically(t *testing.T) {
+	taskID := testUUID(1)
+	store := newStore(sequenceIDs(taskID))
+	input := validCreateInput("original")
+	input.ActiveForm = "original active form"
+	input.Metadata = json.RawMessage(`{"owner":"original"}`)
+	mustCreate(t, store, input)
+
+	tests := []struct {
+		name  string
+		input updateInput
+	}{
+		{
+			name:  "subject",
+			input: updateInput{TaskID: taskID.String(), Subject: stringPointer(strings.Repeat("s", maxSubjectBytes+1))},
+		},
+		{
+			name:  "description",
+			input: updateInput{TaskID: taskID.String(), Description: stringPointer(strings.Repeat("d", maxDescriptionBytes+1))},
+		},
+		{
+			name:  "active form",
+			input: updateInput{TaskID: taskID.String(), ActiveForm: stringPointer(strings.Repeat("a", maxActiveFormBytes+1))},
+		},
+		{
+			name:  "metadata",
+			input: updateInput{TaskID: taskID.String(), Metadata: metadataPointer(strings.Repeat("m", maxMetadataBytes+1))},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := snapshotRecords(t, store)
+			if _, _, err := store.update(tt.input); err == nil {
+				t.Fatal("store.update() accepted an oversized field")
+			}
+			assertRecordsUnchanged(t, store, before)
+		})
+	}
+}
+
+func TestStoreDependencyLimitUpdateRejectsAtomically(t *testing.T) {
+	ids := idsFor(maxDependencies + 2)
+	store := newStore(sequenceIDs(ids...))
+	for i := 0; i < maxDependencies+1; i++ {
+		mustCreate(t, store, validCreateInput("dependency"))
+	}
+	taskID := ids[maxDependencies+1]
+	mustCreate(t, store, validCreateInput("target"))
+
+	dependencies := make([]string, maxDependencies+1)
+	for i := range dependencies {
+		dependencies[i] = ids[i].String()
+	}
+	before := snapshotRecords(t, store)
+	if _, _, err := store.update(updateInput{TaskID: taskID.String(), AddBlockedBy: dependencies}); err == nil {
+		t.Fatal("store.update() accepted too many dependencies")
+	}
+	assertRecordsUnchanged(t, store, before)
+}
+
+func TestStoreAggregateLimitUpdateRejectsAtomically(t *testing.T) {
+	ids := idsFor(127)
+	store := newStore(sequenceIDs(ids...))
+	for range ids {
+		input := createInput{
+			Subject:     "s",
+			Description: strings.Repeat("d", maxDescriptionBytes),
+		}
+		mustCreate(t, store, input)
+	}
+
+	before := snapshotRecords(t, store)
+	if _, _, err := store.update(updateInput{
+		TaskID:   ids[0].String(),
+		Metadata: metadataPointer(strings.Repeat("m", maxMetadataBytes)),
+	}); err == nil {
+		t.Fatal("store.update() exceeded maxStoreBytes")
+	}
+	assertRecordsUnchanged(t, store, before)
+}
