@@ -130,8 +130,8 @@ func (a *AskUser) InvokableRun(ctx context.Context, argsJSON string) (*tool.Tool
 
 // parseAskUserArgs decodes + validates the args. On a non-object document or an
 // empty question it returns a non-empty tool-result error string (the package
-// norm: see readfile.go/glob.go/todo.go, which build arg-validation failures
-// inline rather than via a typed error); otherwise the returned string is empty.
+// norm: see readfile.go/glob.go, which build arg-validation failures inline
+// rather than via a typed error); otherwise the returned string is empty.
 func parseAskUserArgs(argsJSON string) (askUserArgs, string) {
 	var args askUserArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
