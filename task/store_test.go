@@ -108,6 +108,16 @@ func TestStoreIDSourceFailureLeavesGraphUnchanged(t *testing.T) {
 	assertRecordsUnchanged(t, store, before)
 }
 
+func TestStoreZeroIDLeavesGraphUnchanged(t *testing.T) {
+	store := newStore(sequenceIDs(uuid.UUID{}))
+	before := snapshotRecords(t, store)
+
+	if _, err := store.create(validCreateInput("zero ID")); err == nil {
+		t.Fatal("store.create() accepted a zero UUID")
+	}
+	assertRecordsUnchanged(t, store, before)
+}
+
 func TestStoreIDCollisionLeavesGraphUnchanged(t *testing.T) {
 	id := testUUID(1)
 	store := newStore(sequenceIDs(id, id))

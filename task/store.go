@@ -98,6 +98,9 @@ func (s *store) create(input createInput, requestBytes ...int) (Task, error) {
 	if err != nil {
 		return Task{}, fmt.Errorf("generate task ID: %w", err)
 	}
+	if id.IsZero() {
+		return Task{}, errors.New("task ID source returned zero UUID")
+	}
 	idString := id.String()
 	if _, exists := s.tasks[idString]; exists {
 		return Task{}, fmt.Errorf("task ID collision: %s", idString)
