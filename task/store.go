@@ -12,6 +12,8 @@ import (
 )
 
 const (
+	// maxTaskArgsBytes is enforced by Task 4 PrepareCall before raw JSON decode.
+	// The storage layer accepts typed input and does not estimate request bytes.
 	maxTaskArgsBytes    = 64 << 10
 	maxTasksPerLoop     = 256
 	maxSubjectBytes     = 512
@@ -48,23 +50,12 @@ func newStore(source idSource) *store {
 	}
 }
 
-func (s *store) create(input createInput, requestBytes ...int) (Task, error) {
+func (s *store) create(input createInput) (Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(s.tasks) >= maxTasksPerLoop {
 		return Task{}, errors.New("task store limit exceeded: too many tasks")
-	}
-
-	argsBytes := createInputBytes(input)
-	if len(requestBytes) > 1 {
-		return Task{}, errors.New("task create accepts at most one request-size value")
-	}
-	if len(requestBytes) == 1 {
-		argsBytes = requestBytes[0]
-	}
-	if argsBytes < 0 || argsBytes > maxTaskArgsBytes {
-		return Task{}, errors.New("task create request exceeds the argument limit")
 	}
 
 	dependencies, err := s.normalizeDependencies(input.BlockedBy)
@@ -180,14 +171,6 @@ func (s *store) normalizeDependencies(dependencies []string) ([]string, error) {
 	}
 	sort.Strings(normalized)
 	return normalized, nil
-}
-
-func createInputBytes(input createInput) int {
-	total := len(input.Subject) + len(input.Description) + len(input.ActiveForm) + len(input.Metadata)
-	for _, dependency := range input.BlockedBy {
-		total += len(dependency)
-	}
-	return total
 }
 
 func storeRecordBytes(records map[string]taskRecord) int {

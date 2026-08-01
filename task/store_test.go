@@ -12,6 +12,8 @@ import (
 
 var errSequenceExhausted = errors.New("test id sequence exhausted")
 
+var _ func(*store, createInput) (Task, error) = (*store).create
+
 func sequenceIDs(ids ...uuid.UUID) idSource {
 	index := 0
 	return func() (uuid.UUID, error) {
@@ -311,16 +313,6 @@ func TestStoreLimitsCountAndFieldBytesRejectAtomically(t *testing.T) {
 			assertRecordsUnchanged(t, store, before)
 		})
 	}
-}
-
-func TestStoreLimitsRequestArgumentBytesRejectAtomically(t *testing.T) {
-	store := newStore(sequenceIDs(testUUID(1)))
-	before := snapshotRecords(t, store)
-
-	if _, err := store.create(validCreateInput("subject"), maxTaskArgsBytes+1); err == nil {
-		t.Fatal("store.create() accepted an oversized request argument")
-	}
-	assertRecordsUnchanged(t, store, before)
 }
 
 func TestStoreLimitsDependencyCountRejectsAtomically(t *testing.T) {
