@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
+	"strings"
 
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -43,6 +45,14 @@ func decodeObject(raw string, target any) (objectFields, error) {
 	}
 
 	if target != nil {
+		if allowed, ok := exactJSONFieldNames(target); ok {
+			for key := range fields {
+				if _, known := allowed[key]; !known {
+					return nil, &prepareError{}
+				}
+			}
+		}
+
 		decoder := json.NewDecoder(bytes.NewReader([]byte(raw)))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(target); err != nil {
@@ -53,6 +63,62 @@ func decodeObject(raw string, target any) (objectFields, error) {
 		}
 	}
 	return fields, nil
+}
+
+// exactJSONFieldNames returns the top-level names encoding/json should accept
+// for a struct target, using the declared JSON tag spelling rather than the
+// decoder's case-insensitive matching. Embedded tagged structs are flattened
+// just as encoding/json flattens them. Non-struct targets are left to the
+// decoder because maps and custom scalar targets do not have a struct allowlist.
+func exactJSONFieldNames(target any) (map[string]struct{}, bool) {
+	typ := reflect.TypeOf(target)
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if typ.Kind() != reflect.Struct {
+		return nil, false
+	}
+
+	names := make(map[string]struct{})
+	collectJSONFieldNames(typ, names, make(map[reflect.Type]bool))
+	return names, true
+}
+
+func collectJSONFieldNames(typ reflect.Type, names map[string]struct{}, visiting map[reflect.Type]bool) {
+	if visiting[typ] {
+		return
+	}
+	visiting[typ] = true
+	defer delete(visiting, typ)
+
+	for index := 0; index < typ.NumField(); index++ {
+		field := typ.Field(index)
+		tag, tagged := field.Tag.Lookup("json")
+		if tagged && tag == "-" {
+			continue
+		}
+		if field.PkgPath != "" && !field.Anonymous {
+			continue
+		}
+
+		name := strings.Split(tag, ",")[0]
+		if field.Anonymous && name == "" {
+			nested := field.Type
+			for nested.Kind() == reflect.Pointer {
+				nested = nested.Elem()
+			}
+			if nested.Kind() == reflect.Struct {
+				collectJSONFieldNames(nested, names, visiting)
+				continue
+			}
+		}
+		if name == "" {
+			name = field.Name
+		}
+		if name != "" {
+			names[name] = struct{}{}
+		}
+	}
 }
 
 // scanObject validates a single JSON object and captures its top-level raw

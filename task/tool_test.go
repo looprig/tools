@@ -50,6 +50,7 @@ func TestDecodeRejectsMalformedTrailingNonObjectAndUnknownJSON(t *testing.T) {
 		{name: "scalar string", raw: `"subject"`},
 		{name: "scalar number", raw: `0`},
 		{name: "unknown field", raw: `{"subject":"ok","extra":true}`},
+		{name: "case variant field", raw: `{"Subject":"x"}`},
 	}
 
 	for _, tt := range tests {
