@@ -2,23 +2,79 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add `TaskCreate`, `TaskUpdate`, `TaskGet`, and `TaskList` as a Claude-compatible tool bundle backed by one bounded, loop-scoped in-memory task graph.
+**Goal:** Replace Todo with `TaskCreate`, `TaskUpdate`, `TaskGet`, and `TaskList`, giving every parent and subagent Loop its own bounded in-memory task graph.
 
-**Architecture:** A new `task` package owns an unexported mutex-protected store and four sequential concrete tools. Each tool strictly prepares a typed artifact and executes only that artifact. `tools.TaskDefinitions()` returns one deliberate `tool.NewBundleDefinition` exception whose per-binding factory creates a fresh bounded store and all four tools over it; the harness and Loop domain remain unchanged.
+**Architecture:** A new `task` package owns an unexported mutex-protected store and four sequential concrete tools. `tools.TaskDefinitions()` returns one `tool.NewBundleDefinition` whose per-binding factory creates a fresh store. Todo is deleted without a compatibility shim; CodeRig selects Tasks for primary and delegated Loops, while the Harness-owned Subagent control tool remains unchanged.
 
-**Tech Stack:** Go 1.26, `encoding/json`, `sync.Mutex`, Looprig `tool.Definition`, `tool.InvokableTool`, `tool.CallPreparer`, `tool.Sequential`, and `core/uuid`.
+**Tech Stack:** Go 1.26, `encoding/json`, `sync.Mutex`, Looprig `tool.Definition`, `tool.InvokableTool`, `tool.CallPreparer`, `tool.Sequential`, `core/uuid`, and existing Harness managed delegation.
 
 ---
 
-### Task 1: Define the stored record, response model, and cloning rules
+### Task 0: Synchronize the tools module baseline
+
+**Files:**
+- Modify: `go.mod`
+- Modify: `go.sum`
+
+**Step 1: Record the current failure**
+
+Run:
+
+```bash
+GOWORK=off go test -race ./...
+```
+
+Expected: FAIL before package compilation with `updates to go.mod needed`.
+
+**Step 2: Inspect the non-mutating module delta**
+
+Run:
+
+```bash
+GOWORK=off go mod tidy -diff
+```
+
+Expected: a diff aligning the module with the current sibling Harness/Core graph.
+Review it for unexpected new direct dependencies before proceeding.
+
+**Step 3: Synchronize the manifest**
+
+Run:
+
+```bash
+GOWORK=off go mod tidy
+```
+
+Do not add a new external production dependency for Task tools. The implementation
+uses only stdlib plus existing Looprig modules.
+
+**Step 4: Verify the clean baseline**
+
+Run:
+
+```bash
+GOWORK=off go test -race ./...
+GOWORK=off go mod verify
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add go.mod go.sum
+git commit -m "chore: synchronize tools module baseline"
+```
+
+### Task 1: Define task values and defensive cloning
 
 **Files:**
 - Create: `task/model.go`
 - Create: `task/model_test.go`
 
-**Step 1: Write the failing model tests**
+**Step 1: Write failing model tests**
 
-Add table tests that pin:
+Add table coverage for:
 
 ```go
 func TestStatusValid(t *testing.T) {
@@ -36,28 +92,26 @@ func TestStatusValid(t *testing.T) {
 }
 ```
 
-Add:
+Also prove:
 
-- `TestCloneRecordDeepCopiesDependenciesAndMetadata`, using canonical
-  `json.RawMessage` metadata and proving that mutating cloned bytes and slices
-  does not affect the source;
-- `TestTaskFromRecordDerivesOutputOnlyFields`, proving `Blocks` appears only in
-  the response view and cannot be persisted.
+- `cloneRecord` deep-copies dependency and metadata backing storage;
+- `taskFromRecord` derives `Blocks` without persisting it;
+- returned `Task` slices and metadata can be mutated without changing the record;
+- nil metadata is omitted while canonical non-empty metadata is retained.
 
-**Step 2: Run the tests to verify they fail**
+**Step 2: Run the focused test and observe RED**
 
-Run: `GOWORK=off go test -race ./task`
+```bash
+GOWORK=off go test -race ./task -run 'Test(Status|Clone|TaskFromRecord)'
+```
 
-Expected: FAIL because package `task`, `Status`, `Task`, and `cloneRecord` do not
-exist.
+Expected: FAIL because package `task` and its types do not exist.
 
-**Step 3: Implement the minimal model**
+**Step 3: Implement the model**
 
-Create:
+Add the approved types:
 
 ```go
-package task
-
 type Status string
 
 const (
@@ -89,12 +143,13 @@ type Task struct {
 ```
 
 Implement `Status.valid`, `cloneRecord`, and `taskFromRecord`. Clone metadata
-with `append(json.RawMessage(nil), source...)`. `Blocks` exists only on the
-response model.
+with owned bytes and copy every slice.
 
-**Step 4: Run the tests to verify they pass**
+**Step 4: Run GREEN**
 
-Run: `GOWORK=off go test -race ./task`
+```bash
+GOWORK=off go test -race ./task -run 'Test(Status|Clone|TaskFromRecord)'
+```
 
 Expected: PASS.
 
@@ -105,7 +160,7 @@ git add task/model.go task/model_test.go
 git commit -m "feat(task): define task value model"
 ```
 
-### Task 2: Build the loop-local store and basic create/read/list behavior
+### Task 2: Add bounded create, get, and list storage
 
 **Files:**
 - Create: `task/store.go`
@@ -116,16 +171,18 @@ git commit -m "feat(task): define task value model"
 Cover:
 
 - create defaults status to `pending`;
-- create generates a non-empty UUID;
-- blank subject and description are rejected;
-- get rejects an unknown ID;
-- list returns tasks in deterministic ID order;
-- get/list return defensive copies;
-- `Blocks` is derived from other tasks' `BlockedBy` values;
-- task count, subject, description, active-form, metadata, dependency-count, and
-  aggregate-store limits reject the candidate without mutation.
+- non-empty UUID generation;
+- UUID-source failure and generated-ID collision reject without mutation;
+- empty and whitespace-only subject/description rejection;
+- unknown dependencies during create;
+- unknown get ID;
+- deterministic UUID ordering;
+- defensive get/list snapshots;
+- derived `Blocks` from other records' `BlockedBy` lists;
+- count, field, metadata, dependency, and aggregate limits;
+- every rejected create leaves the graph unchanged.
 
-Use a deterministic ID seam:
+Use a deterministic seam:
 
 ```go
 type idSource func() (uuid.UUID, error)
@@ -133,59 +190,47 @@ type idSource func() (uuid.UUID, error)
 store := newStore(sequenceIDs(idA, idB))
 ```
 
-Keep the production default wired to `uuid.New`.
+**Step 2: Run RED**
 
-**Step 2: Run the tests to verify they fail**
+```bash
+GOWORK=off go test -race ./task -run 'TestStore(Create|Get|List|DerivedBlocks|Limits|ID)'
+```
 
-Run: `GOWORK=off go test -race ./task -run 'TestStore(Create|Get|List|DerivedBlocks|Limits)'`
+Expected: FAIL because the store does not exist.
 
-Expected: FAIL because `store`, `newStore`, and its operations do not exist.
-
-**Step 3: Implement the store**
+**Step 3: Implement bounded storage**
 
 Add:
 
 ```go
+const (
+	maxTaskArgsBytes    = 64 << 10
+	maxTasksPerLoop     = 256
+	maxSubjectBytes     = 512
+	maxDescriptionBytes = 16 << 10
+	maxActiveFormBytes  = 512
+	maxMetadataBytes    = 16 << 10
+	maxDependencies     = 128
+	maxStoreBytes       = 2 << 20
+)
+
 type store struct {
 	mu    sync.Mutex
 	newID idSource
 	tasks map[string]taskRecord
 }
-
-type createInput struct {
-	Subject     string
-	Description string
-	ActiveForm  string
-	BlockedBy   []string
-	Metadata    json.RawMessage
-}
 ```
 
-Define the exact private V1 bounds:
+Implement `create`, `get`, `list`, dependency normalization, candidate cloning,
+aggregate-size calculation, and candidate-graph validation. Hold the mutex
+through live-state validation, candidate construction, commit, and snapshotting.
+Reject ID collisions instead of retrying.
 
-```go
-const (
-	maxTaskArgsBytes     = 64 << 10
-	maxTasksPerLoop      = 256
-	maxSubjectBytes      = 512
-	maxDescriptionBytes = 16 << 10
-	maxActiveFormBytes   = 512
-	maxMetadataBytes     = 16 << 10
-	maxDependencies      = 128
-	maxStoreBytes        = 2 << 20
-)
+**Step 4: Run GREEN**
+
+```bash
+GOWORK=off go test -race ./task -run 'TestStore(Create|Get|List|DerivedBlocks|Limits|ID)'
 ```
-
-Implement `create`, `get`, and `list`. Hold the graph mutex through validation,
-mutation, derived-block calculation, and snapshot cloning.
-
-Normalize dependency slices by removing duplicates and sorting IDs.
-`validateCandidateGraph` must check the aggregate byte count before assigning
-the candidate map to `store.tasks`.
-
-**Step 4: Run the tests to verify they pass**
-
-Run: `GOWORK=off go test -race ./task -run 'TestStore(Create|Get|List|DerivedBlocks|Limits)'`
 
 Expected: PASS.
 
@@ -193,34 +238,33 @@ Expected: PASS.
 
 ```bash
 git add task/store.go task/store_test.go
-git commit -m "feat(task): add in-memory task store"
+git commit -m "feat(task): add bounded task storage"
 ```
 
-### Task 3: Add dependency validation and atomic updates
+### Task 3: Add atomic updates and graph invariants
 
 **Files:**
 - Modify: `task/store.go`
 - Modify: `task/store_test.go`
 
-**Step 1: Write failing dependency and update tests**
+**Step 1: Write failing update tests**
 
-Add focused tests for:
+Cover:
 
-- scalar patch fields leave omitted fields unchanged;
-- metadata replacement is deep-copied;
-- unknown status is rejected;
-- unknown dependency is rejected;
-- self-dependency is rejected;
-- a two-node and a three-node cycle are rejected;
-- rejected updates leave the graph unchanged;
-- a blocked task cannot become `in_progress`;
-- completing its last blocker makes it eligible but leaves it `pending`;
-- dependency additions/removals are normalized;
-- deleting a task removes it and cleans references from remaining tasks;
-- an update exceeding a field, dependency, or aggregate-store bound is
-  rejected atomically.
+- omitted scalar and metadata fields remain unchanged;
+- supplied metadata replaces existing metadata;
+- `{}` clears metadata to nil/absent;
+- unknown status and unknown task IDs;
+- unknown dependency, self-dependency, two-node cycle, and three-node cycle;
+- duplicate additions/removals are normalized;
+- removal wins when one ID appears in both add and remove lists;
+- a blocked task cannot transition to `in_progress`;
+- an `in_progress` task cannot acquire an incomplete blocker;
+- completed blockers permit a later transition without auto-starting dependents;
+- deletion removes the task and all inbound references;
+- every field/dependency/aggregate rejection is atomic.
 
-Pin deletion as a command, not a persisted status:
+Pin deletion as a command:
 
 ```go
 updated, deleted, err := store.update(updateInput{
@@ -229,41 +273,26 @@ updated, deleted, err := store.update(updateInput{
 })
 ```
 
-**Step 2: Run the tests to verify they fail**
+**Step 2: Run RED**
 
-Run: `GOWORK=off go test -race ./task -run 'TestStore(Update|Dependency|Cycle|Blocked|Delete|Limits)'`
-
-Expected: FAIL because update behavior is missing.
-
-**Step 3: Implement atomic update behavior**
-
-Add:
-
-```go
-const StatusCommandDeleted Status = "deleted"
-
-type updateInput struct {
-	TaskID          string
-	Subject         *string
-	Description     *string
-	ActiveForm      *string
-	Status          *Status
-	AddBlockedBy    []string
-	RemoveBlockedBy []string
-	Metadata        *json.RawMessage
-}
+```bash
+GOWORK=off go test -race ./task -run 'TestStore(Update|Dependency|Cycle|Blocked|Delete|Metadata)'
 ```
 
-Build a candidate graph while holding the mutex. Validate referenced IDs,
-self-dependencies, cycles with a bounded DFS over `BlockedBy`, and all resource
-limits. Commit the candidate only after every check passes.
+Expected: FAIL because update behavior is absent.
 
-For deletion, remove the target task and its ID from every remaining
-`BlockedBy` slice before committing.
+**Step 3: Implement candidate-graph updates**
 
-**Step 4: Run the tests to verify they pass**
+Add `StatusCommandDeleted`, pointer-based `updateInput`, candidate-map cloning,
+bounded DFS cycle detection, deletion cleanup, and the active-task invariant.
+Apply additions first and removals second so removal wins. Commit only after all
+candidate validation succeeds.
 
-Run: `GOWORK=off go test -race ./task -run 'TestStore(Update|Dependency|Cycle|Blocked|Delete|Limits)'`
+**Step 4: Run GREEN**
+
+```bash
+GOWORK=off go test -race ./task -run 'TestStore(Update|Dependency|Cycle|Blocked|Delete|Metadata)'
+```
 
 Expected: PASS.
 
@@ -271,10 +300,10 @@ Expected: PASS.
 
 ```bash
 git add task/store.go task/store_test.go
-git commit -m "feat(task): add task updates and dependencies"
+git commit -m "feat(task): enforce atomic task graph updates"
 ```
 
-### Task 4: Add strict decoding, metadata, result, and audit helpers
+### Task 4: Add strict preparation and result helpers
 
 **Files:**
 - Create: `task/tool.go`
@@ -282,48 +311,33 @@ git commit -m "feat(task): add task updates and dependencies"
 
 **Step 1: Write failing helper tests**
 
-Test that:
+Test:
 
-- decoding rejects malformed JSON, trailing JSON, and unknown fields;
-- metadata preparation accepts only objects, canonicalizes them, distinguishes
-  omission from `{}`, rejects `null`, and enforces `maxMetadataBytes`;
-- JSON results contain exactly one text block holding valid JSON;
-- model-safe preparation errors have a stable concrete type;
-- audit summaries contain only the tool name and never model-supplied task text.
+- oversized raw documents fail before decode;
+- malformed, trailing, null, array, scalar, and unknown-field JSON fails;
+- duplicate top-level object members fail closed;
+- required-field presence is distinguishable from zero values;
+- metadata accepts only one object, canonicalizes keys, owns its bytes, and
+  rejects malformed/oversized/non-object values;
+- omitted metadata remains nil and `{}` becomes the clear sentinel;
+- `jsonResult` returns exactly one text block containing valid JSON;
+- preparation errors have a stable private concrete type and model-safe text;
+- audit summaries are exactly the concrete tool name.
 
-**Step 2: Run the tests to verify they fail**
+**Step 2: Run RED**
 
-Run: `GOWORK=off go test -race ./task -run 'Test(Decode|Metadata|JSONResult|PrepareError|Audit)'`
-
-Expected: FAIL because the helpers do not exist.
-
-**Step 3: Implement minimal helpers**
-
-Implement a generic strict-object decoder that first rejects argument documents
-above `maxTaskArgsBytes`, then uses `json.Decoder.DisallowUnknownFields`, rejects
-top-level `null`, arrays, and scalars, and requires EOF after the one decoded
-object. Add a `jsonResult` helper that marshals a value and returns
-`tool.TextResult(string(encoded))`.
-
-Add `canonicalMetadata(json.RawMessage) (json.RawMessage, error)`. It must enforce
-`maxMetadataBytes` before and after decoding, reject explicit `null` and
-non-object JSON, decode exactly one value, re-encode the object, and return owned
-bytes. Absence remains nil; an explicit `{}` remains a present empty object.
-
-Add a private model-safe typed preparation error:
-
-```go
-type prepareError struct {
-	toolName string
-	reason   string
-}
-
-func (e *prepareError) Error() string {
-	return e.toolName + ": " + e.reason
-}
+```bash
+GOWORK=off go test -race ./task -run 'Test(Decode|Metadata|JSONResult|PrepareError|Audit)'
 ```
 
-Create a small embedded metadata base:
+Expected: FAIL because helpers do not exist.
+
+**Step 3: Implement the helpers**
+
+Implement a strict object decoder using `json.Decoder`,
+`DisallowUnknownFields`, explicit top-level/object checks, duplicate-member
+detection, and an EOF check. Add `canonicalMetadata`, the explicit-empty-object
+clear signal, `jsonResult`, `prepareError`, and:
 
 ```go
 type toolBase struct {
@@ -334,13 +348,14 @@ type toolBase struct {
 func (b toolBase) AuditSummary(string) string { return b.name }
 ```
 
-Do not implement `PrepareCall` on `toolBase`: each concrete tool must own its
-argument type and typed prepared artifact. Each concrete tool still implements
-its own `Info` so its exact schema remains obvious and testable.
+Do not put `PrepareCall` or `Info` on `toolBase`; concrete tools own their
+schemas and artifact types.
 
-**Step 4: Run the tests to verify they pass**
+**Step 4: Run GREEN**
 
-Run: `GOWORK=off go test -race ./task -run 'Test(Decode|Metadata|JSONResult|PrepareError|Audit)'`
+```bash
+GOWORK=off go test -race ./task -run 'Test(Decode|Metadata|JSONResult|PrepareError|Audit)'
+```
 
 Expected: PASS.
 
@@ -348,7 +363,7 @@ Expected: PASS.
 
 ```bash
 git add task/tool.go task/tool_test.go
-git commit -m "feat(task): add strict task tool helpers"
+git commit -m "feat(task): add strict task preparation helpers"
 ```
 
 ### Task 5: Implement TaskCreate and TaskGet
@@ -359,45 +374,26 @@ git commit -m "feat(task): add strict task tool helpers"
 - Create: `task/get.go`
 - Create: `task/get_test.go`
 
-**Step 1: Write failing preparation, execution, and schema tests**
+**Step 1: Write failing contract tests**
 
-For both tools, assert:
+Pin the exact descriptions and schemas from the approved design. Test required
+fields, `additionalProperties: false`, all preparation failures, canonical UUIDs,
+dependency normalization, non-nil typed artifacts, pure requests, changed raw
+argument immunity, structured success, unknown-ID error results, and missing,
+nil, or cross-tool artifacts.
 
-- exact tool name and description;
-- schema has `type: object` and `additionalProperties: false`;
-- required fields are exact;
-- malformed, trailing, unknown, missing, wrong-type, invalid-UUID, and oversized
-  inputs return `*prepareError` from `PrepareCall` and never reach execution;
-- `PrepareCall` returns a pure request with the concrete tool name and a non-nil
-  artifact of the tool's private type;
-- execution without a prepared call, with a nil artifact, or with the other
-  tool's artifact fails closed as model-visible error text;
-- execution ignores a different raw argument string after preparation;
-- both tools satisfy `tool.Sequential` and return `true`;
-- successful output is structured JSON.
+**Step 2: Run RED**
 
-Pin these input shapes:
-
-```json
-{"subject":"S","description":"D","activeForm":"Doing S","blockedBy":[],"metadata":{}}
+```bash
+GOWORK=off go test -race ./task -run 'TestTask(Create|Get)'
 ```
-
-```json
-{"taskId":"uuid"}
-```
-
-**Step 2: Run the tests to verify they fail**
-
-Run: `GOWORK=off go test -race ./task -run 'TestTask(Create|Get)'`
 
 Expected: FAIL because the concrete tools do not exist.
 
-**Step 3: Implement TaskCreate and TaskGet**
+**Step 3: Implement both tools**
 
-Each tool holds `*store`, embeds `toolBase`, and implements `Info`,
-`PrepareCall`, `InvokableRun`, and `Sequential`.
-
-Use presence-aware decoded argument structs and private prepared artifacts:
+Each tool embeds `toolBase`, holds `*store`, and implements `Info`,
+`PrepareCall`, `InvokableRun`, and `Sequential`. Use private typed artifacts:
 
 ```go
 type taskCreateArtifact struct {
@@ -411,34 +407,15 @@ type taskGetArtifact struct {
 }
 ```
 
-`PrepareCall` strictly decodes and validates the arguments, canonicalizes
-metadata and dependencies, and returns `tool.Request{ToolName: concreteName}`
-plus the artifact. `InvokableRun` ignores its raw string argument and retrieves
-the expected artifact with `prepared.FromContext`. Store-dependent failures
-remain model-visible tool-result strings.
+Retrieve artifacts with `internal/prepared.FromContext`. Return
+`{"task":{...}}` on success and model-visible `error:` results for live-state
+failures. Implement `Sequential() bool { return true }`.
 
-Each tool satisfies:
+**Step 4: Run GREEN**
 
-```go
-var (
-	_ tool.InvokableTool = (*TaskCreate)(nil)
-	_ tool.CallPreparer  = (*TaskCreate)(nil)
-	_ tool.Auditable     = (*TaskCreate)(nil)
-	_ tool.Sequential    = (*TaskCreate)(nil)
-)
+```bash
+GOWORK=off go test -race ./task -run 'TestTask(Create|Get)'
 ```
-
-Implement `Sequential() bool { return true }` for both tools.
-
-Return successful create/get results as:
-
-```json
-{"task":{...complete task...}}
-```
-
-**Step 4: Run the tests to verify they pass**
-
-Run: `GOWORK=off go test -race ./task -run 'TestTask(Create|Get)'`
 
 Expected: PASS.
 
@@ -457,64 +434,40 @@ git commit -m "feat(task): add create and get tools"
 - Create: `task/update.go`
 - Create: `task/update_test.go`
 
-**Step 1: Write failing tool tests**
+**Step 1: Write failing contract tests**
 
-Pin:
+Pin exact design schemas and descriptions. Test:
 
-- `TaskList` prepares only a non-null empty object, returns a typed non-nil
-  artifact, and returns `{"tasks":[]}` when empty;
-- list output is deterministic and includes derived `blocks`;
-- `TaskUpdate` rejects malformed, trailing, unknown, missing, wrong-type,
-  invalid-UUID, invalid-status, invalid-metadata, and oversized input during
-  preparation;
-- both tools fail closed without their own prepared artifact and ignore changed
-  raw arguments after preparation;
-- both tools satisfy `tool.Sequential` and return `true`;
-- every patch field maps to `updateInput`;
-- `status:"deleted"` returns a structured deletion result;
-- store validation failures remain model-visible tool-result errors.
+- TaskList accepts only `{}` and returns `{"tasks":[]}` when empty;
+- deterministic list output and derived `blocks`;
+- presence-aware scalar and metadata patches;
+- `{}` metadata clear behavior;
+- dependency add/remove overlap;
+- deleted status result `{"deletedTaskId":"uuid"}`;
+- every invalid preparation input;
+- every live-state failure as a model-visible result;
+- typed artifact isolation and raw-argument immunity;
+- `tool.Sequential` on both tools.
 
-Use this successful deletion shape:
+**Step 2: Run RED**
 
-```json
-{"deletedTaskId":"uuid"}
+```bash
+GOWORK=off go test -race ./task -run 'TestTask(List|Update)'
 ```
-
-**Step 2: Run the tests to verify they fail**
-
-Run: `GOWORK=off go test -race ./task -run 'TestTask(List|Update)'`
 
 Expected: FAIL because the tools do not exist.
 
-**Step 3: Implement TaskList and TaskUpdate**
+**Step 3: Implement both tools**
 
-Use pointer fields in the decoded update arguments to distinguish omitted scalar
-fields from explicit empty strings. Decode metadata into `json.RawMessage`:
-nil means omitted, `{}` means clear, and `null` is rejected during preparation.
-The prepared update artifact owns the normalized `updateInput`.
+Use pointer fields for supplied scalar patches and a presence-aware metadata
+field. Add private `taskListArtifact` and `taskUpdateArtifact`, compile-time
+capability assertions, structured results, and `Sequential() == true`.
 
-Add:
+**Step 4: Run GREEN**
 
-```go
-type taskListArtifact struct {
-	tool.TokenArtifact
-}
-
-type taskUpdateArtifact struct {
-	tool.TokenArtifact
-	input updateInput
-}
+```bash
+GOWORK=off go test -race ./task -run 'TestTask(List|Update)'
 ```
-
-Like TaskCreate and TaskGet, `InvokableRun` consumes only these artifacts.
-Preserve the exact camelCase field names from the approved design.
-
-Add the same compile-time capability assertions used by TaskCreate and TaskGet,
-including `tool.Sequential`, and implement `Sequential() bool { return true }`.
-
-**Step 4: Run the tests to verify they pass**
-
-Run: `GOWORK=off go test -race ./task -run 'TestTask(List|Update)'`
 
 Expected: PASS.
 
@@ -525,17 +478,22 @@ git add task/list.go task/list_test.go task/update.go task/update_test.go
 git commit -m "feat(task): add list and update tools"
 ```
 
-### Task 7: Expose the four-tool bundle and prove Loop isolation
+### Task 7: Expose Tasks and remove Todo from the tools module
 
 **Files:**
 - Modify: `definitions.go`
 - Modify: `definitions_test.go`
 - Modify: `dependency_test.go`
+- Modify: `example_readme_test.go`
 - Create: `task_bundle_test.go`
+- Delete: `todo/todo.go`
+- Delete: `todo/todo_test.go`
+- Delete: `todo/preparecall_test.go`
+- Delete: `todo/result_test.go`
 
-**Step 1: Write failing public-definition tests**
+**Step 1: Write failing bundle and removal tests**
 
-Add expectations:
+Assert:
 
 ```go
 definition := TaskDefinitions()
@@ -548,22 +506,26 @@ if diff := cmp.Diff(
 if definition.Requirements() != 0 { ... }
 ```
 
-Build once, invoke `TaskCreate`, then prove the built `TaskList` sees the
-created task. Drive every invocation through
-`PrepareCall → loop.WithPreparedCall → InvokableRun`.
+Build once, create a task, and prove list/get/update share one store. Build a
+second time with another Loop ID and prove it is empty. Assert every produced
+tool implements `CallPreparer`, `Auditable`, and `Sequential` and prepares a
+non-nil typed artifact.
 
-Build the definition a second time with a different `LoopID` and prove its list
-is empty. Also run concurrent create/update/list calls under the race detector.
+Add `task` and remove `todo` in `TestToolPackageLayout`. Remove Todo from the
+one-tool definition table and all-tools-prepared roster. Add a source guard that
+rejects `TodoDefinition` and a `todo` package directory.
 
-**Step 2: Run the tests to verify they fail**
+**Step 2: Run RED**
 
-Run: `GOWORK=off go test -race . -run 'TestTaskDefinition|TestTaskBundle'`
+```bash
+GOWORK=off go test -race . -run 'TestTaskDefinition|TestTaskBundle|TestTodoRemoved|TestDefinition|TestToolPackageLayout'
+```
 
-Expected: FAIL because `TaskDefinitions` does not exist.
+Expected: FAIL until the bundle exists and Todo is removed.
 
-**Step 3: Implement the bundle factory**
+**Step 3: Implement the bundle and hard deletion**
 
-In `definitions.go`, import `github.com/looprig/tools/task` and add:
+Add:
 
 ```go
 func TaskDefinitions() tool.Definition {
@@ -578,80 +540,66 @@ func TaskDefinitions() tool.Definition {
 }
 ```
 
-`task.NewTools` creates one private store and returns the four tools in the
-declared order. Every definition build creates a fresh store, which makes each
-Loop binding independent.
+`task.NewTools` creates one private store and returns tools in declared order.
+Delete the Todo import, definition, package, tests, and README compile fixture.
+Do not leave a deprecated alias.
 
-Do not add the bundle to `TestDefinitionBlueprints` and do not weaken that
-test's one-definition/one-tool assertion. Add a dedicated
-`TestTaskDefinitionsBundle` covering its four declared and built names.
+**Step 4: Run GREEN**
 
-Add `task` to `TestToolPackageLayout`. The existing dependency walker must
-continue proving that `task` imports no sibling public tool packages. Add
-`TaskDefinitions()` to the all-tools-prepared test and assert every built task
-tool has a non-nil typed artifact for valid input.
-
-**Step 4: Run the tests to verify they pass**
-
-Run: `GOWORK=off go test -race . -run 'TestTaskDefinition|TestTaskBundle|TestDefinition|TestToolPackageLayout|TestProductionDependencyBoundary'`
+```bash
+GOWORK=off go test -race . -run 'TestTaskDefinition|TestTaskBundle|TestTodoRemoved|TestDefinition|TestToolPackageLayout|TestProductionDependencyBoundary'
+```
 
 Expected: PASS.
 
 **Step 5: Commit**
 
 ```bash
-git add definitions.go definitions_test.go dependency_test.go task_bundle_test.go
-git commit -m "feat: expose loop-scoped task tool bundle"
+git add definitions.go definitions_test.go dependency_test.go example_readme_test.go task_bundle_test.go task
+git add -u todo
+git commit -m "feat: replace Todo with loop-scoped Tasks"
 ```
 
-### Task 8: Prove one bundle instance is reused across Loop modes
+### Task 8: Prove mode reuse, Loop isolation, and concurrency
 
 **Files:**
 - Modify: `task_bundle_test.go`
 
-**Step 1: Write the binding integration tests**
+**Step 1: Add binding integration tests**
 
-Assign `tasks := TaskDefinitions()` once. Define a Loop whose base mode and
-alternate mode both select that exact `tasks` value. Bind the Loop once, obtain
-the base tool set from `bound.Tools()` and the alternate tool set from
-`bound.Mode(alternateName)`, create a task through the base `TaskCreate`, and
-verify the alternate mode's `TaskList` sees it.
+Create `tasks := TaskDefinitions()` once and select the same value in a base mode
+and alternate mode. Bind one Loop; create through the base mode and list through
+the alternate mode. Bind a second Loop and prove it starts empty.
 
-Create a second bound Loop with another `LoopID` and prove it starts empty.
-Also construct a negative fixture with two distinct `TaskDefinitions()` values
-under the same definition name and assert binding rejects it rather than
-silently sharing or duplicating state.
+Add a negative fixture with two distinct `TaskDefinitions()` values named
+`Tasks` in one Loop and assert `BindDuplicateDefinitionName`.
 
-**Step 2: Run the test to verify current wiring**
+Drive all invocations through:
 
-Run: `GOWORK=off go test -race . -run 'TestTaskBundle(SharesStateAcrossModes|RejectsDistinctSameNameDefinitions)' -v`
+```text
+PrepareCall → loop.WithPreparedCall → InvokableRun
+```
 
-Expected before any fix: the sharing test passes if the existing
-definition-build cache behaves as documented, and the distinct-definition test
-passes by observing the existing duplicate-definition error. If either fails,
-stop and inspect `loop.Definition.Bind`; do not add task state to
-`tool.Bindings` or the Loop runtime.
+Add concurrent direct create/update/get/list calls and verify them under the race
+detector.
 
-**Step 3: Make only the minimal correction if the test exposes a defect**
+**Step 2: Run the tests**
 
-The expected implementation needs no production change: one immutable bundle
-definition must appear in every selected mode so `Bind` builds it once by
-definition name and reuses its concrete tools.
+```bash
+GOWORK=off go test -race . -run 'TestTaskBundle(SharesStateAcrossModes|IsolatesLoops|RejectsDistinctSameNameDefinitions|Concurrent)' -v
+```
 
-**Step 4: Re-run the focused test**
+Expected: PASS without Harness production changes. If mode reuse fails, stop and
+inspect `loop.Definition.Bind`; do not move task state into Harness.
 
-Run: `GOWORK=off go test -race . -run 'TestTaskBundle(SharesStateAcrossModes|RejectsDistinctSameNameDefinitions)' -v`
-
-Expected: PASS.
-
-**Step 5: Commit**
+**Step 3: Commit**
 
 ```bash
 git add task_bundle_test.go
-git commit -m "test: prove task state follows loop binding"
+git commit -m "test: prove task state follows one Loop binding"
 ```
 
-### Task 9: Update public documentation while preserving Todo compatibility
+### Task 9: Update tools documentation for the hard cut
 
 **Files:**
 - Modify: `CLAUDE.md`
@@ -660,100 +608,278 @@ git commit -m "test: prove task state follows loop binding"
 - Modify: `example_readme_test.go`
 - Modify: `docs/specs/module.md`
 
-**Step 1: Update the compile-checked README example**
+**Step 1: Update the compile-checked example**
 
-Replace the primary task example:
+Use `tools.TaskDefinitions()` and list the four produced model-facing names.
+Explain that Tasks is the one related-family bundle and that every definition
+build owns one Loop-local graph.
 
-```go
-tools.TodoDefinition(),
+**Step 2: Update policy and package documentation**
+
+Replace the one-definition-per-tool rule with:
+
+> Export one `tool.Definition` per independently selectable capability by
+> default. Never bundle unrelated tools. `Tasks` is the deliberate exception:
+> its four operations require one per-build Loop-local store.
+
+Delete all Todo references. State that parent and child Loops each receive an
+independent graph. Record that Harness, not this module, owns and injects the
+Subagent control tool.
+
+**Step 3: Add a documentation/source cleanup guard**
+
+Extend a root test to search tracked tools sources and documentation for
+`TodoDefinition`, `NewTodo`, and the `github.com/looprig/tools/todo` import.
+
+**Step 4: Verify documentation and formatting**
+
+```bash
+GOWORK=off make fmt
+GOWORK=off go test -race . -run 'TestExample|TestDefinition|TestToolPackageLayout|TestProductionDependencyBoundary|TestTodoRemoved'
 ```
-
-with:
-
-```go
-tools.TaskDefinitions(),
-```
-
-Add a short compatibility note that `TodoDefinition` remains available but
-uses a separate legacy in-memory list.
-
-State that standard tools remain individually selectable by default and Tasks
-is the single deliberate related-family bundle.
-
-**Step 2: Update repository policy and the module specification**
-
-Change the one-definition-per-tool rule consistently in `CLAUDE.md`,
-`CONTRIBUTING.md`, and `docs/specs/module.md`:
-
-> Export one `tool.Definition` per independently selectable tool by default.
-> Never bundle unrelated tools. `Tasks` is the deliberate exception: its four
-> model-facing operations form one capability family and require one per-build
-> loop-local store.
-
-Keep the existing Files non-bundle decision and all sibling-package dependency
-rules unchanged.
-
-List all four produced model-facing names and their scope/lifetime.
-
-**Step 3: Run documentation compile tests**
-
-Run: `GOWORK=off go test -race . -run 'TestExample|TestDefinition|TestToolPackageLayout|TestProductionDependencyBoundary'`
 
 Expected: PASS.
-
-**Step 4: Run formatting**
-
-Run: `GOWORK=off make fmt`
-
-Expected: command succeeds and formats changed Go files.
 
 **Step 5: Commit**
 
 ```bash
 git add CLAUDE.md CONTRIBUTING.md README.md example_readme_test.go docs/specs/module.md
-git commit -m "docs: document structured task tools"
+git commit -m "docs: document loop-scoped task tools"
 ```
 
-### Task 10: Run complete verification
+### Task 10: Migrate CodeRig primary and subagent Loops
 
 **Files:**
-- No expected source changes
+- Modify: `../coderig/internal/app/toolsets.go`
+- Modify: `../coderig/internal/app/swarm_test.go`
+- Modify: `../coderig/internal/app/managed_delegation_test.go`
+- Modify: `../coderig/go.mod`
+- Modify: `../coderig/go.sum`
 
-**Step 1: Run the task package with the race detector**
+**Step 1: Write failing roster tests**
 
-Run: `GOWORK=off go test -race ./task`
+For operator and reviewer definitions, assert all four Task names are present and
+`Todo` is absent. Keep the existing primary-minus-Subagent equality assertion:
+the Harness-injected Subagent tool remains the only primary/leaf tool difference.
 
-Expected: PASS with no race reports.
+**Step 2: Write the managed parent/child isolation test**
 
-**Step 2: Run the complete tools test suite**
+Use the existing scripted managed-delegation harness to drive:
 
-Run: `GOWORK=off make test`
+1. primary `TaskCreate`;
+2. primary `Subagent start` for operator with `wait:true`;
+3. operator child `TaskList`, observing empty;
+4. operator child `TaskCreate`;
+5. primary `TaskList`, observing only the primary task;
+6. primary `Subagent start` for reviewer;
+7. reviewer child `TaskList`, observing empty.
+
+Assert every inference request for primary/operator/reviewer advertises exactly
+`TaskCreate`, `TaskUpdate`, `TaskGet`, and `TaskList`, and no Todo. The test proves
+real managed children receive fresh stores rather than only comparing static
+definition metadata.
+
+**Step 3: Run RED**
+
+```bash
+cd ../coderig
+GOWORK=off go test -race ./internal/app -run 'Test.*Task|TestManagedSubagentTaskIsolation|TestSwarmDefinitionsAntiDrift' -v
+```
+
+Expected: FAIL while CodeRig still selects Todo.
+
+**Step 4: Replace consumer wiring**
+
+Replace both `tools.TodoDefinition()` calls with `tools.TaskDefinitions()`.
+Synchronize module metadata only if the local Tools version/pseudo-version
+requires it. Do not add or move the Subagent tool; it remains structurally
+injected by Harness.
+
+**Step 5: Run GREEN**
+
+```bash
+GOWORK=off go test -race ./internal/app -run 'Test.*Task|TestManagedSubagentTaskIsolation|TestSwarmDefinitionsAntiDrift|TestManagedSubagent' -v
+```
 
 Expected: PASS.
 
-**Step 3: Run static and security checks**
+**Step 6: Commit in the CodeRig repository**
 
-Run: `GOWORK=off make secure`
+```bash
+git add internal/app/toolsets.go internal/app/swarm_test.go internal/app/managed_delegation_test.go go.mod go.sum
+git commit -m "feat: give every CodeRig Loop scoped task tools"
+```
 
-Expected: formatting, `go vet`, `staticcheck`, `gosec`, module verification,
-and `govulncheck` all pass.
+### Task 11: Remove Todo presentation and keep Task summaries redacted
 
-**Step 4: Review the final diff**
+**Files:**
+- Modify: `../tui/internal/presentation/toolsummary.go`
+- Modify: `../tui/internal/presentation/transcript_test.go`
+- Modify: `../tui/internal/presentation/summary_test.go`
 
-Run: `git status --short`
+**Step 1: Write failing presentation tests**
 
-Expected: no uncommitted files.
+For `TaskCreate`, `TaskUpdate`, `TaskGet`, and `TaskList`, pass inputs containing
+subjects, descriptions, metadata, and UUIDs. Assert reconstructed summaries
+contain none of those values. Verify nested subagent cards still display the
+concrete tool name. Add a guard that Todo has no presentation-specific case.
 
-Run: `git diff --check`
+**Step 2: Run RED**
 
-Expected: no output and exit status 0.
+```bash
+cd ../tui
+GOWORK=off go test -race ./internal/presentation -run 'Test.*Task.*Summary|Test.*Nested.*Task' -v
+```
 
-Run: `git log --oneline -10`
+Expected: FAIL until the explicit Task redaction contract is represented.
 
-Expected: the task commits appear in order.
+**Step 3: Update presentation behavior**
 
-**Step 5: Record verification evidence**
+Remove `toolNameTodo`, `todoSummaryArgs`, `todoSummary`, and the Todo switch case.
+Recognize the four Task names as intentionally detail-free summaries, returning
+`""`; the surrounding card already displays `ToolName`. Never reconstruct task
+text or IDs from stored arguments.
 
-No commit is needed if all checks pass without changes. If verification
-required a correction, add a focused regression test, apply the smallest fix,
-repeat Steps 1–4, and commit that correction separately.
+**Step 4: Run GREEN**
+
+```bash
+GOWORK=off go test -race ./internal/presentation -run 'Test.*Task.*Summary|Test.*Nested.*Task' -v
+```
+
+Expected: PASS.
+
+**Step 5: Commit in the TUI repository**
+
+```bash
+git add internal/presentation/toolsummary.go internal/presentation/transcript_test.go internal/presentation/summary_test.go
+git commit -m "refactor(tui): replace Todo summaries with redacted Tasks"
+```
+
+### Task 12: Update Harness and public consumer documentation
+
+**Files:**
+- Modify: `../harness/CLAUDE.md`
+- Modify: `../harness/pkg/tool/README.md`
+- Modify: `../www/looprig/docs/consumers/tools.md`
+- Modify: `../www/looprig/docs/consumers/loop.md`
+- Modify: `../www/looprig/docs/consumers/larger-systems.md`
+- Modify: `../www/looprig/profile/README.md`
+
+**Step 1: Document the ownership boundary**
+
+In Harness, state that Subagent is the deliberate Harness-owned model-facing
+control tool because its schema/catalog is derived from frozen delegate topology
+and its authority is a parent-scoped controller. Optional task tracking remains
+in `github.com/looprig/tools` and Harness does not import it.
+
+**Step 2: Update consumer examples**
+
+Replace Todo with `TaskDefinitions()`. Explain:
+
+- four model-facing names come from one selected definition;
+- each bound Loop, including each subagent, receives an independent graph;
+- modes within one Loop share it;
+- Subagent remains automatically injected and must not be added manually;
+- task coordination between agents uses Subagent messages, not shared memory.
+
+**Step 3: Run documentation checks**
+
+Use the module-specific test/build commands documented by Harness and WWW. At a
+minimum:
+
+```bash
+cd ../harness
+GOWORK=off go test -race ./pkg/tool ./pkg/rig ./internal/delegationtool ./internal/sessionruntime
+
+cd ../www
+GOWORK=off go test -race ./...
+```
+
+Expected: PASS.
+
+**Step 4: Commit separately in each repository**
+
+```bash
+cd ../harness
+git add CLAUDE.md pkg/tool/README.md
+git commit -m "docs: clarify Harness ownership of Subagent"
+
+cd ../www
+git add looprig/docs/consumers/tools.md looprig/docs/consumers/loop.md looprig/docs/consumers/larger-systems.md looprig/profile/README.md
+git commit -m "docs: replace Todo with loop-scoped Tasks"
+```
+
+### Task 13: Complete cross-module verification and removal audit
+
+**Files:**
+- No expected production changes
+
+**Step 1: Prove Todo is gone**
+
+From `/Users/ipotter/code/looprig` run:
+
+```bash
+rg -n 'TodoDefinition|NewTodo|github.com/looprig/tools/todo|toolNameTodo' tools coderig tui www tests -g '*.go' -g '*.md'
+```
+
+Expected: no matches. Historical dated plans may retain Todo only when explicitly
+excluded from the cleanup command; active documentation and production code may
+not.
+
+**Step 2: Verify Tools**
+
+```bash
+cd tools
+GOWORK=off go test -race ./task
+GOWORK=off make test
+GOWORK=off make secure
+git diff --check
+```
+
+Expected: PASS with no race or static/security findings.
+
+**Step 3: Verify CodeRig and real managed delegation**
+
+```bash
+cd ../coderig
+GOWORK=off go test -race ./internal/app
+GOWORK=off make test
+GOWORK=off make secure
+git diff --check
+```
+
+Expected: PASS, including the real parent/operator/reviewer task-isolation test.
+
+**Step 4: Verify TUI, Harness, WWW, and integration ownership**
+
+```bash
+cd ../tui
+GOWORK=off make test
+GOWORK=off make secure
+
+cd ../harness
+GOWORK=off go test -race ./pkg/tool ./pkg/rig ./internal/delegationtool ./internal/sessionruntime
+
+cd ../www
+GOWORK=off go test -race ./...
+
+cd ../tests
+GOWORK=off go test -race ./...
+```
+
+Expected: PASS.
+
+**Step 5: Review repository state and commits**
+
+In every changed repository run:
+
+```bash
+git status --short
+git diff --check
+git log --oneline -15
+```
+
+Expected: no uncommitted feature files; commits are separated by module and
+logical responsibility. If verification requires a fix, add a focused regression
+test, make the smallest correction, rerun the affected module and downstream
+integration suite, and commit the correction in its owning repository.
