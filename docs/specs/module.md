@@ -8,7 +8,10 @@ The harness is the runtime for building Loops and Rigs. Tools are optional capab
 
 ## Core decision
 
-Every tool is an independent definition. There is no `Files` bundle.
+Every independently selectable capability is its own definition. There is no
+bundle of unrelated tools. `Tasks` is the deliberate related-family exception:
+its four operations must be built together so one definition build owns one
+Loop-local task graph.
 
 The standard module exposes separate definitions for:
 
@@ -20,7 +23,7 @@ The standard module exposes separate definitions for:
 - Bash
 - WebSearch
 - Fetch
-- Todo
+- Tasks (`TaskCreate`, `TaskUpdate`, `TaskGet`, and `TaskList`)
 - AskUser
 - Skill
 
@@ -53,15 +56,20 @@ tools.EditFileDefinition()
 tools.GlobDefinition(readGuard)
 tools.GrepDefinition(readGuard, options...)
 tools.Bash(options...)
-tools.TodoDefinition()
+tools.TaskDefinitions()
 tools.AskUserDefinition()
 ```
 
-Each function returns one `tool.Definition`, and each definition builds a fresh `tool.InvokableTool` from the current `tool.Bindings`.
+Each function returns one `tool.Definition`, and each definition builds fresh
+`tool.InvokableTool` values from the current `tool.Bindings`. `TaskDefinitions`
+is the deliberate related-family bundle: it produces the four names above and
+creates one bounded graph per definition build. Modes within one Loop reuse the
+same graph; parent and child Loops bind independently and never share task
+state.
 
 Concrete constructors may remain available for testing and advanced composition, but their dependencies must use exported interfaces. No public constructor may require an unexported concrete type.
 
-Concrete tools and advanced options live in focused packages: `readfile`, `writefile`, `editfile`, `glob`, `grep`, `bash`, `fetch`, `websearch`, `todo`, `askuser`, and `skill`. The permission policy subsystem lives in `permission`. Shared security-sensitive mechanics that are not consumer contracts remain beneath `internal`.
+Concrete tools and advanced options live in focused packages: `readfile`, `writefile`, `editfile`, `glob`, `grep`, `bash`, `fetch`, `websearch`, `task`, `askuser`, and `skill`. The permission policy subsystem lives in `permission`. Shared security-sensitive mechanics that are not consumer contracts remain beneath `internal`.
 
 ## Permission policy
 
@@ -85,6 +93,12 @@ func NewPermissionChecker(
 The Subagent control surface is part of harness delegation, not an optional utility tool. The harness may inject an internal implementation when a Loop declares delegates. That implementation must depend only on harness contracts.
 
 The optional tools module must not be imported by the harness to implement delegation. This avoids a module cycle and keeps delegation available to Rigs that do not use the standard utility tools.
+
+The Harness owns and injects the model-facing `Subagent` control tool when a
+Loop declares delegates. Consumers select `Tasks` separately; they must not
+construct or add `Subagent` from this module. Parent and child task graphs stay
+isolated, so cross-Loop coordination uses the Harness-owned delegation
+messages.
 
 ## Migration
 

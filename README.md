@@ -1,19 +1,27 @@
 # tools
 
-`github.com/looprig/tools` provides optional standard tools for looprig Loops. The harness defines the contracts. This module provides implementations that consumers can select one at a time.
+`github.com/looprig/tools` provides optional standard tools for looprig Loops. The harness defines the contracts. This module provides implementations that consumers can select individually, plus the deliberate related-family `Tasks` bundle.
 
 ```go
 loop.WithTools(
 	tools.ReadFileDefinition(readGuard),
 	tools.GlobDefinition(readGuard),
 	tools.GrepDefinition(readGuard),
-	tools.TodoDefinition(),
+	tools.TaskDefinitions(),
 )
 ```
 
+`TaskDefinitions()` produces the four model-facing tools `TaskCreate`,
+`TaskUpdate`, `TaskGet`, and `TaskList`. They are one deliberate bundle because
+the four operations must share one bounded, Loop-local task graph. Each
+definition build creates a fresh graph; parent and child Loops are isolated,
+while modes within one Loop share the graph. The Harness owns and injects the
+`Subagent` control tool for delegated Loops; consumers must not add it from this
+module.
+
 There is no bundled file-tool definition. A read-only Loop can receive ReadFile without also constructing WriteFile or EditFile. Consumers can mix these tools with their own definitions or use no standard tools at all.
 
-The module root is intentionally a small definition facade. Each concrete tool has a focused package, such as `readfile`, `writefile`, `grep`, `bash`, and `websearch`. The `permission` package is the shared workspace rule library, and shared containment and mutation mechanics remain private under `internal`.
+The module root is intentionally a small definition facade. Each concrete tool has a focused package, such as `readfile`, `writefile`, `grep`, `bash`, and `websearch`. The `task` package owns the four related task operations. The `permission` package is the shared workspace rule library, and shared containment and mutation mechanics remain private under `internal`.
 
 All README snippets are compiled by `example_readme_test.go` at the module root.
 

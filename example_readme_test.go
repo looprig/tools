@@ -23,6 +23,10 @@ func readmeSelectTools(readGuard loop.ReadGuard) loop.Option {
 	)
 }
 
+// The Tasks definition deliberately produces one related family:
+// TaskCreate, TaskUpdate, TaskGet, and TaskList. Its definition build owns one
+// Loop-local graph; modes share it, while parent and child Loops are isolated.
+
 // readmeWorkspaceStore is the README's permission-store snippet.
 func readmeWorkspaceStore(permissionFilePath string) (*permission.Store, []permission.Diagnostic, error) {
 	store, diagnostics, err := permission.NewWorkspaceStore(permission.Config{

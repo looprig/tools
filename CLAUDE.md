@@ -11,12 +11,21 @@ This module provides optional standard tools for looprig consumers. The harness 
 
 ## Boundaries
 
-- Export one `tool.Definition` per tool. Do not bundle unrelated tools.
+- Export one `tool.Definition` per independently selectable capability by
+  default. Never bundle unrelated tools. `Tasks` is the deliberate exception:
+  its four operations require one per-build Loop-local store.
 - Read workspace root, observations, coordinators, ceiling, and delegates from `tool.Bindings`.
 - Depend on harness contracts, never harness internals.
 - Do not import sandbox or confinement. Accept their behavior through harness runner and permission interfaces.
 - Tool packages stay independent of each other: no public tool package imports a sibling public tool package. The one allowlisted sibling import is `permission` (the shared rule library); shared mechanics live under `internal`. `dependency_test.go` at the module root enforces this — extend it, never weaken it, when adding packages.
 - Keep tool effects explicit and fail secure when permission or containment is uncertain: invalid input fails during preparation, a prepared tool without its typed artifact refuses to run, and rule-file load failures are errors.
+- `TaskDefinitions()` produces `TaskCreate`, `TaskUpdate`, `TaskGet`, and
+  `TaskList` from one related-family definition. Each definition build owns one
+  bounded in-memory graph; modes within one Loop share it, while parent and
+  child Loops receive independent graphs. Coordination across that boundary
+  uses Harness delegation messages.
+- Harness owns and injects the model-facing `Subagent` control tool. This
+  module must not implement or manually add `Subagent`.
 - Deliberate exception, recorded here: Bash hands the model-supplied command to `sh -c` (an argv list cannot express shell features). The security boundary is the permission gate over the prepared command-backed request plus the injected confined runner, not the argv shape.
 
 ## Dependencies

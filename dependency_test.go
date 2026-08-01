@@ -5,6 +5,7 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -72,36 +73,38 @@ func TestTodoRemoved(t *testing.T) {
 		t.Fatalf("stat removed package path %q: %v", "todo", err)
 	}
 
-	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			if path == "docs/plans" {
-				return filepath.SkipDir
-			}
-			if path != "." && (entry.Name() == "vendor" || strings.HasPrefix(entry.Name(), ".")) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if filepath.Ext(path) != ".go" {
-			return nil
-		}
+	files, err := trackedSourceAndDocumentation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range files {
 		contents, err := os.ReadFile(path)
 		if err != nil {
-			return err
+			t.Fatal(err)
 		}
 		for _, needle := range forbidden {
 			if strings.Contains(string(contents), needle) {
 				t.Errorf("%s contains removed API reference %q", path, needle)
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
+}
+
+func trackedSourceAndDocumentation() ([]string, error) {
+	output, err := exec.Command("git", "ls-files", "-z", "--", "*.go", "*.md").Output()
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, path := range strings.Split(string(output), "\x00") {
+		if path == "" || strings.HasPrefix(path, "docs/plans/") {
+			continue
+		}
+		if filepath.Ext(path) == ".go" || filepath.Ext(path) == ".md" {
+			files = append(files, path)
+		}
+	}
+	return files, nil
 }
 
 func TestProductionDependencyBoundary(t *testing.T) {

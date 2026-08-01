@@ -2,7 +2,8 @@
 
 Thanks for considering a contribution. `tools` provides the optional standard
 tool implementations for looprig Loops — Bash, ReadFile, WriteFile, EditFile,
-Glob, Grep, WebSearch, Fetch, Todo, AskUser, and Skill — built against the
+Glob, Grep, WebSearch, Fetch, Tasks (`TaskCreate`, `TaskUpdate`, `TaskGet`, and
+`TaskList`), AskUser, and Skill — built against the
 contracts the harness defines. This file is the short guide for working in
 *this* repository.
 
@@ -36,6 +37,11 @@ contracts the harness defines. This file is the short guide for working in
   harness contracts, never harness internals. Never import sandbox or
   confinement directly; accept their behavior through the harness runner
   and permission interfaces.
+- **Tasks are a deliberate related-family bundle.** `TaskDefinitions()` produces
+  four model-facing operations backed by one Loop-local graph per definition
+  build. Modes in one Loop share that graph; parent and child Loops do not.
+  Harness owns and injects `Subagent`, so task coordination across Loops uses
+  delegation messages rather than shared task memory.
 - **No sibling tool-package imports.** Public tool packages stay independent
   of each other; the one allowlisted exception is `permission`. Shared
   mechanics live under `internal`. `dependency_test.go` at the module root
