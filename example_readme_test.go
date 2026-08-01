@@ -19,7 +19,7 @@ func readmeSelectTools(readGuard loop.ReadGuard) loop.Option {
 		tools.ReadFileDefinition(readGuard),
 		tools.GlobDefinition(readGuard),
 		tools.GrepDefinition(readGuard),
-		tools.TodoDefinition(),
+		tools.TaskDefinitions(),
 	)
 }
 

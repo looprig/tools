@@ -312,3 +312,15 @@ type toolBase struct {
 }
 
 func (b toolBase) AuditSummary(string) string { return b.name }
+
+// NewTools constructs the four task tools over one private Loop-local store.
+// The returned order is the order exposed by tools.TaskDefinitions.
+func NewTools() []tool.InvokableTool {
+	store := newStore(nil)
+	return []tool.InvokableTool{
+		newTaskCreate(store),
+		newTaskUpdate(store),
+		newTaskGet(store),
+		newTaskList(store),
+	}
+}

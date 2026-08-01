@@ -42,20 +42,21 @@ func TestDefinitionBlueprints(t *testing.T) {
 	t.Parallel()
 	guard := &fakeReadGuard{maxBytes: 1024}
 	tests := []struct {
-		name       string
-		definition tool.Definition
-		wantName   string
-		requires   tool.Requirements
+		name           string
+		definition     tool.Definition
+		wantName       string
+		wantBuiltNames []string
+		requires       tool.Requirements
 	}{
-		{name: "read file", definition: ReadFileDefinition(guard), wantName: "ReadFile", requires: tool.RequiresWorkspace},
-		{name: "write file", definition: WriteFileDefinition(), wantName: "WriteFile", requires: tool.RequiresWorkspace},
-		{name: "edit file", definition: EditFileDefinition(), wantName: "EditFile", requires: tool.RequiresWorkspace},
-		{name: "glob", definition: GlobDefinition(guard), wantName: "Glob", requires: tool.RequiresWorkspace},
-		{name: "grep", definition: GrepDefinition(guard), wantName: "Grep", requires: tool.RequiresWorkspace},
-		{name: "todo", definition: TodoDefinition(), wantName: "Todo"},
-		{name: "ask user", definition: AskUserDefinition(), wantName: "AskUser"},
-		{name: "fetch", definition: FetchDefinition(http.DefaultClient), wantName: "Fetch"},
-		{name: "bash", definition: Bash(bash.WithRunner(&definitionRunner{})), wantName: "Bash", requires: tool.RequiresWorkspace},
+		{name: "read file", definition: ReadFileDefinition(guard), wantName: "ReadFile", wantBuiltNames: []string{"ReadFile"}, requires: tool.RequiresWorkspace},
+		{name: "write file", definition: WriteFileDefinition(), wantName: "WriteFile", wantBuiltNames: []string{"WriteFile"}, requires: tool.RequiresWorkspace},
+		{name: "edit file", definition: EditFileDefinition(), wantName: "EditFile", wantBuiltNames: []string{"EditFile"}, requires: tool.RequiresWorkspace},
+		{name: "glob", definition: GlobDefinition(guard), wantName: "Glob", wantBuiltNames: []string{"Glob"}, requires: tool.RequiresWorkspace},
+		{name: "grep", definition: GrepDefinition(guard), wantName: "Grep", wantBuiltNames: []string{"Grep"}, requires: tool.RequiresWorkspace},
+		{name: "tasks", definition: TaskDefinitions(), wantName: "Tasks", wantBuiltNames: []string{"TaskCreate", "TaskUpdate", "TaskGet", "TaskList"}},
+		{name: "ask user", definition: AskUserDefinition(), wantName: "AskUser", wantBuiltNames: []string{"AskUser"}},
+		{name: "fetch", definition: FetchDefinition(http.DefaultClient), wantName: "Fetch", wantBuiltNames: []string{"Fetch"}},
+		{name: "bash", definition: Bash(bash.WithRunner(&definitionRunner{})), wantName: "Bash", wantBuiltNames: []string{"Bash"}, requires: tool.RequiresWorkspace},
 	}
 	for _, test := range tests {
 		test := test
@@ -71,15 +72,17 @@ func TestDefinitionBlueprints(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(built) != 1 {
-				t.Fatalf("Build() returned %d tools, want 1", len(built))
+			if len(built) != len(test.wantBuiltNames) {
+				t.Fatalf("Build() returned %d tools, want %d", len(built), len(test.wantBuiltNames))
 			}
-			info, err := built[0].Info(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if info.Name != test.wantName {
-				t.Fatalf("built tool name = %q, want %q", info.Name, test.wantName)
+			for index, wantName := range test.wantBuiltNames {
+				info, err := built[index].Info(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.Name != wantName {
+					t.Fatalf("built tool[%d] name = %q, want %q", index, info.Name, wantName)
+				}
 			}
 		})
 	}
@@ -207,7 +210,7 @@ func TestDefinitionToolsArePrepared(t *testing.T) {
 		EditFileDefinition(),
 		GlobDefinition(guard),
 		GrepDefinition(guard),
-		TodoDefinition(),
+		TaskDefinitions(),
 		AskUserDefinition(),
 		Bash(bash.WithRunner(&definitionRunner{})),
 		FetchDefinition(http.DefaultClient),

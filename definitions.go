@@ -17,7 +17,7 @@ import (
 	"github.com/looprig/tools/internal/definition"
 	"github.com/looprig/tools/internal/workspace"
 	"github.com/looprig/tools/readfile"
-	"github.com/looprig/tools/todo"
+	"github.com/looprig/tools/task"
 	"github.com/looprig/tools/websearch"
 	"github.com/looprig/tools/writefile"
 )
@@ -43,9 +43,9 @@ func GrepDefinition(readGuard loop.ReadGuard, options ...grep.GrepOption) tool.D
 	})
 }
 
-func TodoDefinition() tool.Definition {
-	return tool.NewDefinition("Todo", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
-		return []tool.InvokableTool{todo.NewTodo()}, nil
+func TaskDefinitions() tool.Definition {
+	return tool.NewBundleDefinition("Tasks", []string{"TaskCreate", "TaskUpdate", "TaskGet", "TaskList"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return task.NewTools(), nil
 	})
 }
 

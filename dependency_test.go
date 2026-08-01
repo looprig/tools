@@ -22,7 +22,7 @@ func TestToolPackageLayout(t *testing.T) {
 		"permission",
 		"readfile",
 		"skill",
-		"todo",
+		"task",
 		"websearch",
 		"writefile",
 	} {
@@ -34,6 +34,15 @@ func TestToolPackageLayout(t *testing.T) {
 		if !info.IsDir() {
 			t.Errorf("required package path %q is not a directory", name)
 		}
+	}
+	if info, err := os.Stat("todo"); err == nil {
+		if info.IsDir() {
+			t.Errorf("removed package directory %q still exists", "todo")
+		} else {
+			t.Errorf("removed package path %q still exists and is not a directory", "todo")
+		}
+	} else if !os.IsNotExist(err) {
+		t.Errorf("stat removed package path %q: %v", "todo", err)
 	}
 
 	entries, err := os.ReadDir(".")
@@ -47,6 +56,51 @@ func TestToolPackageLayout(t *testing.T) {
 		if entry.Name() != "definitions.go" {
 			t.Errorf("production implementation remains at module root: %s", entry.Name())
 		}
+	}
+}
+
+func TestTodoRemoved(t *testing.T) {
+	forbidden := []string{
+		strings.Join([]string{"Todo", "Definition"}, ""),
+		strings.Join([]string{"New", "Todo"}, ""),
+		strings.Join([]string{"github.com/looprig/tools/", "todo"}, ""),
+	}
+
+	if info, err := os.Stat("todo"); err == nil {
+		t.Errorf("removed package path %q still exists (directory=%t)", "todo", info.IsDir())
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat removed package path %q: %v", "todo", err)
+	}
+
+	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path == "docs/plans" {
+				return filepath.SkipDir
+			}
+			if path != "." && (entry.Name() == "vendor" || strings.HasPrefix(entry.Name(), ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" {
+			return nil
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, needle := range forbidden {
+			if strings.Contains(string(contents), needle) {
+				t.Errorf("%s contains removed API reference %q", path, needle)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
