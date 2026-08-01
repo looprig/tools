@@ -495,16 +495,22 @@ func TestStoreDependencyUpdateRejectsUnknownAndSelfDependencyAtomically(t *testi
 	mustCreate(t, store, validCreateInput("subject"))
 
 	tests := []struct {
-		name string
-		deps []string
+		name   string
+		add    []string
+		remove []string
 	}{
-		{name: "unknown dependency", deps: []string{testUUID(99).String()}},
-		{name: "self dependency", deps: []string{taskID.String()}},
+		{name: "unknown add dependency", add: []string{testUUID(99).String()}},
+		{name: "unknown remove dependency", remove: []string{testUUID(98).String()}},
+		{name: "self dependency", add: []string{taskID.String()}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			before := snapshotRecords(t, store)
-			if _, _, err := store.update(updateInput{TaskID: taskID.String(), AddBlockedBy: tt.deps}); err == nil {
+			if _, _, err := store.update(updateInput{
+				TaskID:          taskID.String(),
+				AddBlockedBy:    tt.add,
+				RemoveBlockedBy: tt.remove,
+			}); err == nil {
 				t.Fatal("store.update() accepted an invalid dependency")
 			}
 			assertRecordsUnchanged(t, store, before)
