@@ -548,18 +548,20 @@ func TestStoreCycleRejectsThreeNodeCycleAtomically(t *testing.T) {
 func TestStoreDependencyUpdatesNormalizeDuplicatesAndRemovalWins(t *testing.T) {
 	firstID := testUUID(1)
 	secondID := testUUID(2)
-	taskID := testUUID(3)
-	store := newStore(sequenceIDs(firstID, secondID, taskID))
+	thirdID := testUUID(3)
+	taskID := testUUID(4)
+	store := newStore(sequenceIDs(firstID, secondID, thirdID, taskID))
 	mustCreate(t, store, validCreateInput("first"))
 	mustCreate(t, store, validCreateInput("second"))
+	mustCreate(t, store, validCreateInput("third"))
 	mustCreate(t, store, validCreateInput("target"))
 
 	updated := mustUpdate(t, store, updateInput{
 		TaskID:          taskID.String(),
-		AddBlockedBy:    []string{secondID.String(), firstID.String(), firstID.String(), secondID.String()},
-		RemoveBlockedBy: []string{firstID.String(), firstID.String()},
+		AddBlockedBy:    []string{secondID.String(), firstID.String(), thirdID.String(), firstID.String(), secondID.String(), thirdID.String()},
+		RemoveBlockedBy: []string{thirdID.String(), thirdID.String()},
 	})
-	if want := []string{secondID.String()}; !reflect.DeepEqual(updated.BlockedBy, want) {
+	if want := []string{firstID.String(), secondID.String()}; !reflect.DeepEqual(updated.BlockedBy, want) {
 		t.Fatalf("normalized BlockedBy = %#v, want %#v", updated.BlockedBy, want)
 	}
 
