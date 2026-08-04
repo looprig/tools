@@ -9,7 +9,7 @@ tool (
 )
 
 require (
-	github.com/looprig/core v0.4.0
+	github.com/looprig/core v0.5.0
 	github.com/looprig/harness v0.19.0
 	github.com/looprig/inference v0.6.0
 	golang.org/x/net v0.57.0
