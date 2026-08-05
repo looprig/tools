@@ -71,6 +71,8 @@ const globSchema = `{
 
 const globDesc = "List workspace files whose path matches a glob pattern. '**' spans directories; other wildcards stay within one segment. Results are confined to the workspace, exclude denied (secret) paths, and are capped."
 
+const globHostReadsDesc = "List files whose path matches a glob pattern. '**' spans directories; other wildcards stay within one segment. An absolute root may resolve outside the workspace, subject to the caller's read authority; results exclude denied (secret) paths and are capped."
+
 // globArgs is the typed decode of Glob's untrusted argsJSON.
 type globArgs struct {
 	Pattern string `json:"pattern"`
@@ -80,20 +82,47 @@ type globArgs struct {
 // Glob searches workspace filenames against a glob pattern. It depends only on
 // the workspace root and the narrow loop.ReadGuard (least privilege).
 type Glob struct {
-	root  string
-	guard loop.ReadGuard
+	root      string
+	guard     loop.ReadGuard
+	hostReads bool
+}
+
+// GlobOption configures a Glob at construction (functional-options pattern,
+// matching grep.GrepOption / readfile.ReadFileOption).
+type GlobOption func(*Glob)
+
+// WithHostReads lets an absolute search root resolve OUTSIDE the workspace
+// instead of being rejected at prepare time -- the Glob counterpart to
+// readfile.WithHostReads() / grep.WithHostReads(). It does not itself grant
+// anything: an uncontained resolved search root still emits the same
+// filesystem.read requirement PrepareCall always has, so the consumer's bound
+// access source makes the actual Allow/Deny/Gated decision. A RELATIVE "../"
+// traversal is never widened by this option -- only a literal absolute path
+// argument can resolve outside the workspace. Matched paths in an uncontained
+// (host) walk are displayed relative to the SEARCHED directory itself, not
+// the workspace root.
+func WithHostReads() GlobOption {
+	return func(g *Glob) { g.hostReads = true }
 }
 
 // NewGlob constructs a Glob bound to the workspace root and read guard.
-func NewGlob(root string, guard loop.ReadGuard) *Glob {
-	return &Glob{root: root, guard: guard}
+func NewGlob(root string, guard loop.ReadGuard, opts ...GlobOption) *Glob {
+	g := &Glob{root: root, guard: guard}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
 }
 
 // Info returns Glob's self-description. Name MUST equal "Glob".
 func (g *Glob) Info(context.Context) (*tool.ToolInfo, error) {
+	desc := globDesc
+	if g.hostReads {
+		desc = globHostReadsDesc
+	}
 	return &tool.ToolInfo{
 		Name:   globToolName,
-		Desc:   globDesc,
+		Desc:   desc,
 		Schema: json.RawMessage(globSchema),
 	}, nil
 }
@@ -117,10 +146,15 @@ func (g *Glob) AuditSummary(argsJSON string) string {
 // tool.TokenArtifact to satisfy the sealed tool.PreparedArtifact marker.
 type globArtifact struct {
 	tool.TokenArtifact
-	pattern      string
-	searchRel    string // model-supplied search root (display + run-time re-check)
-	searchAbs    string // canonical resolved walk root (requirement Scope)
-	resolvedRoot string // canonical workspace root (relative-path anchor)
+	pattern   string
+	searchRel string // model-supplied search root (display + run-time re-check)
+	searchAbs string // canonical resolved walk root (requirement Scope)
+	// displayRoot is what matched paths are relativized against. For a
+	// workspace-contained search it is the canonical workspace root (matches
+	// unchanged). For an UNCONTAINED host search (WithHostReads() only), it is
+	// searchAbs itself, so results display relative to the searched host
+	// directory (see grep.go's identical displayRoot for the shared rationale).
+	displayRoot string
 }
 
 // prepareGlob is the SINGLE parse-validate-canonicalize step for a Glob call.
@@ -136,18 +170,45 @@ func (g *Glob) prepareGlob(argsJSON string) (*globArtifact, error) {
 	if searchRel == "" {
 		searchRel = defaultSearchDir
 	}
-	// Contain the search root (rejects an escape; resolves symlinks). The returned
-	// abs path is the WalkDir start; the workspace-relative anchor for matching is
-	// computed against the resolved workspace root.
-	searchAbs, err := workspace.ContainedPath(g.root, searchRel)
+	searchAbs, displayRoot, err := g.resolveSearch(searchRel)
 	if err != nil {
-		return nil, &globError{reason: "search root is outside the workspace: " + searchRel, cause: err}
+		return nil, err
 	}
-	resolvedRoot, err := workspace.ResolveRoot(g.root)
+	return &globArtifact{pattern: a.Pattern, searchRel: searchRel, searchAbs: searchAbs, displayRoot: displayRoot}, nil
+}
+
+// resolveSearch is the SINGLE resolution step both prepareGlob and
+// InvokableRun's stage-1 recheck use (mirrors grep.Grep.resolveSearch; see
+// its doc comment for the full rationale on message stability and the
+// uncontained displayRoot choice).
+func (g *Glob) resolveSearch(input string) (searchAbs, displayRoot string, err error) {
+	if !g.hostReads {
+		searchAbs, err = workspace.ContainedPath(g.root, input)
+		if err != nil {
+			return "", "", &globError{reason: "search root is outside the workspace: " + input, cause: err}
+		}
+		root, rerr := workspace.ResolveRoot(g.root)
+		if rerr != nil {
+			return "", "", &globError{reason: "workspace root could not be resolved", cause: rerr}
+		}
+		return searchAbs, root, nil
+	}
+	searchAbs, contained, err := workspace.ResolvedPath(g.root, input)
 	if err != nil {
-		return nil, &globError{reason: "workspace root could not be resolved", cause: err}
+		reason := "search root is outside the workspace: " + input
+		if filepath.IsAbs(input) {
+			reason = "search root could not be resolved: " + input
+		}
+		return "", "", &globError{reason: reason, cause: err}
 	}
-	return &globArtifact{pattern: a.Pattern, searchRel: searchRel, searchAbs: searchAbs, resolvedRoot: resolvedRoot}, nil
+	if !contained {
+		return searchAbs, searchAbs, nil
+	}
+	root, rerr := workspace.ResolveRoot(g.root)
+	if rerr != nil {
+		return "", "", &globError{reason: "workspace root could not be resolved", cause: rerr}
+	}
+	return searchAbs, root, nil
 }
 
 // PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
@@ -182,15 +243,15 @@ func (g *Glob) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, er
 
 	// Enforce the APPROVED resolved walk root: a resolution changed between
 	// prepare and run (a symlink swap) refuses the walk fail-closed.
-	searchAbs, err := workspace.ContainedPath(g.root, art.searchRel)
-	if err != nil {
-		return tool.TextResult("error: search root is outside the workspace: " + art.searchRel), nil
+	searchAbs, _, rerr := g.resolveSearch(art.searchRel)
+	if rerr != nil {
+		return tool.TextResult("error: " + rerr.Error()), nil
 	}
 	if searchAbs != art.searchAbs {
 		return tool.TextResult("error: search root resolution changed since approval: " + art.searchRel), nil
 	}
 
-	matches, truncated, expired := g.walk(ctx, art.searchAbs, art.resolvedRoot, art.pattern)
+	matches, truncated, expired := g.walk(ctx, art.searchAbs, art.displayRoot, art.pattern)
 	if expired {
 		return tool.TextResult("error: glob timed out"), nil
 	}

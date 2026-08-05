@@ -108,6 +108,8 @@ const grepSchema = `{
 
 const grepDesc = "Search workspace file contents for a regular expression. Confined to the workspace, skips denied (secret) paths and noise directories, and is capped. Uses ripgrep when available, otherwise a built-in scanner."
 
+const grepHostReadsDesc = "Search file contents for a regular expression. An absolute path may resolve outside the workspace, subject to the caller's read authority; skips denied (secret) paths and noise directories, and is capped. Uses ripgrep when available, otherwise a built-in scanner."
+
 // grepArgs is the typed decode of Grep's untrusted argsJSON.
 type grepArgs struct {
 	Pattern      string `json:"pattern"`
@@ -138,6 +140,7 @@ type Grep struct {
 	guard      loop.ReadGuard
 	useRg      bool
 	argvRunner tool.ArgvRunner
+	hostReads  bool
 }
 
 // GrepOption configures a Grep at construction (functional-options pattern).
@@ -148,6 +151,20 @@ type GrepOption func(*Grep)
 // runner (the default) preserves the exact bare-harness direct-execution behavior.
 func WithArgvRunner(r tool.ArgvRunner) GrepOption {
 	return func(g *Grep) { g.argvRunner = r }
+}
+
+// WithHostReads lets an absolute search path resolve OUTSIDE the workspace
+// instead of being rejected at prepare time -- the Grep counterpart to
+// readfile.WithHostReads(). It does not itself grant anything: an uncontained
+// resolved search root still emits the same filesystem.read requirement
+// PrepareCall always has, so the consumer's bound access source makes the
+// actual Allow/Deny/Gated decision. A RELATIVE "../" traversal is never
+// widened by this option -- only a literal absolute path argument can resolve
+// outside the workspace. Matched file paths in an uncontained (host) search
+// are displayed relative to the SEARCHED directory itself, not the workspace
+// root (which a host path has no meaningful relative spelling against).
+func WithHostReads() GrepOption {
+	return func(g *Grep) { g.hostReads = true }
 }
 
 // NewGrep constructs a Grep bound to the workspace root and read guard, preferring
@@ -168,9 +185,13 @@ func newGrepWithBackend(root string, guard loop.ReadGuard, useRg bool, opts ...G
 
 // Info returns Grep's self-description. Name MUST equal "Grep".
 func (g *Grep) Info(context.Context) (*tool.ToolInfo, error) {
+	desc := grepDesc
+	if g.hostReads {
+		desc = grepHostReadsDesc
+	}
 	return &tool.ToolInfo{
 		Name:   grepToolName,
-		Desc:   grepDesc,
+		Desc:   desc,
 		Schema: json.RawMessage(grepSchema),
 	}, nil
 }
@@ -195,12 +216,19 @@ func (g *Grep) AuditSummary(argsJSON string) string {
 // the sealed tool.PreparedArtifact marker.
 type grepArtifact struct {
 	tool.TokenArtifact
-	pattern      string // raw pattern (rg backend)
-	re           *regexp.Regexp
-	searchRel    string // model-supplied search path (display + run-time re-check)
-	searchAbs    string // canonical resolved walk root (requirement Scope)
-	resolvedRoot string // canonical workspace root (relative-path anchor)
-	opts         grepOptions
+	pattern   string // raw pattern (rg backend)
+	re        *regexp.Regexp
+	searchRel string // model-supplied search path (display + run-time re-check)
+	searchAbs string // canonical resolved walk root (requirement Scope)
+	// displayRoot is what matched file paths are relativized against. For a
+	// workspace-contained search it is the canonical workspace root (matches
+	// unchanged). For an UNCONTAINED host search (WithHostReads() only), it is
+	// searchAbs itself, so results display relative to the searched host
+	// directory -- the workspace root has no meaningful relative spelling for a
+	// host path outside it, and DenyFilteredRel would otherwise silently drop
+	// every result as an "escape".
+	displayRoot string
+	opts        grepOptions
 }
 
 // prepareGrep is the SINGLE parse-validate-canonicalize step for a Grep call:
@@ -221,13 +249,9 @@ func (g *Grep) prepareGrep(argsJSON string) (*grepArtifact, error) {
 	if searchRel == "" {
 		searchRel = defaultSearchDir
 	}
-	searchAbs, err := workspace.ContainedPath(g.root, searchRel)
+	searchAbs, displayRoot, err := g.resolveSearch(searchRel)
 	if err != nil {
-		return nil, &grepError{reason: "search path is outside the workspace: " + searchRel, cause: err}
-	}
-	resolvedRoot, err := workspace.ResolveRoot(g.root)
-	if err != nil {
-		return nil, &grepError{reason: "workspace root could not be resolved", cause: err}
+		return nil, err
 	}
 	// Compile the pattern up front: an invalid regex fails preparation (and the
 	// fallback needs the compiled form anyway).
@@ -236,11 +260,11 @@ func (g *Grep) prepareGrep(argsJSON string) (*grepArtifact, error) {
 		return nil, &grepError{reason: "invalid pattern: " + err.Error(), cause: err}
 	}
 	return &grepArtifact{
-		pattern:      a.Pattern,
-		re:           re,
-		searchRel:    searchRel,
-		searchAbs:    searchAbs,
-		resolvedRoot: resolvedRoot,
+		pattern:     a.Pattern,
+		re:          re,
+		searchRel:   searchRel,
+		searchAbs:   searchAbs,
+		displayRoot: displayRoot,
 		opts: grepOptions{
 			recursive:    a.Recursive == nil || *a.Recursive, // default true.
 			ignoreCase:   a.IgnoreCase,
@@ -248,6 +272,49 @@ func (g *Grep) prepareGrep(argsJSON string) (*grepArtifact, error) {
 			includeAll:   a.IncludeAll,
 		},
 	}, nil
+}
+
+// resolveSearch is the SINGLE resolution step both prepareGrep and
+// InvokableRun's stage-1 recheck use, so the two can never drift on how a
+// search path resolves between approval and execution. Without
+// WithHostReads(), it is exactly workspace.ContainedPath plus the canonical
+// workspace root as displayRoot -- unchanged historical behavior, matching
+// message included. With WithHostReads(), it is workspace.ResolvedPath: a
+// RELATIVE input's error keeps the historical "outside the workspace"
+// message (it is the exact same containedPath rejection, forwarded
+// verbatim); only an ABSOLUTE input can fail for the new reason (its
+// existing-prefix chain itself could not be resolved). An uncontained
+// (host) result is not an error at this layer -- the filesystem.read gate
+// decides it -- and reports itself as displayRoot so matches are shown
+// relative to the searched host directory.
+func (g *Grep) resolveSearch(input string) (searchAbs, displayRoot string, err error) {
+	if !g.hostReads {
+		searchAbs, err = workspace.ContainedPath(g.root, input)
+		if err != nil {
+			return "", "", &grepError{reason: "search path is outside the workspace: " + input, cause: err}
+		}
+		root, rerr := workspace.ResolveRoot(g.root)
+		if rerr != nil {
+			return "", "", &grepError{reason: "workspace root could not be resolved", cause: rerr}
+		}
+		return searchAbs, root, nil
+	}
+	searchAbs, contained, err := workspace.ResolvedPath(g.root, input)
+	if err != nil {
+		reason := "search path is outside the workspace: " + input
+		if filepath.IsAbs(input) {
+			reason = "search path could not be resolved: " + input
+		}
+		return "", "", &grepError{reason: reason, cause: err}
+	}
+	if !contained {
+		return searchAbs, searchAbs, nil
+	}
+	root, rerr := workspace.ResolveRoot(g.root)
+	if rerr != nil {
+		return "", "", &grepError{reason: "workspace root could not be resolved", cause: rerr}
+	}
+	return searchAbs, root, nil
 }
 
 // PrepareCall decodes and validates the untrusted arguments ONCE (including
@@ -281,9 +348,9 @@ func (g *Grep) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, er
 
 	// Enforce the APPROVED resolved walk root: a resolution changed between
 	// prepare and run (a symlink swap) refuses the search fail-closed.
-	searchAbs, err := workspace.ContainedPath(g.root, art.searchRel)
-	if err != nil {
-		return tool.TextResult("error: search path is outside the workspace: " + art.searchRel), nil
+	searchAbs, _, rerr := g.resolveSearch(art.searchRel)
+	if rerr != nil {
+		return tool.TextResult("error: " + rerr.Error()), nil
 	}
 	if searchAbs != art.searchAbs {
 		return tool.TextResult("error: search path resolution changed since approval: " + art.searchRel), nil
@@ -299,9 +366,9 @@ func (g *Grep) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, er
 	var matches []string
 	var truncated, expired bool
 	if g.useRg {
-		matches, truncated, expired = g.runRg(ctx, art.pattern, art.searchAbs, art.resolvedRoot, art.opts)
+		matches, truncated, expired = g.runRg(ctx, art.pattern, art.searchAbs, art.displayRoot, art.opts)
 	} else {
-		matches, truncated, expired = g.runFallback(ctx, art.searchAbs, art.resolvedRoot, art.re, art.opts)
+		matches, truncated, expired = g.runFallback(ctx, art.searchAbs, art.displayRoot, art.re, art.opts)
 	}
 	if expired {
 		return tool.TextResult("error: grep timed out"), nil

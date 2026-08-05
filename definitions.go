@@ -24,12 +24,13 @@ import (
 
 type DefinitionBuildError = definition.BuildError
 
-func GlobDefinition(readGuard loop.ReadGuard) tool.Definition {
+func GlobDefinition(readGuard loop.ReadGuard, options ...glob.GlobOption) tool.Definition {
+	sealed := append([]glob.GlobOption(nil), options...)
 	return tool.NewDefinition("Glob", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if workspace.IsNil(readGuard) {
 			return nil, &DefinitionBuildError{Definition: "Glob", Dependency: "read_guard"}
 		}
-		return []tool.InvokableTool{glob.NewGlob(bindings.Workspace.Root, readGuard)}, nil
+		return []tool.InvokableTool{glob.NewGlob(bindings.Workspace.Root, readGuard, sealed...)}, nil
 	})
 }
 
@@ -73,12 +74,13 @@ func FetchDefinition(client *http.Client) tool.Definition {
 	})
 }
 
-func ReadFileDefinition(readGuard loop.ReadGuard) tool.Definition {
+func ReadFileDefinition(readGuard loop.ReadGuard, options ...readfile.ReadFileOption) tool.Definition {
+	sealed := append([]readfile.ReadFileOption(nil), options...)
 	return tool.NewDefinition("ReadFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if workspace.IsNil(readGuard) {
 			return nil, &DefinitionBuildError{Definition: "ReadFile", Dependency: "read_guard"}
 		}
-		return []tool.InvokableTool{readfile.NewReadFile(bindings.Workspace.Root, readGuard, loopObservations(bindings.Workspace.Observations))}, nil
+		return []tool.InvokableTool{readfile.NewReadFile(bindings.Workspace.Root, readGuard, loopObservations(bindings.Workspace.Observations), sealed...)}, nil
 	})
 }
 

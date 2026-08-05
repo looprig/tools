@@ -54,6 +54,8 @@ const readFileSchema = `{
 
 const readFileDesc = "Read a UTF-8 text file from the workspace and return its contents as line-numbered text. Supports an optional 1-based line range. Reads are confined to the workspace, never follow a final-component symlink, and are capped at a per-file byte limit."
 
+const readFileHostReadsDesc = "Read a UTF-8 text file and return its contents as line-numbered text. Supports an optional 1-based line range. An absolute path may resolve outside the workspace, subject to the caller's read authority; reads never follow a final-component symlink and are capped at a per-file byte limit."
+
 // readFileArgs is the typed decode of ReadFile's untrusted argsJSON.
 type readFileArgs struct {
 	Path      string `json:"path"`
@@ -66,24 +68,55 @@ type readFileArgs struct {
 // segregation), and the loop's shared observation map: it never sees the full
 // permission gate.
 type ReadFile struct {
-	root  string
-	guard loop.ReadGuard
-	obs   tool.WorkspaceObservations
+	root      string
+	guard     loop.ReadGuard
+	obs       tool.WorkspaceObservations
+	hostReads bool
+}
+
+// ReadFileOption configures a ReadFile at construction (functional-options
+// pattern, matching grep.GrepOption).
+type ReadFileOption func(*ReadFile)
+
+// WithHostReads lets an absolute path resolve OUTSIDE the workspace instead of
+// being rejected at prepare time. It does not itself grant anything: an
+// uncontained resolved path still emits the same filesystem.read requirement
+// PrepareCall always has, so the consumer's bound access source (the selected
+// sandbox.Profile in coderig) makes the actual Allow/Deny/Gated decision --
+// the same authority a spawned Bash command's host reads already go through.
+// Without this option, ReadFile's behavior is unchanged: any path outside the
+// workspace is rejected lexically before a requirement is ever built. A
+// RELATIVE "../" traversal is NEVER widened by this option -- only a literal
+// absolute path argument can resolve outside the workspace (workspace.ResolvedPath).
+// A successful uncontained read never records an observation (see
+// InvokableRun): a host read must not feed the same-loop write-authorization
+// map, since WriteFile/EditFile remain workspace-confined regardless of this
+// option.
+func WithHostReads() ReadFileOption {
+	return func(r *ReadFile) { r.hostReads = true }
 }
 
 // NewReadFile constructs a ReadFile bound to the workspace root, read guard, and
 // the loop's shared observation map. A complete read records the raw-content hash
 // into obs so a subsequent same-loop WriteFile/EditFile of the same path is
 // authorized; obs is supplied by Files (one per loop binding).
-func NewReadFile(root string, guard loop.ReadGuard, obs tool.WorkspaceObservations) *ReadFile {
-	return &ReadFile{root: root, guard: guard, obs: obs}
+func NewReadFile(root string, guard loop.ReadGuard, obs tool.WorkspaceObservations, opts ...ReadFileOption) *ReadFile {
+	r := &ReadFile{root: root, guard: guard, obs: obs}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Info returns ReadFile's self-description. Name MUST equal "ReadFile".
 func (r *ReadFile) Info(context.Context) (*tool.ToolInfo, error) {
+	desc := readFileDesc
+	if r.hostReads {
+		desc = readFileHostReadsDesc
+	}
 	return &tool.ToolInfo{
 		Name:   readFileToolName,
-		Desc:   readFileDesc,
+		Desc:   desc,
 		Schema: json.RawMessage(readFileSchema),
 	}, nil
 }
@@ -108,6 +141,7 @@ type readFileArtifact struct {
 	abs       string // canonical symlink-resolved path (requirement Scope/Match, observation key)
 	lexical   string // lexically-joined on-disk name the O_NOFOLLOW open targets
 	display   string // model-supplied path, used only in messages
+	contained bool   // whether abs is inside the workspace root (false only possible under WithHostReads)
 	startLine int
 	endLine   int
 }
@@ -125,17 +159,61 @@ func (r *ReadFile) prepareRead(argsJSON string) (*readFileArtifact, error) {
 	if err := validateLineRange(a.StartLine, a.EndLine); err != nil {
 		return nil, err
 	}
-	abs, err := workspace.ContainedPath(r.root, a.Path)
+	abs, contained, lexical, err := r.resolveRead(a.Path)
 	if err != nil {
-		return nil, &readFileError{reason: "path is outside the workspace", cause: err}
+		return nil, err
 	}
 	return &readFileArtifact{
 		abs:       abs,
-		lexical:   joinedUnderRoot(r.root, a.Path),
+		lexical:   lexical,
 		display:   a.Path,
+		contained: contained,
 		startLine: a.StartLine,
 		endLine:   a.EndLine,
 	}, nil
+}
+
+// resolveRead is the SINGLE resolution step both PrepareCall (via prepareRead)
+// and InvokableRun's stage-1 recheck use, so the two can never drift on how a
+// path resolves between approval and execution. Without WithHostReads(), it is
+// exactly workspace.ContainedPath -- any non-nil error means "outside the
+// workspace", matching the historical error message. With WithHostReads(), it
+// is workspace.ResolvedPath -- a non-nil error here means resolution itself
+// failed (e.g. an unresolvable symlink chain), never merely "outside the
+// workspace", since an uncontained-but-resolved path is not an error at this
+// layer; the filesystem.read gate decides it. lexical is the ON-DISK name
+// (never symlink-resolved) the caller's O_NOFOLLOW open must target: joined
+// under root for a contained result, or the cleaned input itself for an
+// uncontained absolute one, so a symlinked final component is rejected by
+// O_NOFOLLOW either way, never silently followed.
+func (r *ReadFile) resolveRead(input string) (abs string, contained bool, lexical string, err error) {
+	if !r.hostReads {
+		abs, err = workspace.ContainedPath(r.root, input)
+		if err != nil {
+			return "", false, "", &readFileError{reason: "path is outside the workspace", cause: err}
+		}
+		return abs, true, joinedUnderRoot(r.root, input), nil
+	}
+	abs, contained, err = workspace.ResolvedPath(r.root, input)
+	if err != nil {
+		// A RELATIVE input's error always comes from the exact same containedPath
+		// call the non-widened branch above makes (workspace.ResolvedPath forwards
+		// it verbatim for relative input) -- keep its historical message. Only an
+		// ABSOLUTE input can fail for the NEW reason (its existing-prefix chain
+		// itself could not be resolved), which is a materially different cause and
+		// gets its own message.
+		reason := "path is outside the workspace"
+		if filepath.IsAbs(input) {
+			reason = "path could not be resolved"
+		}
+		return "", false, "", &readFileError{reason: reason, cause: err}
+	}
+	if filepath.IsAbs(input) {
+		// input is already the correct on-disk name; joinedUnderRoot would
+		// wrongly re-anchor an absolute path underneath root.
+		return abs, contained, filepath.Clean(input), nil
+	}
+	return abs, contained, joinedUnderRoot(r.root, input), nil
 }
 
 // PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
@@ -171,9 +249,9 @@ func (r *ReadFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	// containment once for the permission decision; re-proving the resolution
 	// still equals the approved canonical target closes the prepare→run window
 	// (a parent-dir symlink swap must not redirect the read).
-	abs, err := workspace.ContainedPath(r.root, art.display)
-	if err != nil {
-		return tool.TextResult("error: path is outside the workspace: " + art.display), nil
+	abs, _, _, rerr := r.resolveRead(art.display)
+	if rerr != nil {
+		return tool.TextResult("error: " + rerr.Error() + ": " + art.display), nil
 	}
 	if abs != art.abs {
 		return tool.TextResult("error: path resolution changed since approval: " + art.display), nil
@@ -196,8 +274,12 @@ func (r *ReadFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	if err != nil {
 		// A DEFINITIVE not-found records absence (authorizing a later create of a
 		// genuinely new file). Every other failure — symlink (ELOOP), not-regular,
-		// or a read error — is ambiguous and records NO usable observation.
-		if errors.Is(err, os.ErrNotExist) {
+		// or a read error — is ambiguous and records NO usable observation. An
+		// UNCONTAINED (host) target records nothing either way: WriteFile/EditFile
+		// stay workspace-confined regardless of WithHostReads(), so a host read
+		// authorizing a future write there is never meaningful, and a host read
+		// must not feed the same-loop write-authorization map at all.
+		if art.contained && errors.Is(err, os.ErrNotExist) {
 			_ = r.obs.WithPath(string(key), func(obs *tool.FileObservation) error {
 				*obs = tool.FileObservation{Observed: true}
 				return nil
@@ -218,7 +300,7 @@ func (r *ReadFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	// saw only a prefix, so its hash would not cover the whole file and MUST NOT be
 	// recorded (else a partial read could authorize clobbering the unseen remainder).
 	// The hash is private — it never reaches the model.
-	if !truncated {
+	if !truncated && art.contained {
 		_ = r.obs.WithPath(string(key), func(obs *tool.FileObservation) error {
 			*obs = tool.FileObservation{Observed: true, Present: true, Hash: sha256.Sum256([]byte(body))}
 			return nil
