@@ -20,3 +20,7 @@ func New(root string, observations tool.WorkspaceObservations, options ...Option
 func WithMutationCoordinator(coordinator tool.WorkspaceCoordinator) Option {
 	return filemutation.WithMutationCoordinator(coordinator)
 }
+
+func WithHostWrites() Option {
+	return filemutation.WithHostWrites()
+}

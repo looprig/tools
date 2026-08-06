@@ -84,15 +84,29 @@ func ReadFileDefinition(readGuard loop.ReadGuard, options ...readfile.ReadFileOp
 	})
 }
 
-func WriteFileDefinition() tool.Definition {
+// WriteFileDefinition accepts writefile.Option values such as
+// writefile.WithHostWrites(). Do not pass writefile.WithMutationCoordinator
+// here: this entry point already injects the session-bound coordinator, and a
+// caller-supplied one is applied after it and silently wins, defeating the
+// PathMutation permit and lease-health check with no error.
+func WriteFileDefinition(options ...writefile.Option) tool.Definition {
+	sealed := append([]writefile.Option(nil), options...)
 	return tool.NewDefinition("WriteFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
-		return []tool.InvokableTool{writefile.New(bindings.Workspace.Root, loopObservations(bindings.Workspace.Observations), writefile.WithMutationCoordinator(bindings.Workspace.Coordinator))}, nil
+		opts := append([]writefile.Option{writefile.WithMutationCoordinator(bindings.Workspace.Coordinator)}, sealed...)
+		return []tool.InvokableTool{writefile.New(bindings.Workspace.Root, loopObservations(bindings.Workspace.Observations), opts...)}, nil
 	})
 }
 
-func EditFileDefinition() tool.Definition {
+// EditFileDefinition accepts editfile.Option values such as
+// editfile.WithHostWrites(). Do not pass editfile.WithMutationCoordinator
+// here: this entry point already injects the session-bound coordinator, and a
+// caller-supplied one is applied after it and silently wins, defeating the
+// PathMutation permit and lease-health check with no error.
+func EditFileDefinition(options ...editfile.Option) tool.Definition {
+	sealed := append([]editfile.Option(nil), options...)
 	return tool.NewDefinition("EditFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
-		return []tool.InvokableTool{editfile.New(bindings.Workspace.Root, loopObservations(bindings.Workspace.Observations), editfile.WithMutationCoordinator(bindings.Workspace.Coordinator))}, nil
+		opts := append([]editfile.Option{editfile.WithMutationCoordinator(bindings.Workspace.Coordinator)}, sealed...)
+		return []tool.InvokableTool{editfile.New(bindings.Workspace.Root, loopObservations(bindings.Workspace.Observations), opts...)}, nil
 	})
 }
 
