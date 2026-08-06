@@ -295,6 +295,56 @@ func TestWriteFilePrepareCallContainedRequirementUnchangedWithHostWrites(t *test
 	}
 }
 
+// --- 7b: an ABSOLUTE input that still resolves INSIDE the workspace stays
+// contained even with WithHostWrites() enabled -- proving it is
+// target.contained (not merely "the option is on") that gates Candidates and
+// Description, mirroring the read side's
+// TestReadFileWithHostReadsInWorkspaceAbsolutePathStillObserves
+// (readfile/readfile_hostreads_test.go). ---
+
+func TestWriteFilePrepareCallHostWritesAbsoluteInWorkspacePathStillContained(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	inside := filepath.Join(root, "f.txt")
+	w := NewWriteFile(root, newFileObservations(), WithHostWrites())
+
+	req, _, err := w.PrepareCall(context.Background(), mustUUID(t), mustJSON(t, map[string]any{"path": inside, "content": "hi"}))
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	wantAbs := resolvedJoin(t, root, "f.txt")
+	r := req.Requirements[0]
+	if r.Description != "write "+wantAbs {
+		t.Errorf("Description = %q, want %q", r.Description, "write "+wantAbs)
+	}
+	if len(r.Candidates) != 1 || r.Candidates[0].Match != wantAbs || r.Candidates[0].Kind != r.Kind {
+		t.Errorf("Candidates = %+v, want one exact-path candidate for %q", r.Candidates, wantAbs)
+	}
+}
+
+func TestEditFilePrepareCallHostWritesAbsoluteInWorkspacePathStillContained(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	inside := filepath.Join(root, "f.txt")
+	if err := os.WriteFile(inside, []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := NewEditFile(root, newFileObservations(), WithHostWrites())
+
+	req, _, err := e.PrepareCall(context.Background(), mustUUID(t), mustJSON(t, map[string]any{"path": inside, "old": "alpha", "new": "beta"}))
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	wantAbs := resolvedJoin(t, root, "f.txt")
+	r := req.Requirements[0]
+	if r.Description != "write "+wantAbs {
+		t.Errorf("Description = %q, want %q", r.Description, "write "+wantAbs)
+	}
+	if len(r.Candidates) != 1 || r.Candidates[0].Match != wantAbs || r.Candidates[0].Kind != r.Kind {
+		t.Errorf("Candidates = %+v, want one exact-path candidate for %q", r.Candidates, wantAbs)
+	}
+}
+
 // --- 8: run-time stage-1 recheck refuses a changed resolution for a host target ---
 
 func TestEnforceApprovedResolutionHostWritesRefusesChangedResolution(t *testing.T) {
@@ -329,5 +379,55 @@ func TestEnforceApprovedResolutionHostWritesRefusesChangedResolution(t *testing.
 
 	if err := enforceApprovedResolution(root, target, true); err == nil {
 		t.Fatalf("enforceApprovedResolution() error = nil, want refusal after resolution changed")
+	}
+}
+
+// TestEnforceApprovedResolutionHostWritesRefusesUnresolvableTarget exercises
+// enforceApprovedResolution's OTHER failure branch: RE-RESOLUTION itself
+// failing outright (a bare non-nil err from resolveMutationTarget, returned
+// as-is) rather than resolving to a DIFFERENT valid target (the
+// "abs != target.abs" comparison branch already covered above). A
+// self-referential symlink swapped in after approval makes the display path
+// unresolvable (ELOOP), which must surface as "path could not be resolved"
+// (resolveMutationTarget's absolute-input resolution-failure reason) --
+// distinct from "path resolution changed since approval".
+func TestEnforceApprovedResolutionHostWritesRefusesUnresolvableTarget(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	a := filepath.Join(hostDir, "a")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	display := filepath.Join(a, "f.txt")
+
+	target, err := resolveMutationTarget(root, display, true)
+	if err != nil {
+		t.Fatalf("resolveMutationTarget() error = %v", err)
+	}
+	if target.contained {
+		t.Fatalf("target.contained = true, want false")
+	}
+
+	// Swap "a" -> a SELF-REFERENTIAL symlink AFTER "approval": resolving
+	// display now hits ELOOP instead of landing on any valid (even if
+	// different) target.
+	if err := os.RemoveAll(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(a, a); err != nil {
+		t.Fatal(err)
+	}
+
+	err = enforceApprovedResolution(root, target, true)
+	if err == nil {
+		t.Fatalf("enforceApprovedResolution() error = nil, want refusal for an unresolvable target")
+	}
+	wfe, ok := err.(*writeFileError)
+	if !ok {
+		t.Fatalf("error type = %T, want *writeFileError", err)
+	}
+	if wfe.reason != "path could not be resolved" {
+		t.Errorf("reason = %q, want %q (the bare-error-return branch, not the changed-resolution branch)", wfe.reason, "path could not be resolved")
 	}
 }
