@@ -74,6 +74,13 @@ const writeFileSchema = `{
 
 const writeFileDesc = "Write a UTF-8 text file in the workspace, creating parent directories as needed and overwriting any existing file atomically. Writes are confined to the workspace and never follow a final-component symlink. Requires approval before each write."
 
+// writeFileHostWritesDesc is WriteFile's Info() description when constructed
+// WithHostWrites(): an absolute path may resolve outside the workspace
+// (subject to the caller's write authority), and — critically — such writes
+// are NOT covered by session checkpoint/undo, which only snapshots the
+// workspace.
+const writeFileHostWritesDesc = "Write a UTF-8 text file, creating parent directories as needed and overwriting any existing file atomically. An absolute path may resolve outside the workspace, subject to the caller's write authority; writes never follow a final-component symlink. Writes outside the workspace are NOT covered by session checkpoint/undo. Requires approval before each write."
+
 // writeFileArgs is the typed decode of WriteFile's untrusted argsJSON.
 type writeFileArgs struct {
 	Path    string `json:"path"`
@@ -91,6 +98,12 @@ type writeFileArgs struct {
 // commit runs under a SHARED session-mutation + canonical-PATH permit (design
 // §"File-tool optimistic concurrency and binding"), which serializes same-real-file
 // writes ACROSS loops (the private observation map only serializes within one loop).
+//
+// This optimistic-concurrency policy applies ONLY to a CONTAINED (in-workspace)
+// target. An UNCONTAINED target (WithHostWrites(), an absolute path resolving
+// outside the workspace) never consults or updates the observation map in either
+// direction — see commitUncontained's doc comment for the product decision behind
+// that split.
 type WriteFile struct {
 	root       string
 	obs        tool.WorkspaceObservations
@@ -108,11 +121,17 @@ func NewWriteFile(root string, obs tool.WorkspaceObservations, opts ...FileMutat
 	return &WriteFile{root: root, obs: obs, coord: cfg.coord, hostWrites: cfg.hostWrites}
 }
 
-// Info returns WriteFile's self-description. Name MUST equal "WriteFile".
+// Info returns WriteFile's self-description. Name MUST equal "WriteFile". The
+// description swaps to writeFileHostWritesDesc when hostWrites is set,
+// mirroring readfile.go's readFileDesc/readFileHostReadsDesc swap.
 func (w *WriteFile) Info(context.Context) (*tool.ToolInfo, error) {
+	desc := writeFileDesc
+	if w.hostWrites {
+		desc = writeFileHostWritesDesc
+	}
 	return &tool.ToolInfo{
 		Name:   writeFileToolName,
-		Desc:   writeFileDesc,
+		Desc:   desc,
 		Schema: json.RawMessage(writeFileSchema),
 	}, nil
 }
@@ -220,33 +239,33 @@ func (w *WriteFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResul
 	// on-disk write targets the LEXICAL joined path (NOT the symlink-resolved form),
 	// mirroring ReadFile/EditFile: an atomic Rename/Link on this lexical name never
 	// follows a final-component symlink.
-	if err := w.commit(key, art.target.lexical, art.target.display, []byte(art.content)); err != nil {
+	if err := w.commit(key, art.target, []byte(art.content)); err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
 	return tool.TextResult("wrote " + art.target.display + " (" + strconv.Itoa(len(art.content)) + " bytes)"), nil
 }
 
-// commit performs the optimistic-concurrency write for one path while holding that
-// path's critical section: it cheaply classifies the target (absent / regular /
-// irregular), then either creates a genuinely absent file via an atomic no-replace
-// publication, or overwrites an existing regular file — but ONLY if this loop's
-// complete observation still equals the file's current on-disk hash. The classify,
-// the (deferred) hash read, and the publish all happen under one lock hold, so a
-// concurrent same-loop change between check and write cannot slip through. On a
-// stale/conflict/irregular refusal the entry is invalidated and a typed error is
-// returned; on success the new content's hash is recorded. lexical is the on-disk
-// target; display is the model-supplied path used only in error messages.
-func (w *WriteFile) commit(key canonicalObservationKey, lexical, display string, data []byte) error {
+// commit performs the write for one target while (for a CONTAINED target) holding
+// that path's optimistic-concurrency critical section, or (for an UNCONTAINED host
+// target) bypassing the observation map entirely — see commitUncontained's doc
+// comment for why. key is the observation-map key (meaningful only for a contained
+// target); target carries the lexical on-disk name, the display path used in error
+// messages, and the contained flag that selects which policy applies; data is the
+// content to write.
+func (w *WriteFile) commit(key canonicalObservationKey, target mutationTarget, data []byte) error {
+	if !target.contained {
+		return w.commitUncontained(target, data)
+	}
 	return w.obs.WithPath(string(key), func(obs *tool.FileObservation) error {
-		switch classifyWriteTarget(lexical) {
+		switch classifyWriteTarget(target.lexical) {
 		case writeTargetAbsent:
 			// Create a genuinely new file. No prior read is required. The no-replace
 			// publication fails without clobbering if another writer wins the race
 			// between this absence check and the link.
-			if err := atomicCreateFile(lexical, data); err != nil {
+			if err := atomicCreateFile(target.lexical, data); err != nil {
 				*obs = tool.FileObservation{}
 				if errors.Is(err, errCreateConflict) {
-					return &FileCreateConflictError{Path: display}
+					return &FileCreateConflictError{Path: target.display}
 				}
 				return err
 			}
@@ -258,7 +277,7 @@ func (w *WriteFile) commit(key canonicalObservationKey, lexical, display string,
 			// (a ReadFile refuses it O_NOFOLLOW), so overwriting is refused with a
 			// distinct error that does NOT tell the model to "read again".
 			*obs = tool.FileObservation{}
-			return &IrregularFileError{Path: display}
+			return &IrregularFileError{Path: target.display}
 		}
 
 		// writeTargetRegular. Without a complete observation the overwrite is doomed
@@ -267,27 +286,72 @@ func (w *WriteFile) commit(key canonicalObservationKey, lexical, display string,
 		// the current contents to complete the compare-and-swap.
 		if !obs.Observed || !obs.Present {
 			*obs = tool.FileObservation{}
-			return &StaleFileError{Path: display}
+			return &StaleFileError{Path: target.display}
 		}
-		curHash, present, err := hashFileOnDisk(lexical)
+		curHash, present, err := hashFileOnDisk(target.lexical)
 		if err != nil {
 			// The target became irregular/unreadable since the classify (a race): fail
 			// secure with the distinct irregular error.
 			*obs = tool.FileObservation{}
-			return &IrregularFileError{Path: display}
+			return &IrregularFileError{Path: target.display}
 		}
 		if !present || obs.Hash != curHash {
 			// Vanished, or its content changed since our read: an optimistic-concurrency
 			// conflict — read again.
 			*obs = tool.FileObservation{}
-			return &StaleFileError{Path: display}
+			return &StaleFileError{Path: target.display}
 		}
-		if err := atomicWriteFile(lexical, data); err != nil {
+		if err := atomicWriteFile(target.lexical, data); err != nil {
 			return err
 		}
 		*obs = tool.FileObservation{Observed: true, Present: true, Hash: sha256.Sum256(data)}
 		return nil
 	})
+}
+
+// commitUncontained writes an UNCONTAINED (host) target WITHOUT ever touching the
+// observation map, in either direction: it does not require a prior observation
+// before overwriting an existing file, and it does not record one after a
+// successful write or create. This is a deliberate product decision, not an
+// oversight — a prior host READ must never authorize a later host WRITE, and vice
+// versa (the same decision WithHostReads() already enforces on the read side by
+// never recording an observation for an uncontained read). Recording an
+// observation here would recreate exactly the authority-inheritance channel that
+// decision forbids. The cleanest shape for that is to bypass w.obs.WithPath (and
+// thus commit's per-path critical section) entirely for an uncontained target —
+// cross-loop serialization for the SAME real file still happens one layer up, via
+// the coordinator's PathMutation permit InvokableRun acquires before commit is
+// ever called, so this is not a concurrency-safety gap.
+func (w *WriteFile) commitUncontained(target mutationTarget, data []byte) error {
+	switch classifyWriteTarget(target.lexical) {
+	case writeTargetAbsent:
+		// Unlike the contained path, stageTempFile's MkdirAll must NOT be allowed to
+		// silently manufacture a directory chain the approval never named (a typo'd
+		// host path). Require the parent to already exist before attempting the
+		// create.
+		parent := filepath.Dir(target.lexical)
+		fi, err := os.Stat(parent)
+		if err != nil || !fi.IsDir() {
+			return &writeFileError{reason: "parent directory does not exist", cause: err}
+		}
+		if err := atomicCreateFile(target.lexical, data); err != nil {
+			if errors.Is(err, errCreateConflict) {
+				return &FileCreateConflictError{Path: target.display}
+			}
+			return err
+		}
+		return nil
+
+	case writeTargetIrregular:
+		// A final-component symlink or other non-regular node: refused exactly as for
+		// a contained target.
+		return &IrregularFileError{Path: target.display}
+	}
+
+	// writeTargetRegular. No observation check, no hash comparison: an uncontained
+	// overwrite is authorized by the fresh approval alone, never by a same-loop
+	// observation (in either direction).
+	return atomicWriteFile(target.lexical, data)
 }
 
 // writeTargetKind classifies a write/edit target's final component without reading

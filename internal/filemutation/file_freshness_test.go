@@ -356,7 +356,8 @@ func TestUnobservedOverwriteRejectedCheaply(t *testing.T) {
 	}
 	// commit is exercised directly so the typed error survives (InvokableRun flattens
 	// it to a tool-result string).
-	cerr := w.commit(canonicalObservationKey(abs), workspace.JoinedPath(root, "big.txt"), "big.txt", []byte("small"))
+	target := mutationTarget{abs: abs, contained: true, lexical: workspace.JoinedPath(root, "big.txt"), display: "big.txt"}
+	cerr := w.commit(canonicalObservationKey(abs), target, []byte("small"))
 	var stale *StaleFileError
 	if !errors.As(cerr, &stale) {
 		t.Fatalf("commit err = %v (%T), want *StaleFileError", cerr, cerr)
@@ -388,6 +389,7 @@ func TestIrregularWriteTargetIsTyped(t *testing.T) {
 	}
 	key := canonicalObservationKey(abs)
 	lexical := workspace.JoinedPath(root, "l.txt")
+	mutTarget := mutationTarget{abs: abs, contained: true, lexical: lexical, display: "l.txt"}
 
 	assertIrregularNotStale := func(t *testing.T, cerr error) {
 		t.Helper()
@@ -403,7 +405,7 @@ func TestIrregularWriteTargetIsTyped(t *testing.T) {
 
 	t.Run("WriteFile", func(t *testing.T) {
 		obs := newFileObservations()
-		assertIrregularNotStale(t, NewWriteFile(root, obs).commit(key, lexical, "l.txt", []byte("x")))
+		assertIrregularNotStale(t, NewWriteFile(root, obs).commit(key, mutTarget, []byte("x")))
 	})
 	t.Run("EditFile", func(t *testing.T) {
 		obs := newFileObservations()

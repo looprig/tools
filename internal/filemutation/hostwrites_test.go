@@ -4,8 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/internal/workspace"
 )
 
@@ -29,6 +31,20 @@ import (
 //     unchanged whether or not the option is set.
 //  8. The run-time stage-1 recheck (enforceApprovedResolution) refuses an
 //     approved uncontained target whose resolution changed since approval.
+//
+// It also pins commit-time behavior for an uncontained target (later work,
+// same product decision as WithHostReads(): a prior host read/write must never
+// authorize a later host write/read in either direction):
+//
+//  9. An uncontained CREATE succeeds with NO prior observation, and records
+//     none afterward.
+// 10. An uncontained OVERWRITE of an existing file succeeds with NO prior
+//     observation (no StaleFileError), and records none afterward.
+// 11. An uncontained target whose parent directory is missing fails with a
+//     typed error and does NOT create the directory.
+// 12. An uncontained symlink target is still refused with IrregularFileError.
+// 13. Info()'s description swaps to the host-writes-aware wording when the
+//     option is set.
 
 // resolvedAbsHost resolves input against root exactly as resolveMutationTarget
 // does for a host (uncontained) target, giving tests the canonical abs to
@@ -429,5 +445,199 @@ func TestEnforceApprovedResolutionHostWritesRefusesUnresolvableTarget(t *testing
 	}
 	if wfe.reason != "path could not be resolved" {
 		t.Errorf("reason = %q, want %q (the bare-error-return branch, not the changed-resolution branch)", wfe.reason, "path could not be resolved")
+	}
+}
+
+// --- 9-12: commit-time behavior for an UNCONTAINED (host) target ---
+//
+// The product decision: a prior host READ must never authorize a later host
+// WRITE, and vice versa (the same decision WithHostReads() already enforces on
+// the read side by never recording an observation for an uncontained read).
+// So for an uncontained target, WriteFile.commit must skip BOTH the
+// observation check before an overwrite AND recording an observation after a
+// successful write -- in either direction, never read from or write to the
+// observation map for an uncontained target.
+
+// recordedObservation returns the observation obs currently holds for path,
+// mirroring the inspection idiom used by
+// readfile_hostreads_test.go's TestReadFileWithHostReadsDoesNotRecordObservationForUncontainedRead.
+func recordedObservation(t *testing.T, obs *fileObservations, path string) tool.FileObservation {
+	t.Helper()
+	var recorded tool.FileObservation
+	if err := obs.WithPath(path, func(o *tool.FileObservation) error {
+		recorded = *o
+		return nil
+	}); err != nil {
+		t.Fatalf("obs.WithPath: %v", err)
+	}
+	return recorded
+}
+
+// TestWriteFileHostWritesCreateSucceedsWithoutPriorObservationAndRecordsNone
+// pins behavior 9: an uncontained CREATE (an absent host target) succeeds with
+// NO prior observation, and after success no observation was recorded for it
+// either -- a host write must never feed the same-loop write-authorization map.
+func TestWriteFileHostWritesCreateSucceedsWithoutPriorObservationAndRecordsNone(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	target := filepath.Join(hostDir, "new.txt")
+	obs := newFileObservations()
+	w := NewWriteFile(root, obs, WithHostWrites())
+
+	out := prepareRun(context.Background(), t, w, mustJSON(t, map[string]any{"path": target, "content": "hello"}))
+	if strings.HasPrefix(out, "error:") {
+		t.Fatalf("uncontained create = %q, want success", out)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read created file: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("on-disk body = %q, want %q", got, "hello")
+	}
+
+	abs := resolvedAbsHost(t, root, target)
+	if recorded := recordedObservation(t, obs, abs); recorded.Observed {
+		t.Errorf("uncontained create recorded an observation %+v, want none", recorded)
+	}
+}
+
+// TestWriteFileHostWritesOverwritesExistingWithoutPriorObservationAndRecordsNone
+// pins behavior 10, the key behavior change: overwriting an EXISTING
+// uncontained target succeeds with NO prior observation and no StaleFileError
+// -- for a CONTAINED target the identical setup (an existing file, no prior
+// read) is refused (see TestWriteFreshnessGate's "overwrite without any
+// observation is refused" and writefile_test.go's "unobserved existing file is
+// rejected without clobbering"). After success, no observation is recorded
+// either.
+func TestWriteFileHostWritesOverwritesExistingWithoutPriorObservationAndRecordsNone(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	target := filepath.Join(hostDir, "existing.txt")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	obs := newFileObservations()
+	w := NewWriteFile(root, obs, WithHostWrites())
+
+	out := prepareRun(context.Background(), t, w, mustJSON(t, map[string]any{"path": target, "content": "new"}))
+	if strings.HasPrefix(out, "error:") {
+		t.Fatalf("uncontained overwrite without prior observation = %q, want success (no StaleFileError)", out)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read overwritten file: %v", err)
+	}
+	if string(got) != "new" {
+		t.Errorf("on-disk body = %q, want %q", got, "new")
+	}
+
+	abs := resolvedAbsHost(t, root, target)
+	if recorded := recordedObservation(t, obs, abs); recorded.Observed {
+		t.Errorf("uncontained overwrite recorded an observation %+v, want none", recorded)
+	}
+}
+
+// TestWriteFileHostWritesMissingParentDirFailsWithoutCreatingIt pins behavior
+// 11: an uncontained CREATE whose parent directory does not exist fails with a
+// typed error and, critically, does NOT manufacture the missing directory
+// chain (stageTempFile's MkdirAll would silently do so for a typo'd host
+// path the approval never named -- this pre-flight check exists specifically
+// to prevent that for uncontained targets).
+func TestWriteFileHostWritesMissingParentDirFailsWithoutCreatingIt(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	missingParent := filepath.Join(hostDir, "nope")
+	target := filepath.Join(missingParent, "new.txt")
+	obs := newFileObservations()
+	w := NewWriteFile(root, obs, WithHostWrites())
+
+	out := prepareRun(context.Background(), t, w, mustJSON(t, map[string]any{"path": target, "content": "x"}))
+	if !strings.HasPrefix(out, "error:") {
+		t.Fatalf("uncontained create with missing parent dir = %q, want an error", out)
+	}
+	if _, err := os.Stat(missingParent); !os.IsNotExist(err) {
+		t.Fatalf("missing parent dir %q was created (stat err=%v), want it left absent", missingParent, err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("target %q exists, want no file written", target)
+	}
+}
+
+// TestWriteFileHostWritesIrregularTargetRefused pins behavior 12: an
+// uncontained target whose final component is a symlink is still refused with
+// *IrregularFileError, mirroring the contained-side
+// TestWriteFileUnobservedSymlinkRejected/TestIrregularWriteTargetIsTyped.
+// Neither the symlink node nor its target is touched.
+func TestWriteFileHostWritesIrregularTargetRefused(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	const targetBody = "ORIGINAL TARGET BODY"
+	real := filepath.Join(hostDir, "real.txt")
+	if err := os.WriteFile(real, []byte(targetBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(hostDir, "link.txt")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	obs := newFileObservations()
+	w := NewWriteFile(root, obs, WithHostWrites())
+
+	out := prepareRun(context.Background(), t, w, mustJSON(t, map[string]any{"path": link, "content": "NEW"}))
+	if !strings.HasPrefix(out, "error:") {
+		t.Fatalf("uncontained write to a symlink target = %q, want a fail-secure rejection", out)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat link: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link.txt is no longer a symlink; the rejected write mutated it")
+	}
+	gotTarget, err := os.ReadFile(real)
+	if err != nil {
+		t.Fatalf("read real target: %v", err)
+	}
+	if string(gotTarget) != targetBody {
+		t.Fatalf("symlink target was clobbered: %q, want %q", gotTarget, targetBody)
+	}
+}
+
+// --- 13: Info() reflects host-write mode ---
+
+// TestWriteFileInfoHostWritesDesc pins behavior 13, mirroring readfile.go's
+// readFileDesc/readFileHostReadsDesc swap: with WithHostWrites() set, Info()'s
+// Desc must differ from the default writeFileDesc and must convey that an
+// absolute path may resolve outside the workspace and that such writes are
+// NOT covered by session checkpoint/undo.
+func TestWriteFileInfoHostWritesDesc(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	def, err := NewWriteFile(root, newFileObservations()).Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if def.Desc != writeFileDesc {
+		t.Errorf("Info().Desc without WithHostWrites() = %q, want the unchanged default %q", def.Desc, writeFileDesc)
+	}
+
+	host, err := NewWriteFile(root, newFileObservations(), WithHostWrites()).Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if host.Desc == writeFileDesc {
+		t.Errorf("Info().Desc with WithHostWrites() = %q, want a distinct host-writes-aware description", host.Desc)
+	}
+	if !strings.Contains(host.Desc, "outside the workspace") {
+		t.Errorf("Info().Desc = %q, want it to mention resolving outside the workspace", host.Desc)
+	}
+	if !strings.Contains(host.Desc, "checkpoint") {
+		t.Errorf("Info().Desc = %q, want it to mention writes outside the workspace are not covered by checkpoint/undo", host.Desc)
 	}
 }
