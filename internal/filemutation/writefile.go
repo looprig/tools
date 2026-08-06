@@ -321,18 +321,35 @@ func (w *WriteFile) commit(key canonicalObservationKey, target mutationTarget, d
 // thus commit's per-path critical section) entirely for an uncontained target —
 // cross-loop serialization for the SAME real file still happens one layer up, via
 // the coordinator's PathMutation permit InvokableRun acquires before commit is
-// ever called, so this is not a concurrency-safety gap.
+// ever called, SO LONG AS a coordinator is bound (the runtime always binds one
+// through the Files definition). A coordinator-free WriteFile (the standalone/bare
+// unit-test path, where acquirePathMutation is a documented no-op) gives an
+// uncontained target NO same-loop serialization at all — unlike a contained
+// target, which still serializes on w.obs.WithPath's internal per-path lock even
+// coordinator-free. This is not a corruption risk (os.Rename/os.Link stay atomic
+// at the OS level; the worst case is last-write-wins), but it is a real asymmetry
+// with the contained path.
 func (w *WriteFile) commitUncontained(target mutationTarget, data []byte) error {
 	switch classifyWriteTarget(target.lexical) {
 	case writeTargetAbsent:
 		// Unlike the contained path, stageTempFile's MkdirAll must NOT be allowed to
 		// silently manufacture a directory chain the approval never named (a typo'd
 		// host path). Require the parent to already exist before attempting the
-		// create.
+		// create. This check has a TOCTOU gap of its own: atomicCreateFile ->
+		// stageTempFile still unconditionally MkdirAlls this same parent a few lines
+		// later, so a parent removed/swapped in the narrow window between this Stat
+		// and that MkdirAll is silently recreated — the same class of parent-dir
+		// resolve->open TOCTOU the package doc comment's §3c already accepts as out
+		// of scope for this local single-user tool, not a new hole.
 		parent := filepath.Dir(target.lexical)
 		fi, err := os.Stat(parent)
-		if err != nil || !fi.IsDir() {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
 			return &writeFileError{reason: "parent directory does not exist", cause: err}
+		case err != nil:
+			return &writeFileError{reason: "could not stat parent directory", cause: err}
+		case !fi.IsDir():
+			return &writeFileError{reason: "parent path exists but is not a directory"}
 		}
 		if err := atomicCreateFile(target.lexical, data); err != nil {
 			if errors.Is(err, errCreateConflict) {
