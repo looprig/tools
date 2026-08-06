@@ -92,18 +92,20 @@ type writeFileArgs struct {
 // §"File-tool optimistic concurrency and binding"), which serializes same-real-file
 // writes ACROSS loops (the private observation map only serializes within one loop).
 type WriteFile struct {
-	root  string
-	obs   tool.WorkspaceObservations
-	coord tool.WorkspaceCoordinator
+	root       string
+	obs        tool.WorkspaceObservations
+	coord      tool.WorkspaceCoordinator
+	hostWrites bool
 }
 
 // NewWriteFile constructs a WriteFile bound to the workspace root and the loop's
 // shared observation map (supplied by Files, one per loop binding). A
 // WithMutationCoordinator option binds the session workspace coordinator; without it
-// the tool runs coordinator-free (the standalone/bare path).
+// the tool runs coordinator-free (the standalone/bare path). A WithHostWrites option
+// lets an absolute target resolve outside the workspace instead of being rejected.
 func NewWriteFile(root string, obs tool.WorkspaceObservations, opts ...FileMutatorOption) *WriteFile {
 	cfg := resolveFileMutatorConfig(opts)
-	return &WriteFile{root: root, obs: obs, coord: cfg.coord}
+	return &WriteFile{root: root, obs: obs, coord: cfg.coord, hostWrites: cfg.hostWrites}
 }
 
 // Info returns WriteFile's self-description. Name MUST equal "WriteFile".
@@ -148,7 +150,7 @@ func (w *WriteFile) prepareWrite(argsJSON string) (*writeFileArtifact, error) {
 	if a.Path == "" {
 		return nil, &writeFileError{reason: "a non-empty 'path' is required"}
 	}
-	target, err := resolveMutationTarget(w.root, a.Path)
+	target, err := resolveMutationTarget(w.root, a.Path, w.hostWrites)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +199,7 @@ func (w *WriteFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResul
 	// containment for the permission decision; re-proving that the resolution
 	// still equals the approved canonical target closes the prepare→run window
 	// (a parent-dir symlink swap redirects the write nowhere: it is refused).
-	if err := enforceApprovedResolution(w.root, art.target); err != nil {
+	if err := enforceApprovedResolution(w.root, art.target, w.hostWrites); err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
 

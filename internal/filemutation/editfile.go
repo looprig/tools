@@ -74,18 +74,20 @@ type editFileArgs struct {
 // commit runs under a SHARED session-mutation + canonical-PATH permit (serializing
 // same-real-file edits across loops, excluded by a Bash/checkpoint permit).
 type EditFile struct {
-	root  string
-	obs   tool.WorkspaceObservations
-	coord tool.WorkspaceCoordinator
+	root       string
+	obs        tool.WorkspaceObservations
+	coord      tool.WorkspaceCoordinator
+	hostWrites bool
 }
 
 // NewEditFile constructs an EditFile bound to the workspace root and the loop's
 // shared observation map (supplied by Files, one per loop binding). A
 // WithMutationCoordinator option binds the session workspace coordinator; without it
-// the tool runs coordinator-free (the standalone/bare path).
+// the tool runs coordinator-free (the standalone/bare path). A WithHostWrites option
+// lets an absolute target resolve outside the workspace instead of being rejected.
 func NewEditFile(root string, obs tool.WorkspaceObservations, opts ...FileMutatorOption) *EditFile {
 	cfg := resolveFileMutatorConfig(opts)
-	return &EditFile{root: root, obs: obs, coord: cfg.coord}
+	return &EditFile{root: root, obs: obs, coord: cfg.coord, hostWrites: cfg.hostWrites}
 }
 
 // Info returns EditFile's self-description. Name MUST equal "EditFile".
@@ -135,7 +137,7 @@ func (e *EditFile) prepareEdit(argsJSON string) (*editFileArtifact, error) {
 	if a.Old == "" {
 		return nil, &writeFileError{reason: "'old' must be a non-empty substring to find"}
 	}
-	target, err := resolveMutationTarget(e.root, a.Path)
+	target, err := resolveMutationTarget(e.root, a.Path, e.hostWrites)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +183,7 @@ func (e *EditFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 
 	// Stage 1: enforce the APPROVED resolved path (see WriteFile.InvokableRun):
 	// a resolution changed since preparation refuses the edit fail-closed.
-	if err := enforceApprovedResolution(e.root, art.target); err != nil {
+	if err := enforceApprovedResolution(e.root, art.target, e.hostWrites); err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
 

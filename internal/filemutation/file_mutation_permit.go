@@ -23,7 +23,8 @@ import (
 // fileMutatorConfig is the resolved construction config shared by WriteFile and
 // EditFile.
 type fileMutatorConfig struct {
-	coord tool.WorkspaceCoordinator
+	coord      tool.WorkspaceCoordinator
+	hostWrites bool
 }
 
 // FileMutatorOption configures a structured file mutator (WriteFile/EditFile) at
@@ -40,6 +41,17 @@ func WithMutationCoordinator(coord tool.WorkspaceCoordinator) FileMutatorOption 
 			cfg.coord = coord
 		}
 	}
+}
+
+// WithHostWrites lets an absolute write/edit target resolve OUTSIDE the
+// workspace instead of being rejected at prepare time -- the write-side
+// counterpart to readfile.WithHostReads()/grep.WithHostReads()/glob.WithHostReads().
+// It grants nothing itself: an uncontained resolved target still emits a
+// filesystem.write requirement, and the caller's bound access source (the
+// sandbox.Profile) makes the actual Allow/Deny/Gated decision. A relative
+// "../" traversal is never widened by this option.
+func WithHostWrites() FileMutatorOption {
+	return func(cfg *fileMutatorConfig) { cfg.hostWrites = true }
 }
 
 func resolveFileMutatorConfig(opts []FileMutatorOption) fileMutatorConfig {
