@@ -1260,3 +1260,171 @@ implementation this session produced under override. Phase Gate 6's own
 combined journal/lifecycle/notification race verification (explicitly
 deferred by Task 24's own plan text to "Phase Gate 6") is likewise not yet
 run, since that gate covers all five tasks together.
+
+## Phase 5, Tasks 21–23 and Phase Gate 5 — Interactive terminals (2026-08-06)
+
+**Prerequisite override applied:** the user accepted Phase 3's sandbox async-pipe
+work as gate-closed based on personal cross-laptop testing, ahead of the live
+privileged-CI evidence that gate had been waiting on (see the Phase 3
+coordination-prerequisite note above). Phase 5 proceeded on that basis. Separately,
+between this session starting and Phase 5 finishing, the user's own manual work
+independently merged Phase 3's sandbox implementation to sandbox's `main` and
+tagged/pushed it as `v0.5.1` — confirmed by this session via `git merge-base
+--is-ancestor` and a tag/commit comparison, not assumed.
+
+**Task 21 — Unix PTY execution (sandbox).** `pty.Open`-based attach ahead of the
+existing configure/start linearization; `Setsid`/`Setctty` coexists with the
+existing `Setpgid` process-tree containment (`newProcessTree` skips `Setpgid`
+when `Setsid` is set; `Setsid` intrinsically makes pgid == pid, so signal/group
+operations keyed off the child pid remain valid — proved by a dedicated test,
+not just asserted). Implementation went through two rounds of fixes past the
+first green state: (1) a real deadlock — nothing pumped the PTY master, so on
+Darwin a PTY session leader with any undrained output blocks in the kernel's
+exit() path until the master is drained, wedging `Process.Wait`/
+`ExecutorSet.Close` permanently on an abandoned PTY process; fixed with a
+dedicated pump goroutine draining the master into an `os.Pipe`, mirroring the
+existing pipe path's drain pattern. `Stdin().Close()` on a PTY was also closing
+the master outright (a real hangup/SIGHUP to the foreground group) instead of
+delivering in-band VEOF (0x04); fixed, with master-close remaining exclusively
+`Process.Close()`'s job. (2) A second review round found `Process.Close()`
+returning a spurious `EIO` error on the single most common path (natural
+run-to-completion) and a `resize`/`Close` race on the raw terminal fd/handle
+(mutex released before the actual syscall); both fixed, the second by holding
+the lock for the full syscall duration. Final state: 16/16 focused tests green,
+full module `-race` clean, `GOOS=linux`/`GOOS=windows` cross-compile clean.
+Independent spec-compliance and code-quality review both passed after the fix
+rounds (code-quality: **Approved**, prior findings independently reproduced as
+real via a throwaway detached-worktree repro, then confirmed closed).
+
+**Task 22A — ConPTY launch plan (sandbox, platform-neutral).** Immutable
+launch-plan type (`internal/exec/conpty_launch_plan.go`) enforcing
+AllocatePipes→CreatePseudoConsole→CreateSuspended→AssignJob→Resume via real
+validation logic, not a comment. Independent review brute-forced all 120
+permutations of the 5 required steps and confirmed exactly 1 (the canonical
+order) validates. Approved on first pass, no fix round needed.
+
+**Task 22B — Windows pseudo-console process (sandbox).** `conPTYTerminal`
+implementing the shared `processTerminal` interface; `conPTYSignaler` for
+interrupt (discovered mid-task: `GenerateConsoleCtrlEvent` cannot reach a
+ConPTY-attached child, since `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` detaches it
+from the caller's console — Ctrl-C is instead delivered in-band as byte 0x03,
+which the console host translates to a real `CTRL_C_EVENT`). Design question
+requiring real reasoning (documented, not guessed): Windows has no kernel VEOF
+byte equivalent, so `Stdin().Close()`'s single-byte VEOF write is special-cased
+to close the parent's retained input-pipe write end instead of forwarding it as
+data — ConPTY's actual, documented "no more input" primitive, which (unlike a
+Unix PTY master close) does not tear down output or hang up the process. Went
+through two further review-and-fix rounds: (1) the Task 22A launch plan was
+built and its result discarded rather than actually driving execution order —
+fixed by making `startConPTY` genuinely dispatch off `plan.Steps()`; and a
+resize/Close race on the raw Windows handle (same class of bug as Task 21's,
+independently caught) — fixed by holding the lock through the full syscall,
+mirroring `Job.Assign`/`Job.Terminate`'s established pattern exactly. (2) A
+security-relevant gap: flipping `ttySupported` to platform-wide `true` opened a
+silent TTY→pipe downgrade on the Windows Elevated/broker backend
+(`startBackendOwned` never checked `options.TTY`) — this is a live, reachable
+path, not hypothetical, and directly violated this package's own no-silent-
+fallback contract; fixed by making that path fail closed
+(`ErrProcessTTYUnsupported`) until real broker ConPTY support is built as a
+separate, later-scoped task. Also fixed: `ErrConPTYUnavailable` (renamed
+`ErrProcessConPTYUnavailable` for naming-convention consistency) was
+unreachable from the module's public API surface (`sandbox.go`) — added.
+Everything Windows-specific here is verified by compile/vet/cross-compile and a
+linked test binary only — no Windows host was available to this session;
+runtime behavior is deferred to a live Windows phase-gate run.
+
+**Task 22C — restricted/elevated broker and CI (sandbox).** Scope was resolved
+by design investigation rather than the plan text alone, because Task 22B's own
+fail-closed guard raised a real ambiguity about what "prove restricted/elevated
+preserves Job ownership" was actually asking for. The investigation surfaced a
+second, independent, previously-unreviewed containment bug: ConPTY's suspended-
+process launch uses raw `windows.CreateProcess` (required, since ConPTY can't go
+through `cmd.Start()`), which never reads `SysProcAttr.Token` — so a `TTY:true`
+request against the REAL restricted backend was silently running the child
+with the caller's full token instead of the restricted one. The Job containment
+still held; the token/ACL restriction — the actual point of the restricted tier
+— did not. Fixed by dispatching to `windows.CreateProcessAsUser` when a
+restricted token is present, argument marshaling cross-checked against Go's own
+`syscall.StartProcess` and `golang.org/x/sys/windows`'s real signatures.
+`TestIntegrationConPTYRestricted`'s containment assertion (a write outside the
+granted root must be denied) is the decisive proof this fix works — confirmed
+by independent review to be something that would have passed (wrongly) before
+the fix and now fails-closed correctly. `TestIntegrationConPTYElevated` proves
+the Task 22B fail-closed guard holds under a real elevated broker, with a
+`TTY:false` control run proving the broker itself isn't just unavailable.
+`TestConPTYBrokerJobPlan` added (platform-neutral) binding broker-credentialed
+plan construction to the ordering invariant. CI wiring added to the existing
+`windows-restricted`/`windows-elevated` jobs. A follow-on review found the fast
+`windows-cross-compile` job never compiled with `-tags integration`, so this
+exact bug class (compiles under `windows`, breaks only under `windows +
+integration`) could recur undetected between self-hosted-runner runs; closed by
+extending `scripts/test-windows-build.sh` to also compile-check the tagged
+build for both target arches. Confirmed three files that the plan's combined
+Task 22 file list named as possibly-in-scope
+(`broker_adapters_windows.go`/`runner_windows.go`/`shell_windows.go`) were
+correctly NOT touched — pre-split leftovers from before the subtasks existed,
+not needed for this scope.
+
+**Task 23 — Tools PTY semantics end to end (tools).** Mapped the 8 required
+coverage items against substantial pre-existing test coverage from earlier
+phases; 4 were already genuinely covered and left untouched, 4 had real gaps.
+The most significant: `bash/supervised.go`'s `runSupervised` mapped every
+`PrepareProcess` failure to a generic `process_setup_failed`, discarding
+harness's typed PTY-unavailable error — meaning the model-facing
+`pty_unavailable` contract and the "never silently falls back to pipes" claim
+in `bash.go`'s own tool-schema doc comment were both untested and, for the
+no-fallback case specifically, not actually true end-to-end. Fixed with a small
+`classifyPrepareProcessError` helper; new tests prove both that PTY-unavailable
+is classified correctly AND that a real spawn is never reached
+(`startCalls == 0`) when it is. `process/pty_integration_test.go` (new,
+`//go:build integration`) added `TestIntegrationProcessPTYToolWorkflow`, using
+a stdlib-only "PTY-shaped" double (one shared `os.Pipe` wired to a real
+subprocess's stdout+stderr) that mirrors `ProcessStreamModePTY`'s documented
+contract without importing a PTY library or the `sandbox` package into `tools`
+— genuinely runs and passes in this session (not deferred), since tools' own
+claims don't depend on real OS-level PTY behavior, only on correctly shaping
+requests/responses around harness's contracts.
+
+**Phase Gate 5 — run in this session, Darwin-reachable subset only:**
+
+```
+sandbox: go test -race -count=1 ./...                                    ok, all packages
+sandbox: go test -tags integration -list 'TestIntegration(...|ConPTY)'   7 tests discovered
+sandbox: go test -tags integration -race ./internal/exec -run '...'      ok — Darwin-reachable
+  tests PASS (TestIntegrationProcessTreeDarwinSetsidFailsClosed,
+  TestIntegrationProcessPTYDarwinLifetimeUnavailable); Linux/container-only
+  tests self-SKIP on Darwin as designed, not failures.
+sandbox: make secure                                                      clean
+sandbox: CGO_ENABLED=0 go build (native, linux/amd64, windows/amd64)      clean
+sandbox: GOOS=windows go test -c ./internal/exec                          real linked .exe produced
+tools:   go test -race ./...                                              ok, all packages
+tools:   go test -tags integration -list '...ProcessPTYToolWorkflow'     5 tests discovered
+tools:   go test -tags integration -race ./bash ./process -run '...'     ok — all 5 PASS
+  (unlike sandbox's Linux/Windows-only tests, tools' integration coverage
+  doesn't depend on real OS-level PTY behavior, so nothing here is deferred)
+tools:   go test ./internal/safetext -fuzz FuzzNormalize -fuzztime=10s    ok, no crashes
+tools:   make secure                                                      clean
+tools:   CGO_ENABLED=0 go build (native, linux/amd64, windows/amd64)      clean
+```
+
+**What Phase Gate 5 does NOT close, and why (infra, not code, matching the
+Phase 3 precedent):**
+
+- `TestProcessConPTYInteractive`, `TestIntegrationConPTYRestricted`,
+  `TestIntegrationConPTYElevated` (all sandbox, Windows-only) — no Windows host
+  was available to this session. Code, argument marshaling, and reasoning were
+  independently reviewed and verified by reading against Go's own stdlib and
+  the vendored `golang.org/x/sys/windows` source; actual runtime behavior on
+  real Windows hardware is unverified. CI wiring for all three now exists in
+  `windows-restricted`/`windows-elevated`, ready to produce that evidence on
+  the next run of self-hosted Windows CI.
+- `TestIntegrationProcessPTYLifecycle` (sandbox, Linux-only live test) —
+  correctly self-skips on this Darwin session; compiles clean under
+  `GOOS=linux`; needs the project's Linux integration-test host to actually
+  execute.
+
+Independent spec-compliance and code-quality review passed for all of Tasks
+21–23, including every fix round. Phase 5 is implementation-complete and
+reviewed to the same standard as Phases 1/2/4/6; only the live-Windows and
+live-Linux runtime evidence remains outstanding, structurally identical to
+Phase 3's own still-open gap.
