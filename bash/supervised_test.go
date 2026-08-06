@@ -593,6 +593,102 @@ func TestSupervisedBashPTYAndMaxOutputBytesReachRunnerAndCeiling(t *testing.T) {
 	waitProcessDone(t, registry, b.owner, out.ProcessID)
 }
 
+// TestSupervisedBashPTYYieldedTerminalCombinesOutputStream asserts `tty:true`
+// combined with `yield_time_ms` both reaches the runner as a PTY request AND
+// that its terminal result's Output faithfully reflects the PTY topology's
+// single combined stream (harness's tool.ProcessStreamModePTY doc comment:
+// "exposes combined terminal bytes through Stdout; Stderr remains non-nil
+// but is closed and empty" — the fake process here leaves Stderr at its
+// default empty reader, contributing nothing). Every byte the fake PTY-mode
+// process produces arrives through Stdout alone, and Tools' own
+// terminal-output rendering (readTerminalOutput -> ProcessOutput) returns it
+// verbatim, exactly like TestSupervisedBashYieldedExitsWithinBudgetReturnsTerminalJSON's
+// non-PTY case — proving the identical cursor-addressed rendering path
+// handles a PTY-mode entry's single combined stream correctly, with no
+// separate stdout/stderr bookkeeping of its own, and that yield_time_ms
+// still yields the real terminal result when a PTY was also requested.
+func TestSupervisedBashPTYYieldedTerminalCombinesOutputStream(t *testing.T) {
+	t.Parallel()
+	proc := newFakeProcess(0)
+	proc.mode = tool.ProcessStreamModePTY
+	proc.stdout = io.NopCloser(strings.NewReader("line one\nline two\n"))
+	// proc.stderr stays the default empty reader — exactly the documented
+	// PTY contract's "Stderr remains non-nil but is closed and empty".
+	prepared := &fakePreparedProcess{access: freshWorkspaceAccess(), process: proc}
+	runner := &fakeAsyncRunner{prepared: prepared}
+	coord := &recordingLifetimeCoordinator{}
+	obs := &syncWorkspaceObservations{}
+	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+
+	out, _, _ := runSupervisedCall(t, b, `{"command":"cat -","tty":true,"yield_time_ms":2000}`, nil)
+
+	if !runner.lastReq.PTY {
+		t.Errorf("ProcessRequest.PTY = false, want true")
+	}
+	if out.Backgrounded {
+		t.Errorf("Backgrounded = true, want false for a call that exited within budget")
+	}
+	if out.Status != string(process.StateExited) {
+		t.Errorf("Status = %q, want %q", out.Status, process.StateExited)
+	}
+	if out.Output != "line one\nline two\n" {
+		t.Errorf("Output = %q, want the process's full combined PTY output %q", out.Output, "line one\nline two\n")
+	}
+}
+
+// TestSupervisedBashPTYUnavailableFailsClosedWithoutFallback asserts a
+// `tty:true` call whose PrepareProcess fails because the runner could not
+// allocate a real PTY/ConPTY surfaces the spec's exact pty_unavailable code
+// (docs/specs/long-running-command-supervision.md: "tty: true requests a
+// real PTY/ConPTY. Failure to allocate one returns pty_unavailable; it never
+// falls back to pipes") rather than the generic process_setup_failed a
+// classification-unaware PrepareProcess failure reports, and NEVER reaches
+// Start — there is no silent fallback to a pipe-backed spawn.
+func TestSupervisedBashPTYUnavailableFailsClosedWithoutFallback(t *testing.T) {
+	t.Parallel()
+	proc := newFakeProcess(0)
+	prepared := &fakePreparedProcess{access: freshWorkspaceAccess(), process: proc}
+	runner := &fakeAsyncRunner{prepared: prepared, err: &tool.ProcessError{Code: tool.ProcessErrorPTYUnavailable}}
+	coord := &recordingLifetimeCoordinator{}
+	obs := &syncWorkspaceObservations{}
+	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+
+	out, _, _ := runSupervisedCall(t, b, `{"command":"true","background":true,"tty":true}`, nil)
+
+	if out.Error != string(process.CodePTYUnavailable) {
+		t.Errorf("Error = %q, want %q", out.Error, process.CodePTYUnavailable)
+	}
+	if !runner.lastReq.PTY {
+		t.Errorf("ProcessRequest.PTY = false, want true (the request itself asked for a real terminal)")
+	}
+	if prepared.startCalls != 0 {
+		t.Errorf("prepared.Start() called %d times, want 0 (no silent fallback to a pipe-backed spawn)", prepared.startCalls)
+	}
+	if out.ProcessID != "" || out.Backgrounded {
+		t.Errorf("result = %+v, want no live handle at all", out)
+	}
+}
+
+// TestSupervisedBashPrepareProcessFailureReportsProcessSetupFailed asserts a
+// PrepareProcess failure that carries no typed tool.ProcessError
+// classification falls back to process_setup_failed — the pre-existing
+// default for any setup failure other than a classified pty_unavailable —
+// closing this file's previously untested PrepareProcess-failure branch in
+// its ordinary (non-PTY) case.
+func TestSupervisedBashPrepareProcessFailureReportsProcessSetupFailed(t *testing.T) {
+	t.Parallel()
+	runner := &fakeAsyncRunner{err: errors.New("boom: could not prepare process")}
+	coord := &recordingLifetimeCoordinator{}
+	obs := &syncWorkspaceObservations{}
+	b, _ := newSupervisedTestTool(t, runner, coord, obs)
+
+	out, _, _ := runSupervisedCall(t, b, `{"command":"true","background":true}`, nil)
+
+	if out.Error != string(process.CodeProcessSetupFailed) {
+		t.Errorf("Error = %q, want %q", out.Error, process.CodeProcessSetupFailed)
+	}
+}
+
 // TestSupervisedBashStorageCeilingFromMaxOutputBytes unit-tests
 // storageCeiling directly: a present max_output_bytes becomes
 // StorageCeiling.SpoolBytes; an absent one yields the zero StorageCeiling

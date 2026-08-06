@@ -513,6 +513,71 @@ func TestProcessInputResizeAppliedForPTY(t *testing.T) {
 	}
 }
 
+// TestProcessInputResizeFailFastNeverWritesOrClosesInSameCall extends the
+// standalone resize-rejection case above to a call that ALSO asked for a
+// data write and EOF in the same request: applyOperations' documented
+// "resize, then data, then EOF" ordering means a resize that fails closed
+// (a non-PTY process) must stop data and EOF from ever being attempted in
+// that same call, not merely when resize is the only operation requested.
+func TestProcessInputResizeFailFastNeverWritesOrClosesInSameCall(t *testing.T) {
+	t.Parallel()
+	sup := newTestSupervisor(t, Config{})
+	owner := testOwner(t)
+	h := testHandle(t, 1)
+	stdin := &inputFakeStdin{}
+	proc := &inputFakeProcess{stdin: stdin, streamMode: tool.ProcessStreamModePipes}
+	newInputEntry(t, sup, owner, h, proc)
+
+	tl := NewProcessInput(sup, owner)
+	text := runInput(t, tl, `{"process_id":"`+string(h)+`","rows":24,"cols":80,"data":"hello","eof":true}`)
+	got := decodeSingle(t, text)
+
+	if got.Error != string(CodePTYUnavailable) {
+		t.Errorf("Error = %q, want %q", got.Error, CodePTYUnavailable)
+	}
+	if proc.resizeCallCount() != 0 {
+		t.Errorf("Resize was called %d times, want 0", proc.resizeCallCount())
+	}
+	if stdin.writeCallCount() != 0 {
+		t.Errorf("Write was called %d times, want 0 (a failing resize must stop data from being attempted in the same call)", stdin.writeCallCount())
+	}
+	if stdin.closeCallCount() != 0 {
+		t.Errorf("Close was called %d times, want 0 (a failing resize must stop EOF from being attempted in the same call)", stdin.closeCallCount())
+	}
+}
+
+// TestProcessInputEOFRepeatedForPTYSendsEOTEachTime proves a PTY-mode
+// process's EOF forwarding tolerates repetition exactly like the pipe path's
+// own idempotence test (TestProcessInputEOFIdempotentForPipe): a second
+// eof:true call against a still-open PTY terminal succeeds again (never an
+// error) and writes the EOT byte again — unlike a pipe's Close, forwarding
+// EOF as an in-band control byte has nothing to reject on repetition, since
+// the terminal's Stdin is never actually closed.
+func TestProcessInputEOFRepeatedForPTYSendsEOTEachTime(t *testing.T) {
+	t.Parallel()
+	sup := newTestSupervisor(t, Config{})
+	owner := testOwner(t)
+	h := testHandle(t, 1)
+	stdin := &inputFakeStdin{}
+	proc := &inputFakeProcess{stdin: stdin, streamMode: tool.ProcessStreamModePTY}
+	newInputEntry(t, sup, owner, h, proc)
+
+	tl := NewProcessInput(sup, owner)
+	for i := 0; i < 2; i++ {
+		text := runInput(t, tl, `{"process_id":"`+string(h)+`","eof":true}`)
+		got := decodeSingle(t, text)
+		if got.Error != "" {
+			t.Fatalf("call %d: Error = %q, want empty (a PTY's forwarded EOF must tolerate repetition)", i, got.Error)
+		}
+	}
+	if b := stdin.writtenBytes(); len(b) != 2 || b[0] != 0x04 || b[1] != 0x04 {
+		t.Errorf("stdin received %v, want two 0x04 (ASCII EOT) bytes", b)
+	}
+	if stdin.closeCallCount() != 0 {
+		t.Errorf("Close was called %d times, want 0 (a PTY's EOF is forwarded as a control byte, never a close)", stdin.closeCallCount())
+	}
+}
+
 // --- InvokableRun: cursor semantics ---
 
 // TestProcessInputExplicitCursorOverridesDefault proves a caller-supplied

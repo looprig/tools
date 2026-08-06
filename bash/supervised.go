@@ -101,7 +101,7 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	}
 	prepared, err := b.asyncRunner.PrepareProcess(ctx, req)
 	if err != nil {
-		return supervisedErrorResult(string(process.CodeProcessSetupFailed)), nil
+		return supervisedErrorResult(classifyPrepareProcessError(err)), nil
 	}
 
 	// Step 2: the PREPARED, authoritative access (never any caller-declared
@@ -393,6 +393,28 @@ func classifyProcessError(err error, fallback process.Code) string {
 		return string(perr.Code)
 	}
 	return string(fallback)
+}
+
+// classifyPrepareProcessError renders a tool.AsyncProcessRunner.PrepareProcess
+// failure into runSupervised's stable, model-facing process.Code. A
+// PrepareProcess failure never spawns anything either way (Start is never
+// even reached), so "no fallback to pipes" already holds regardless of this
+// classification; what this function adds is naming the real reason. A
+// runner that classifies its own failure through Harness's typed
+// tool.ProcessError (e.g. tool.ProcessErrorPTYUnavailable, when `tty:true`
+// could not be honored — spec "tty: true requests a real PTY/ConPTY.
+// Failure to allocate one returns pty_unavailable; it never falls back to
+// pipes") reports that exact code, distinguishing a PTY-allocation failure
+// from every other setup failure. Every other error (untyped, or a
+// tool.ProcessErrorCode this package's own domain has no direct counterpart
+// for) conservatively reports process_setup_failed, exactly matching this
+// call's behavior before this classification existed.
+func classifyPrepareProcessError(err error) string {
+	var perr *tool.ProcessError
+	if errors.As(err, &perr) && perr.Code == tool.ProcessErrorPTYUnavailable {
+		return string(process.CodePTYUnavailable)
+	}
+	return string(process.CodeProcessSetupFailed)
 }
 
 // leaseFromPermit adapts a tool.WorkspacePermit (Release with no return
