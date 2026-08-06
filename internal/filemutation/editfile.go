@@ -310,18 +310,43 @@ func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, ol
 // obs.Observed/obs.Present/obs.Hash comparison; everything else (the fresh read,
 // the exact-`old`-substring anchor match, the atomic write-back, the diff preview)
 // stays IDENTICAL to the contained path. The anchor match in applyReplacement is
-// itself real, independent freshness protection: if the file changed underneath
-// since the model last saw it, `old` will very likely fail to match exactly once,
-// and the edit refuses loudly with a distinct editAnchorError, never a silent
-// wrong-edit. This is why no NEW freshness mechanism is needed for the uncontained
-// case — the anchor match already does freshness-adjacent work, and the CAS check
-// on top of it was specifically about not editing based on a stale cached hash the
-// model never actually re-verified, which does not apply once host edits get no
-// cached authority at all.
+// itself real freshness protection, but its strength depends on replace_all:
+//   - replace_all=false: it degrades gracefully. applyReplacement requires
+//     EXACTLY ONE occurrence of `old`, so if the file changed underneath since
+//     the model last saw it in a way that alters the occurrence count (zero, or
+//     two-or-more), the edit refuses loudly with a distinct editAnchorError —
+//     never a silent wrong-edit.
+//   - replace_all=true: the check is weaker. applyReplacement only requires AT
+//     LEAST ONE occurrence and then replaces ALL of them, so it confirms `old`
+//     still exists somewhere, not that the occurrence SET is unchanged. If the
+//     file drifts between the model's read and this commit such that a NEW
+//     occurrence of `old` appears somewhere the model never saw, that occurrence
+//     is silently replaced too — a contained target does not have this gap,
+//     because its CAS check requires a fresh full-file read matching the exact
+//     current on-disk hash before any edit is authorized, so ANY drift (not just
+//     a changed occurrence count) is caught before applyReplacement ever runs.
+//     This is an accepted, intentional residual risk of skipping the CAS check
+//     for host targets (see TestEditFileHostWritesReplaceAllOverReplacesDriftedOccurrences),
+//     not an oversight.
+//
+// This is why no NEW freshness mechanism is needed for the non-replace_all
+// uncontained case — the anchor match already does freshness-adjacent work, and
+// the CAS check on top of it was specifically about not editing based on a stale
+// cached hash the model never actually re-verified, which does not apply once
+// host edits get no cached authority at all.
 //
 // Unlike WriteFile, EditFile never creates a file (an absent target is already an
 // honest "file not found" — there is nothing to edit), so no parent-directory
 // pre-flight check is needed here.
+//
+// Like WriteFile's commitUncontained, bypassing e.obs.WithPath here also bypasses
+// its internal per-canonical-path lock: cross-loop serialization for the SAME
+// real file still happens one layer up via the coordinator's PathMutation permit
+// (InvokableRun acquires it before commit is ever called) so long as a
+// coordinator is bound, but a coordinator-free EditFile gives an uncontained
+// target NO same-loop serialization at all — unlike a contained target, which
+// still serializes on the WithPath lock even coordinator-free. See WriteFile's
+// commitUncontained doc comment for the full discussion.
 func (e *EditFile) commitUncontained(target mutationTarget, old, replacement string, replaceAll bool) (string, error) {
 	switch classifyWriteTarget(target.lexical) {
 	case writeTargetAbsent:
@@ -341,7 +366,9 @@ func (e *EditFile) commitUncontained(target mutationTarget, old, replacement str
 
 	// No observation check, no hash comparison: an uncontained edit is authorized by
 	// the fresh approval alone, never by a same-loop observation (in either
-	// direction). The anchor match below is the freshness protection that remains.
+	// direction). The anchor match below is the freshness protection that remains —
+	// full strength for replace_all=false, weaker for replace_all=true (see this
+	// method's doc comment).
 	updated, errMsg := applyReplacement(original, old, replacement, replaceAll)
 	if errMsg != "" {
 		return "", &editAnchorError{message: errMsg}

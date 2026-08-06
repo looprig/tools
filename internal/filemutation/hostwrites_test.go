@@ -58,8 +58,15 @@ import (
 //     requirement (Candidates nil) for an UNCONTAINED target only; a
 //     contained target still gets exactly one requirement.
 // 15. Skipping the freshness comparator for an uncontained target does NOT
-//     weaken anchor enforcement: a WRONG `old` anchor still fails with the
-//     distinct editAnchorError, never a silent wrong-edit.
+//     weaken anchor enforcement for replace_all=false: a WRONG `old` anchor
+//     still fails with the distinct editAnchorError, never a silent
+//     wrong-edit.
+// 16. For replace_all=true, the anchor match is WEAKER protection: it only
+//     confirms `old` exists somewhere, not that the occurrence set is
+//     unchanged. An uncontained target whose on-disk occurrence count
+//     drifted since a hypothetical prior read is silently over-replaced --
+//     an accepted, intentional residual risk (a contained target's CAS check
+//     would catch this drift; see commitUncontained's doc comment).
 
 // resolvedAbsHost resolves input against root exactly as resolveMutationTarget
 // does for a host (uncontained) target, giving tests the canonical abs to
@@ -745,6 +752,50 @@ func TestEditFileHostWritesWrongAnchorStillFails(t *testing.T) {
 	}
 	if string(got) != "alpha bravo charlie\n" {
 		t.Errorf("on-disk body = %q, want it left untouched by the rejected edit", got)
+	}
+}
+
+// TestEditFileHostWritesReplaceAllOverReplacesDriftedOccurrences makes explicit
+// and regression-proof the residual risk documented on commitUncontained: for
+// replace_all=true, applyReplacement only requires `old` to occur AT LEAST
+// ONCE and then replaces EVERY occurrence -- it confirms `old` still exists
+// somewhere, not that the occurrence SET is unchanged from whatever the model
+// last saw. This test simulates a model that looked at the file when it held
+// exactly one occurrence of "old", but by the time the uncontained edit
+// commits the file has DRIFTED on disk to hold a second occurrence the model
+// never saw. Because an uncontained target skips the CAS check entirely (see
+// commitUncontained), the edit proceeds and silently replaces BOTH
+// occurrences, with no error. A contained target does not have this gap: its
+// CAS check requires a fresh full-file read matching the exact current
+// on-disk hash before authorizing ANY edit, so this drift would be caught
+// before applyReplacement ever ran. This is the accepted, intentional
+// residual risk of skipping the freshness comparator for host targets -- this
+// test exists to keep that risk visible and testable, not to change it.
+func TestEditFileHostWritesReplaceAllOverReplacesDriftedOccurrences(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	target := filepath.Join(hostDir, "drift.txt")
+
+	// The model is presumed to have seen a file with a single occurrence of
+	// "old" (e.g. "alpha old charlie\n"). By commit time the on-disk file has
+	// drifted to hold a SECOND, unrelated occurrence the model never observed.
+	if err := os.WriteFile(target, []byte("alpha old charlie\ndelta old echo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := NewEditFile(root, newFileObservations(), WithHostWrites())
+
+	out := prepareRun(context.Background(), t, e, mustJSON(t, map[string]any{"path": target, "old": "old", "new": "NEW", "replace_all": true}))
+	if strings.HasPrefix(out, "error:") {
+		t.Fatalf("uncontained replace_all edit = %q, want success (this is the accepted residual risk, not a refusal)", out)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read edited file: %v", err)
+	}
+	want := "alpha NEW charlie\ndelta NEW echo\n"
+	if string(got) != want {
+		t.Errorf("on-disk body = %q, want %q -- both occurrences replaced, including the one that drifted in after the model's presumed read", got, want)
 	}
 }
 
