@@ -123,12 +123,35 @@ func writeRequirement(target mutationTarget) tool.Requirement {
 	}
 }
 
-// mutationRequest assembles the prepared request for one direct mutation call.
-func mutationRequest(toolName, executionID string, target mutationTarget) tool.Request {
+// mutationRequest assembles the prepared request for one direct mutation
+// call: the write requirement for target, plus any extra requirements the
+// caller supplies. extra is variadic so it is backward compatible -- every
+// existing WriteFile call site (which never passes extra) is unaffected.
+// EditFile uses it to append a paired filesystem.read requirement for an
+// UNCONTAINED target (see pairedReadRequirement's doc comment).
+func mutationRequest(toolName, executionID string, target mutationTarget, extra ...tool.Requirement) tool.Request {
+	reqs := append([]tool.Requirement{writeRequirement(target)}, extra...)
 	return tool.Request{
 		ToolName:     toolName,
 		ExecutionID:  executionID,
-		Requirements: []tool.Requirement{writeRequirement(target)},
+		Requirements: reqs,
+	}
+}
+
+// pairedReadRequirement builds the paired direct filesystem.read requirement
+// EditFile emits alongside its filesystem.write requirement for an
+// UNCONTAINED target only (EditFile always performs an in-process read via
+// readForEdit before writing). Candidates is nil for the same reason an
+// uncontained write requirement's Candidates is nil (see writeRequirement):
+// a persisted "approve always" read rule for a host path would silently
+// authorize every future read there with no further prompt.
+func pairedReadRequirement(abs string) tool.Requirement {
+	return tool.Requirement{
+		Kind:        permission.CapabilityFilesystemRead,
+		Scope:       abs,
+		Match:       abs,
+		Description: "read " + abs,
+		Candidates:  nil,
 	}
 }
 

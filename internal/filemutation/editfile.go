@@ -58,6 +58,14 @@ const editFileSchema = `{
 
 const editFileDesc = "Edit a UTF-8 text file in the workspace by replacing an exact substring. By default 'old' must occur exactly once (a unique edit); set replace_all to replace every occurrence. Returns a diff preview. Edits are confined to the workspace and never follow a final-component symlink. Requires approval before each edit."
 
+// editFileHostWritesDesc is EditFile's Info() description when constructed
+// WithHostWrites(): an absolute path may resolve outside the workspace
+// (subject to the caller's write authority), and — critically — such edits
+// are NOT covered by session checkpoint/undo, which only snapshots the
+// workspace. Mirrors writefile.go's writeFileDesc/writeFileHostWritesDesc
+// split.
+const editFileHostWritesDesc = "Edit a UTF-8 text file by replacing an exact substring. By default 'old' must occur exactly once (a unique edit); set replace_all to replace every occurrence. Returns a diff preview. An absolute path may resolve outside the workspace, subject to the caller's write authority; edits never follow a final-component symlink. Edits outside the workspace are NOT covered by session checkpoint/undo. Requires approval before each edit."
+
 // editFileArgs is the typed decode of EditFile's untrusted argsJSON.
 type editFileArgs struct {
 	Path       string `json:"path"`
@@ -90,11 +98,17 @@ func NewEditFile(root string, obs tool.WorkspaceObservations, opts ...FileMutato
 	return &EditFile{root: root, obs: obs, coord: cfg.coord, hostWrites: cfg.hostWrites}
 }
 
-// Info returns EditFile's self-description. Name MUST equal "EditFile".
+// Info returns EditFile's self-description. Name MUST equal "EditFile". The
+// description swaps to editFileHostWritesDesc when hostWrites is set,
+// mirroring writefile.go's writeFileDesc/writeFileHostWritesDesc swap.
 func (e *EditFile) Info(context.Context) (*tool.ToolInfo, error) {
+	desc := editFileDesc
+	if e.hostWrites {
+		desc = editFileHostWritesDesc
+	}
 	return &tool.ToolInfo{
 		Name:   editFileToolName,
-		Desc:   editFileDesc,
+		Desc:   desc,
 		Schema: json.RawMessage(editFileSchema),
 	}, nil
 }
@@ -145,14 +159,25 @@ func (e *EditFile) prepareEdit(argsJSON string) (*editFileArtifact, error) {
 }
 
 // PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
-// canonical edit target ONCE, and returns the typed request — one direct
+// canonical edit target ONCE, and returns the typed request — a direct
 // filesystem.write requirement whose Scope and Match are the canonical resolved
 // path, empty grant pair — plus the typed artifact InvokableRun executes.
 // Invalid input fails here and never reaches the permission gate.
+//
+// For an UNCONTAINED target ONLY, the request also carries a paired
+// filesystem.read requirement for the SAME canonical path (see
+// pairedReadRequirement): EditFile always performs an in-process read via
+// readForEdit before writing back, and a prior host read/write must never
+// silently authorize this one — every host read tied to an edit gets its own
+// fresh gate decision. A contained target is unchanged: exactly one
+// requirement (write only).
 func (e *EditFile) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
 	art, err := e.prepareEdit(argsJSON)
 	if err != nil {
 		return tool.Request{}, nil, err
+	}
+	if !art.target.contained {
+		return mutationRequest(editFileToolName, executionID.String(), art.target, pairedReadRequirement(art.target.abs)), art, nil
 	}
 	return mutationRequest(editFileToolName, executionID.String(), art.target), art, nil
 }
@@ -198,27 +223,31 @@ func (e *EditFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	}
 	defer permit.Release()
 
-	// Stage 3: commit under the path's optimistic-concurrency critical section. The
-	// read/write below operate on the LEXICAL joined path (NOT the symlink-resolved
-	// form), mirroring ReadFile: the O_NOFOLLOW read rejects a final-component
-	// symlink rather than following it, and the atomic write targets the same
-	// lexical name so it REPLACES a final-component symlink rather than following it.
-	preview, err := e.commit(key, art.target.lexical, art.target.display, art.old, art.replacement, art.replaceAll)
+	// Stage 3: commit under the path's optimistic-concurrency critical section (for a
+	// CONTAINED target) or bypassing the observation map entirely (for an UNCONTAINED
+	// host target — see commitUncontained's doc comment). The read/write operate on
+	// the LEXICAL joined path (NOT the symlink-resolved form), mirroring ReadFile: the
+	// O_NOFOLLOW read rejects a final-component symlink rather than following it, and
+	// the atomic write targets the same lexical name so it REPLACES a final-component
+	// symlink rather than following it.
+	preview, err := e.commit(key, art.target, art.old, art.replacement, art.replaceAll)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
 	return tool.TextResult(preview), nil
 }
 
-// commit performs the optimistic-concurrency edit for one path while holding that
-// path's critical section: it reads the current content ONCE (that same read yields
-// both the bytes to edit and the hash to compare), refuses with StaleFileError if
-// this loop lacks a complete observation whose hash equals the current on-disk hash,
-// applies the occurrence-rule replacement (an anchor miss is a DISTINCT
-// editAnchorError, not a freshness conflict), publishes atomically, and records the
-// new content's hash. lexical is the on-disk target; display is the model-supplied
-// path used in messages and the diff header.
-func (e *EditFile) commit(key canonicalObservationKey, lexical, display, old, replacement string, replaceAll bool) (string, error) {
+// commit performs the edit for one target while (for a CONTAINED target) holding
+// that path's optimistic-concurrency critical section, or (for an UNCONTAINED host
+// target) bypassing the observation map entirely — see commitUncontained's doc
+// comment for why. key is the observation-map key (meaningful only for a contained
+// target); target carries the lexical on-disk name, the display path used in error
+// messages/the diff header, and the contained flag that selects which policy
+// applies; old/replacement/replaceAll are the requested edit.
+func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, old, replacement string, replaceAll bool) (string, error) {
+	if !target.contained {
+		return e.commitUncontained(target, old, replacement, replaceAll)
+	}
 	var preview string
 	err := e.obs.WithPath(string(key), func(obs *tool.FileObservation) error {
 		// Cheap classify first (a single Lstat, no content read). An absent target is an
@@ -226,12 +255,12 @@ func (e *EditFile) commit(key canonicalObservationKey, lexical, display, old, re
 		// dead-end); a symlink/non-regular target is refused with the DISTINCT
 		// IrregularFileError (re-reading it via ReadFile also fails O_NOFOLLOW, so
 		// "read again" would dead-end there too).
-		switch classifyWriteTarget(lexical) {
+		switch classifyWriteTarget(target.lexical) {
 		case writeTargetAbsent:
 			return &writeFileError{reason: "file not found"}
 		case writeTargetIrregular:
 			*obs = tool.FileObservation{}
-			return &IrregularFileError{Path: display}
+			return &IrregularFileError{Path: target.display}
 		}
 
 		// writeTargetRegular. Read the file ONCE (that same read yields both the bytes to
@@ -239,7 +268,7 @@ func (e *EditFile) commit(key canonicalObservationKey, lexical, display, old, re
 		// read failure (too-large, or a race to symlink/absent since the classify) is
 		// returned as-is — it is not an optimistic-concurrency conflict, so it must not
 		// masquerade as a StaleFileError telling the model to "read again".
-		original, rerr := e.readForEdit(lexical)
+		original, rerr := e.readForEdit(target.lexical)
 		if rerr != nil {
 			return rerr
 		}
@@ -248,21 +277,79 @@ func (e *EditFile) commit(key canonicalObservationKey, lexical, display, old, re
 		// file and its recorded hash still equals the current on-disk content.
 		if curHash := sha256.Sum256([]byte(original)); !obs.Observed || !obs.Present || obs.Hash != curHash {
 			*obs = tool.FileObservation{}
-			return &StaleFileError{Path: display}
+			return &StaleFileError{Path: target.display}
 		}
 
 		updated, errMsg := applyReplacement(original, old, replacement, replaceAll)
 		if errMsg != "" {
 			return &editAnchorError{message: errMsg}
 		}
-		if err := atomicWriteFile(lexical, []byte(updated)); err != nil {
+		if err := atomicWriteFile(target.lexical, []byte(updated)); err != nil {
 			return err
 		}
 		*obs = tool.FileObservation{Observed: true, Present: true, Hash: sha256.Sum256([]byte(updated))}
-		preview = diffPreview(display, original, updated)
+		preview = diffPreview(target.display, original, updated)
 		return nil
 	})
 	return preview, err
+}
+
+// commitUncontained edits an UNCONTAINED (host) target WITHOUT ever touching the
+// observation map, in either direction: it does not require a prior observation
+// before editing an existing file, and it does not record one after a successful
+// edit. This is a deliberate product decision, not an oversight — a prior host
+// read/write must never authorize a later host edit, and vice versa (the same
+// decision WithHostReads() enforces on the read side, and commitUncontained
+// enforces on WriteFile's write side).
+//
+// EditFile's freshness mechanism differs from WriteFile's in a way that matters
+// here: EditFile ALREADY reads the current file fresh at commit time
+// (readForEdit), and the recorded observation hash is used ONLY as a comparator
+// against that fresh read — never as the source of the bytes being edited. So for
+// an uncontained target, this method simply SKIPS the
+// obs.Observed/obs.Present/obs.Hash comparison; everything else (the fresh read,
+// the exact-`old`-substring anchor match, the atomic write-back, the diff preview)
+// stays IDENTICAL to the contained path. The anchor match in applyReplacement is
+// itself real, independent freshness protection: if the file changed underneath
+// since the model last saw it, `old` will very likely fail to match exactly once,
+// and the edit refuses loudly with a distinct editAnchorError, never a silent
+// wrong-edit. This is why no NEW freshness mechanism is needed for the uncontained
+// case — the anchor match already does freshness-adjacent work, and the CAS check
+// on top of it was specifically about not editing based on a stale cached hash the
+// model never actually re-verified, which does not apply once host edits get no
+// cached authority at all.
+//
+// Unlike WriteFile, EditFile never creates a file (an absent target is already an
+// honest "file not found" — there is nothing to edit), so no parent-directory
+// pre-flight check is needed here.
+func (e *EditFile) commitUncontained(target mutationTarget, old, replacement string, replaceAll bool) (string, error) {
+	switch classifyWriteTarget(target.lexical) {
+	case writeTargetAbsent:
+		return "", &writeFileError{reason: "file not found"}
+	case writeTargetIrregular:
+		// A final-component symlink or other non-regular node: refused exactly as for
+		// a contained target.
+		return "", &IrregularFileError{Path: target.display}
+	}
+
+	// writeTargetRegular. Read the file ONCE, exactly as the contained path does; the
+	// only thing skipped for an uncontained target is the obs comparison below.
+	original, rerr := e.readForEdit(target.lexical)
+	if rerr != nil {
+		return "", rerr
+	}
+
+	// No observation check, no hash comparison: an uncontained edit is authorized by
+	// the fresh approval alone, never by a same-loop observation (in either
+	// direction). The anchor match below is the freshness protection that remains.
+	updated, errMsg := applyReplacement(original, old, replacement, replaceAll)
+	if errMsg != "" {
+		return "", &editAnchorError{message: errMsg}
+	}
+	if err := atomicWriteFile(target.lexical, []byte(updated)); err != nil {
+		return "", err
+	}
+	return diffPreview(target.display, original, updated), nil
 }
 
 // readForEdit opens path O_RDONLY|O_NOFOLLOW (a final-component symlink fails to

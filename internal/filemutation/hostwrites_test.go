@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/internal/workspace"
+	"github.com/looprig/tools/permission"
 )
 
 // hostwrites_test.go covers WithHostWrites(): the write-side counterpart to
@@ -45,6 +46,20 @@ import (
 // 12. An uncontained symlink target is still refused with IrregularFileError.
 // 13. Info()'s description swaps to the host-writes-aware wording when the
 //     option is set.
+//
+// EditFile's freshness mechanism differs from WriteFile's (it already reads
+// the file fresh at commit time via readForEdit; the recorded observation
+// hash is only ever a COMPARATOR, never the source of the edited bytes), so
+// its commit-time behaviors 9-13 above are pinned separately below (see "---
+// EditFile commit-time host-write behavior ---"), plus two EditFile-only
+// behaviors:
+//
+// 14. EditFile's PrepareCall additionally carries a paired filesystem.read
+//     requirement (Candidates nil) for an UNCONTAINED target only; a
+//     contained target still gets exactly one requirement.
+// 15. Skipping the freshness comparator for an uncontained target does NOT
+//     weaken anchor enforcement: a WRONG `old` anchor still fails with the
+//     distinct editAnchorError, never a silent wrong-edit.
 
 // resolvedAbsHost resolves input against root exactly as resolveMutationTarget
 // does for a host (uncontained) target, giving tests the canonical abs to
@@ -231,8 +246,14 @@ func TestEditFilePrepareCallUncontainedRequirementHasNilCandidates(t *testing.T)
 	if err != nil {
 		t.Fatalf("PrepareCall() error = %v", err)
 	}
-	if len(req.Requirements) != 1 {
-		t.Fatalf("Requirements = %d, want 1", len(req.Requirements))
+	// Unlike WriteFile, an uncontained EditFile target also carries a paired
+	// filesystem.read requirement (EditFile performs an in-process read via
+	// readForEdit before writing back) -- see
+	// TestEditFilePrepareCallPairedReadRequirementUncontainedOnly for the
+	// dedicated pin on that second requirement's shape. This test stays
+	// focused on the WRITE requirement's Candidates.
+	if len(req.Requirements) != 2 {
+		t.Fatalf("Requirements = %d, want 2 (write + paired read)", len(req.Requirements))
 	}
 	if req.Requirements[0].Candidates != nil {
 		t.Errorf("Candidates = %+v, want nil -- an uncontained host-write requirement must never offer a persistable standing-allow candidate", req.Requirements[0].Candidates)
@@ -639,5 +660,216 @@ func TestWriteFileInfoHostWritesDesc(t *testing.T) {
 	}
 	if !strings.Contains(host.Desc, "checkpoint") {
 		t.Errorf("Info().Desc = %q, want it to mention writes outside the workspace are not covered by checkpoint/undo", host.Desc)
+	}
+}
+
+// --- EditFile commit-time host-write behavior ---
+//
+// EditFile's freshness mechanism differs from WriteFile's: EditFile ALREADY
+// reads the current file fresh at commit time (readForEdit), and the
+// recorded observation hash is used only as a COMPARATOR against that fresh
+// read -- never as the source of the bytes being edited. So for an
+// uncontained target, EditFile.commit skips ONLY the
+// obs.Observed/obs.Present/obs.Hash comparison; the fresh read, the exact
+// `old`-substring anchor match (applyReplacement), the atomic write-back,
+// and the diff preview all stay identical to the contained path. The anchor
+// match is itself real, independent freshness protection: an `old` that no
+// longer matches exactly once fails loudly with a distinct editAnchorError,
+// never a silent wrong-edit.
+
+// TestEditFileHostWritesSucceedsWithoutPriorObservationAndRecordsNone pins
+// pinned behavior 1: an uncontained edit of an EXISTING host file succeeds
+// with NO prior observation (no StaleFileError -- proving the comparator is
+// genuinely skipped, not merely permissive), and after success no
+// observation was recorded for it either -- a host edit must never feed the
+// same-loop write-authorization map, mirroring WriteFile's
+// TestWriteFileHostWritesOverwritesExistingWithoutPriorObservationAndRecordsNone.
+func TestEditFileHostWritesSucceedsWithoutPriorObservationAndRecordsNone(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	target := filepath.Join(hostDir, "existing.txt")
+	if err := os.WriteFile(target, []byte("alpha bravo charlie\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	obs := newFileObservations()
+	e := NewEditFile(root, obs, WithHostWrites())
+
+	out := prepareRun(context.Background(), t, e, mustJSON(t, map[string]any{"path": target, "old": "bravo", "new": "BRAVO"}))
+	if strings.HasPrefix(out, "error:") {
+		t.Fatalf("uncontained edit without prior observation = %q, want success (no StaleFileError)", out)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read edited file: %v", err)
+	}
+	if string(got) != "alpha BRAVO charlie\n" {
+		t.Errorf("on-disk body = %q, want %q", got, "alpha BRAVO charlie\n")
+	}
+
+	abs := resolvedAbsHost(t, root, target)
+	if recorded := recordedObservation(t, obs, abs); recorded.Observed {
+		t.Errorf("uncontained edit recorded an observation %+v, want none", recorded)
+	}
+}
+
+// TestEditFileHostWritesWrongAnchorStillFails pins pinned behavior 2: even
+// with the freshness comparator skipped for an uncontained target, a WRONG
+// `old` anchor still fails with the distinct anchor error (not silently
+// applied, and not masquerading as a StaleFileError) -- proving the anchor
+// match is real, independent freshness protection, not bypassed alongside
+// the CAS skip.
+func TestEditFileHostWritesWrongAnchorStillFails(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	target := filepath.Join(hostDir, "existing.txt")
+	if err := os.WriteFile(target, []byte("alpha bravo charlie\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := NewEditFile(root, newFileObservations(), WithHostWrites())
+
+	out := prepareRun(context.Background(), t, e, mustJSON(t, map[string]any{"path": target, "old": "zulu", "new": "X"}))
+	if !strings.HasPrefix(out, "error:") {
+		t.Fatalf("uncontained edit with a non-matching anchor = %q, want an error", out)
+	}
+	if !strings.Contains(out, "not found in the file") {
+		t.Errorf("result = %q, want the anchor error (%q), not a freshness error", out, "not found in the file")
+	}
+	if strings.Contains(out, "must be read before writing") {
+		t.Errorf("result = %q, must NOT be the StaleFileError message -- the anchor mismatch is a distinct failure", out)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(got) != "alpha bravo charlie\n" {
+		t.Errorf("on-disk body = %q, want it left untouched by the rejected edit", got)
+	}
+}
+
+// TestEditFilePrepareCallPairedReadRequirementUncontainedOnly pins pinned
+// behavior 4: an uncontained PrepareCall carries a SECOND requirement of
+// kind filesystem.read, for the SAME canonical path, with nil Candidates
+// (the same reason writeRequirement suppresses Candidates for an uncontained
+// write -- a persisted "approve always" read rule for a host path would
+// silently authorize every future read there). A contained target still
+// gets exactly one requirement (write only), never a paired read.
+func TestEditFilePrepareCallPairedReadRequirementUncontainedOnly(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	// Uncontained: two requirements -- write (Candidates nil, already pinned by
+	// TestEditFilePrepareCallUncontainedRequirementHasNilCandidates) plus a
+	// paired read for the SAME path, also with nil Candidates.
+	hostDir := t.TempDir()
+	outside := filepath.Join(hostDir, "host.txt")
+	if err := os.WriteFile(outside, []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eHost := NewEditFile(root, newFileObservations(), WithHostWrites())
+	reqHost, _, err := eHost.PrepareCall(context.Background(), mustUUID(t), mustJSON(t, map[string]any{"path": outside, "old": "alpha", "new": "beta"}))
+	if err != nil {
+		t.Fatalf("PrepareCall(uncontained) error = %v", err)
+	}
+	if len(reqHost.Requirements) != 2 {
+		t.Fatalf("Requirements = %d, want 2 (write + paired read) for an uncontained EditFile target", len(reqHost.Requirements))
+	}
+	wantAbs := resolvedAbsHost(t, root, outside)
+	readReq := reqHost.Requirements[1]
+	if readReq.Kind != permission.CapabilityFilesystemRead {
+		t.Errorf("Requirements[1].Kind = %q, want %q", readReq.Kind, permission.CapabilityFilesystemRead)
+	}
+	if readReq.Scope != wantAbs || readReq.Match != wantAbs {
+		t.Errorf("Requirements[1] Scope/Match = %q/%q, want both %q", readReq.Scope, readReq.Match, wantAbs)
+	}
+	if readReq.Candidates != nil {
+		t.Errorf("Requirements[1].Candidates = %+v, want nil -- a persisted host-read candidate would silently authorize every future read here", readReq.Candidates)
+	}
+
+	// Contained: still exactly one requirement (write only), never a paired read.
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eContained := NewEditFile(root, newFileObservations())
+	reqContained, _, err := eContained.PrepareCall(context.Background(), mustUUID(t), mustJSON(t, map[string]any{"path": "f.txt", "old": "alpha", "new": "beta"}))
+	if err != nil {
+		t.Fatalf("PrepareCall(contained) error = %v", err)
+	}
+	if len(reqContained.Requirements) != 1 {
+		t.Fatalf("Requirements = %d, want 1 for a contained EditFile target (never a paired read)", len(reqContained.Requirements))
+	}
+}
+
+// TestEditFileHostWritesIrregularTargetRefused pins pinned behavior 5: an
+// uncontained target whose final component is a symlink is still refused
+// with *IrregularFileError, mirroring the contained-side
+// TestIrregularWriteTargetIsTyped and WriteFile's
+// TestWriteFileHostWritesIrregularTargetRefused. Neither the symlink node
+// nor its target is touched.
+func TestEditFileHostWritesIrregularTargetRefused(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	hostDir := t.TempDir()
+	const targetBody = "ORIGINAL TARGET BODY"
+	real := filepath.Join(hostDir, "real.txt")
+	if err := os.WriteFile(real, []byte(targetBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(hostDir, "link.txt")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	e := NewEditFile(root, newFileObservations(), WithHostWrites())
+
+	out := prepareRun(context.Background(), t, e, mustJSON(t, map[string]any{"path": link, "old": "ORIGINAL", "new": "NEW"}))
+	if !strings.HasPrefix(out, "error:") {
+		t.Fatalf("uncontained edit of a symlink target = %q, want a fail-secure rejection", out)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat link: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link.txt is no longer a symlink; the rejected edit mutated it")
+	}
+	gotTarget, err := os.ReadFile(real)
+	if err != nil {
+		t.Fatalf("read real target: %v", err)
+	}
+	if string(gotTarget) != targetBody {
+		t.Fatalf("symlink target was clobbered: %q, want %q", gotTarget, targetBody)
+	}
+}
+
+// TestEditFileInfoHostWritesDesc mirrors
+// TestWriteFileInfoHostWritesDesc/readfile.go's readFileDesc split: with
+// WithHostWrites() set, Info()'s Desc must differ from the default
+// editFileDesc and must convey that an absolute path may resolve outside the
+// workspace and that such edits are NOT covered by session checkpoint/undo.
+func TestEditFileInfoHostWritesDesc(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	def, err := NewEditFile(root, newFileObservations()).Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if def.Desc != editFileDesc {
+		t.Errorf("Info().Desc without WithHostWrites() = %q, want the unchanged default %q", def.Desc, editFileDesc)
+	}
+
+	host, err := NewEditFile(root, newFileObservations(), WithHostWrites()).Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if host.Desc == editFileDesc {
+		t.Errorf("Info().Desc with WithHostWrites() = %q, want a distinct host-writes-aware description", host.Desc)
+	}
+	if !strings.Contains(host.Desc, "outside the workspace") {
+		t.Errorf("Info().Desc = %q, want it to mention resolving outside the workspace", host.Desc)
+	}
+	if !strings.Contains(host.Desc, "checkpoint") {
+		t.Errorf("Info().Desc = %q, want it to mention edits outside the workspace are not covered by checkpoint/undo", host.Desc)
 	}
 }
