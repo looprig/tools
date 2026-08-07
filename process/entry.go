@@ -600,6 +600,35 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 		close(e.exited)
 	}
 
+	// The quota reservation and the workspace lifetime lease are released
+	// here -- BEFORE lifecycle publication and completion notification,
+	// below -- deliberately reordered from this package's original
+	// publish-then-notify-then-release sequence. By the time doTerminalize
+	// ever runs, the process has ALREADY fully exited (this method is only
+	// reached after Process.Wait has returned), so it can no longer touch
+	// the workspace regardless of when its lease is released: deferring
+	// release behind two best-effort notifications served no safety
+	// purpose. It did, however, create a real deadlock risk once a real
+	// completion notifier needs to reach its owning loop (Coderig/Harness's
+	// production wiring dispatches into that loop's own command channel):
+	// if that loop's actor is itself synchronously blocked trying to
+	// acquire a workspace lease this exact still-held lease conflicts with
+	// (e.g. a SessionIdle-triggered checkpoint racing a just-backgrounded
+	// process), the old ordering meant the lease could never be released
+	// until notify() reached an actor that could only become reachable
+	// AFTER that same lease was released -- a genuine circular wait,
+	// reproduced end to end by Coderig's Task 28 integration tests as a
+	// ~10 second stall (bounded only by an unrelated shutdown drain
+	// timeout, not by anything in this package). Releasing first breaks
+	// that cycle unconditionally: a slow or unreachable notifier can no
+	// longer hold the lease hostage.
+	if e.releaseQuota != nil {
+		e.releaseQuota(e.reservation)
+	}
+	if e.lease != nil {
+		_ = e.lease.Release()
+	}
+
 	kind := tool.ProcessLifecycleCompleted
 	eventID := events.Completed
 	if state == StateLostOnRestore {
@@ -630,12 +659,6 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 		})
 	}
 
-	if e.releaseQuota != nil {
-		e.releaseQuota(e.reservation)
-	}
-	if e.lease != nil {
-		_ = e.lease.Release()
-	}
 	if e.onTerminal != nil {
 		e.onTerminal(e.identity.Handle, e.identity.Owner)
 	}

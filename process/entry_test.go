@@ -10,6 +10,143 @@ import (
 	"time"
 )
 
+// blockingCompletionNotifier is a completionNotifier whose notify call
+// blocks until release is closed, recording the exact moment it was
+// entered on entered (closed once, on first call). It exists to prove
+// doTerminalize releases the quota reservation and workspace lease BEFORE
+// -- not behind -- a completion notifier that is slow or blocked reaching
+// its target (TestEntryTerminalizeReleasesLeaseAndQuotaBeforeNotifying).
+type blockingCompletionNotifier struct {
+	entered chan struct{}
+	release <-chan struct{}
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *blockingCompletionNotifier) notify(ctx context.Context, event completionEvent) error {
+	close(f.entered)
+	select {
+	case <-f.release:
+	case <-ctx.Done():
+	}
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *blockingCompletionNotifier) Calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+var _ completionNotifier = (*blockingCompletionNotifier)(nil)
+
+// TestEntryTerminalizeReleasesLeaseAndQuotaBeforeNotifying proves
+// doTerminalize releases the quota reservation and the workspace lifetime
+// lease BEFORE calling the completion notifier (and so, by the same
+// ordering, before the lifecycle publisher too) -- not after. A process has
+// already fully exited by the time doTerminalize ever runs (it is only
+// reached after Process.Wait has returned), so it can no longer touch the
+// workspace regardless of when its lease is released; deferring release
+// behind two best-effort notifications served no safety purpose and, when a
+// completion notifier needs to reach a busy owning loop actor (a real
+// SessionResourceServices-backed notifier ultimately dispatches into that
+// loop's own command channel), created a circular wait whenever the loop's
+// own SessionIdle-triggered workspace checkpoint needed this exact
+// still-held lease to proceed -- discovered via Coderig's Task 28
+// end-to-end integration tests, which reproduced a genuine ~10 second
+// deadlock (bounded only by an unrelated shutdown drain timeout) the first
+// time a real Coderig session let a turn go idle while a background
+// process it had just started was still running. Before this test's fix,
+// lease.ReleaseCalls()/the quota release both waited behind notify(),
+// exactly reproducing that deadlock's root cause in isolation.
+func TestEntryTerminalizeReleasesLeaseAndQuotaBeforeNotifying(t *testing.T) {
+	t.Parallel()
+
+	handle := testHandle(t, 11)
+	owner := testOwner(t)
+	origin := testOrigin(t)
+	identity := Identity{Handle: handle, Owner: owner, Origin: origin}
+
+	events := LifecycleEventIDs{
+		Started: mustUUID(t), Backgrounded: mustUUID(t),
+		Completed: mustUUID(t), Lost: mustUUID(t), CommandID: mustUUID(t),
+	}
+	createdAt := time.Now().UTC()
+	startedAt := createdAt.Add(time.Millisecond)
+
+	store := NewManifestStore(t.TempDir())
+	seed := NewManifest(identity, CommandMetadata{Command: "echo hi"}, AccessReadOnly, false, createdAt, nil)
+	seed.Events = events
+	seed.State = StateRunning
+	seed.StartedAt = &startedAt
+	if err := store.Save(seed); err != nil {
+		t.Fatalf("store.Save() err = %v, want nil", err)
+	}
+
+	spool, err := OpenSpool(t.TempDir(), handle, 0)
+	if err != nil {
+		t.Fatalf("OpenSpool() err = %v, want nil", err)
+	}
+
+	release := make(chan struct{})
+	notifications := &blockingCompletionNotifier{entered: make(chan struct{}), release: release}
+	lease := &fakeLease{}
+	quotaReleases := &callCounter{}
+
+	e := &entry{
+		identity:      identity,
+		lease:         lease,
+		lifecycle:     &fakeLifecycleSink{},
+		notifications: notifications,
+		manifests:     &fakeManifestSaver{store: store},
+		reservation:   reservation{loopID: owner.LoopID, sessionID: owner.SessionID, memoryBytes: 10, spoolBytes: 10},
+		releaseQuota:  func(reservation) { quotaReleases.inc() },
+		base: manifestBase{
+			command: CommandMetadata{Command: "echo hi"}, access: AccessReadOnly, tty: false,
+			createdAt: createdAt, startedAt: startedAt, events: events,
+		},
+		buffer: NewBuffer(0),
+		spool:  spool,
+		done:   make(chan struct{}),
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		code := 0
+		e.terminalize(context.Background(), StateExited, Result{ExitCode: &code, Reason: "exited"}, time.Now().UTC())
+		close(finished)
+	}()
+
+	select {
+	case <-notifications.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for notify to be entered")
+	}
+
+	// notify() is now blocked inside the notifier -- release/lease must
+	// ALREADY have been reversed by this point, not waiting behind it.
+	if got := quotaReleases.Count(); got != 1 {
+		t.Errorf("quota released %d times while notify() was still blocked, want exactly 1 (release must not wait behind notify)", got)
+	}
+	if got := lease.ReleaseCalls(); got != 1 {
+		t.Errorf("lease released %d times while notify() was still blocked, want exactly 1 (release must not wait behind notify)", got)
+	}
+
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for terminalize to return")
+	}
+	if got := notifications.Calls(); got != 1 {
+		t.Errorf("notify called %d times, want exactly 1", got)
+	}
+}
+
 // TestEntryRunClosesDoneAfterDrainingBothStreams is a finer-grained unit
 // test of entry.run/drain in isolation from Supervisor.Start's admission
 // plumbing: it constructs an entry directly (a Buffer and a Spool only --
