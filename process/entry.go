@@ -45,11 +45,29 @@ var _ manifestSaver = (*ManifestStore)(nil)
 // outcome, Lost for a restore-reconciliation outcome (Task 9; State ==
 // StateLostOnRestore) -- never a freshly minted ID.
 type lifecycleTerminalEvent struct {
-	EventID    uuid.UUID
-	Kind       tool.ProcessLifecycleKind
-	Identity   Identity
-	State      State
-	Result     Result
+	EventID uuid.UUID
+	Kind    tool.ProcessLifecycleKind
+
+	Identity Identity
+	State    State
+	Result   Result
+
+	// CreatedAt and StartedAt mirror this process's manifest.CreatedAt/
+	// StartedAt (entry.base's own already-captured values -- see
+	// manifestBase's doc comment), never freshly derived here. A REAL
+	// tool.ProcessLifecyclePublisher requires ProcessCreatedAt non-zero for
+	// EVERY kind, and ProcessStartedAt non-zero for a Completed/Exited
+	// record (tool.ProcessLifecycleMetadata.Validate/validProcessLifecycleShape),
+	// so a lifecycleSink adapter that publishes a real
+	// tool.ProcessLifecycleMetadata (session_resource.go's
+	// lifecyclePublisherAdapter) cannot construct a valid DTO without them.
+	// Added alongside session_resource.go's Activate wiring -- see that
+	// file's doc comment for why the pre-fix package-private fakes never
+	// caught this: they never validated against the real Harness DTO at
+	// all.
+	CreatedAt time.Time
+	StartedAt time.Time
+
 	FinishedAt time.Time
 }
 
@@ -596,6 +614,8 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 			Identity:   e.identity,
 			State:      state,
 			Result:     result,
+			CreatedAt:  e.base.createdAt,
+			StartedAt:  e.base.startedAt,
 			FinishedAt: finishedAt,
 		})
 	}

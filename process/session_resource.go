@@ -33,12 +33,31 @@ type SupervisorResource struct {
 	Manifests  *ManifestStore
 }
 
-// Activate is intentionally a no-op today: the Supervisor this resource
-// wraps is constructed notification-free (NewSupervisorResource passes nil
-// for both NewSupervisor's lifecycle and notifications parameters). A future
-// task that wires services's real capabilities through to a live Supervisor
-// is what would give Activate real work to do.
-func (r *SupervisorResource) Activate(context.Context, tool.SessionResourceServices) error {
+// Activate wires the real, validated tool.SessionResourceServices Harness's
+// live session construction supplies into the shared Supervisor this
+// resource wraps. NewSupervisorResource itself constructs the Supervisor
+// notification-free (nil lifecycle/notifications at NewSupervisor time,
+// below) precisely because these real capabilities do not exist yet at
+// factory time -- SessionResource's own contract late-binds them here, after
+// the live session, hub, durable publisher, and notifier are ready
+// (pkg/tool.SessionResource's doc comment). Activate adapts services'
+// validated tool.ProcessLifecyclePublisher/tool.ProcessCompletionNotifier
+// into this package's private lifecycleSink/completionNotifier shapes
+// (lifecycle_bridge.go) and installs them on the live Supervisor
+// (activateServices), which every subsequent Start call -- and so every
+// admitted process's Start-time and terminal lifecycle publish and
+// completion notify -- reads from that point on (supervisor.go's
+// servicesLocked). services.Validate() rejects a nil or typed-nil service
+// before either is installed, so a caller that mishandles construction can
+// never leave the Supervisor half-wired.
+func (r *SupervisorResource) Activate(_ context.Context, services tool.SessionResourceServices) error {
+	if err := services.Validate(); err != nil {
+		return err
+	}
+	r.Supervisor.activateServices(
+		lifecyclePublisherAdapter{publisher: services.ProcessLifecyclePublisher()},
+		completionNotifierAdapter{notifier: services.ProcessCompletionNotifier()},
+	)
 	return nil
 }
 

@@ -299,6 +299,42 @@ func (s *Supervisor) closeAdmission() {
 	s.mu.Unlock()
 }
 
+// activateServices late-binds the Supervisor's session-wide lifecycle
+// publisher and completion notifier after construction, under s.mu so a
+// concurrent Start (which reads both fields, also under s.mu -- see
+// servicesLocked) can never observe a torn or stale value. It is the
+// counterpart NewSupervisorResource's own doc comment predicted ("a future
+// task that wires services's real capabilities through to a live Supervisor
+// is what would give Activate real work to do"): SupervisorResource.Activate
+// is that future task's caller, adapting the real, validated
+// tool.SessionResourceServices Harness's own session construction supplies
+// (session_resource.go) into this package's private lifecycleSink/
+// completionNotifier shapes and calling this method exactly once, before any
+// bound process tool can be invoked. It is intentionally a plain,
+// non-defensive setter: Harness's own SessionResource.Activate contract
+// guarantees at-most-once activation per session resource
+// (TestSessionResourcesActivateAndShutdownOnce, harness
+// internal/sessionruntime), so this method adds no re-activation guard of
+// its own.
+func (s *Supervisor) activateServices(lifecycle lifecycleSink, notifications completionNotifier) {
+	s.mu.Lock()
+	s.lifecycle = lifecycle
+	s.notifications = notifications
+	s.mu.Unlock()
+}
+
+// servicesLocked returns the Supervisor's current session-wide lifecycle/
+// notifications capabilities under s.mu, so Start's own read can never race
+// a concurrent activateServices call. See activateServices' doc comment for
+// why a lock is required here even though every field write happens exactly
+// once, before any live tool call: the race detector has no way to see that
+// happens-before relationship from field access alone.
+func (s *Supervisor) servicesLocked() (lifecycleSink, completionNotifier) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lifecycle, s.notifications
+}
+
 // Shutdown implements the spec's "Supervisor lifetime" coordinated shutdown
 // sequence: close admission to new processes, concurrently request graceful
 // termination of every currently running process tree, escalate to a
@@ -785,6 +821,22 @@ func (s *Supervisor) Start(
 		return "", New(CodeSupervisorShuttingDown)
 	}
 
+	// sessionLifecycle/notifications are the Supervisor's own session-wide
+	// services (activateServices, above), read once here under lock. sink,
+	// this call's own explicit per-call parameter, wins when the caller
+	// supplies one (TestSupervisorStartPublishesStartedOrBackgrounded
+	// exercises exactly that override); otherwise every lifecycle publish
+	// this process ever makes -- Start-time AND, via the entry it
+	// registers below, its eventual terminal publish -- falls back to the
+	// session-wide value a real caller (Bash, via Coderig's composed
+	// session) never supplies directly. notifications has no per-call
+	// counterpart at all: it is always the session-wide value.
+	sessionLifecycle, notifications := s.servicesLocked()
+	effectiveSink := sink
+	if effectiveSink == nil {
+		effectiveSink = sessionLifecycle
+	}
+
 	if prepared == nil {
 		return "", Wrap(CodeInvalidArguments, errors.New("prepared process is required"))
 	}
@@ -942,8 +994,8 @@ func (s *Supervisor) Start(
 		startKind = tool.ProcessLifecycleBackgrounded
 		startEventID = events.Backgrounded
 	}
-	if sink != nil {
-		_ = sink.publishStart(ctx, lifecycleStartEvent{
+	if effectiveSink != nil {
+		_ = effectiveSink.publishStart(ctx, lifecycleStartEvent{
 			EventID:   startEventID,
 			Kind:      startKind,
 			Identity:  identity,
@@ -970,7 +1022,7 @@ func (s *Supervisor) Start(
 	e := &entry{
 		identity:       identity,
 		lease:          lease,
-		lifecycle:      sink,
+		lifecycle:      effectiveSink,
 		observations:   observations,
 		ceiling:        ceiling,
 		yield:          yield,
@@ -978,7 +1030,7 @@ func (s *Supervisor) Start(
 		process:        proc,
 		reservation:    res,
 		manifests:      s.manifests,
-		notifications:  s.notifications,
+		notifications:  notifications,
 		releaseQuota:   s.releaseQuota,
 		onTerminal:     s.recordTerminal,
 		buffer:         NewBuffer(res.memoryBytes),

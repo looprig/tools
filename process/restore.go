@@ -187,19 +187,27 @@ func (s *Supervisor) markLostOnRestore(ctx context.Context, m Manifest) (Manifes
 // Harness journal index (Task 24) is the actual duplicate-suppression
 // boundary; this call's only job is to keep resending the same IDs.
 func (s *Supervisor) publishLostOnRestore(ctx context.Context, m Manifest) {
-	if s.lifecycle != nil {
-		_ = s.lifecycle.publish(ctx, lifecycleTerminalEvent{
+	lifecycle, notifications := s.servicesLocked()
+
+	if lifecycle != nil {
+		var startedAt time.Time
+		if m.StartedAt != nil {
+			startedAt = *m.StartedAt
+		}
+		_ = lifecycle.publish(ctx, lifecycleTerminalEvent{
 			EventID:    m.Events.Lost,
 			Kind:       tool.ProcessLifecycleLost,
 			Identity:   m.Identity,
 			State:      m.State,
 			Result:     m.Result,
+			CreatedAt:  m.CreatedAt,
+			StartedAt:  startedAt,
 			FinishedAt: *m.FinishedAt,
 		})
 	}
 
-	if s.notifications != nil {
-		_ = s.notifications.notify(ctx, completionEvent{
+	if notifications != nil {
+		_ = notifications.notify(ctx, completionEvent{
 			CommandID: m.Events.CommandID,
 			Owner:     m.Owner,
 			Handle:    m.Handle,
