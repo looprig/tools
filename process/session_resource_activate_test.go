@@ -160,6 +160,135 @@ func TestSupervisorResourceActivateWiresRealLifecycleAndNotificationServices(t *
 	}
 }
 
+// TestSupervisorResourceActivateReconcilesPersistedManifests proves Activate
+// performs the session-restore reconciliation step (Supervisor.Restore,
+// restore.go) over whatever this resource's directory already contains --
+// not only wiring the lifecycle/notification services. Restore.go's own doc
+// comment documents it as "intended to be called once, immediately after
+// NewSupervisor and before any Start/Wait call, as the caller's
+// session-restore step," but nothing in this package's, or bash's, own
+// production code ever called it: NewSupervisorResource's factory
+// constructs a fresh, always-empty in-memory Supervisor regardless of
+// whether its directory already holds manifests from a PRIOR process
+// (persisted sessions reuse the identical <data-dir>/resources/<session-id>
+// root across a real restart -- persisted_resource_storage_provider's own
+// stability contract, coderig's persistence.go), and SupervisorResource
+// (this file) never bridged that gap either. A real session restore
+// therefore silently discarded every previously known process: completed
+// output became permanently unreadable and a still-running manifest was
+// never marked lost -- discovered via Coderig's Task 28 end-to-end restore
+// integration test, which found a freshly-completed process's own output
+// unreadable ("not_found") immediately after a real close/reopen cycle.
+func TestSupervisorResourceActivateReconcilesPersistedManifests(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed dir with a manifest exactly as a PRIOR SupervisorResource in this
+	// same directory would have durably left one: a completed process
+	// (queryable output) and one still StateRunning (nothing was around to
+	// mark it lost when the prior process ended).
+	handle := testHandle(t, 21)
+	owner := testOwner(t)
+	origin := testOrigin(t)
+	identity := Identity{Handle: handle, Owner: owner, Origin: origin}
+	events := LifecycleEventIDs{
+		Started: mustUUID(t), Backgrounded: mustUUID(t),
+		Completed: mustUUID(t), Lost: mustUUID(t), CommandID: mustUUID(t),
+	}
+	createdAt := time.Now().UTC()
+	startedAt := createdAt.Add(time.Millisecond)
+	finishedAt := startedAt.Add(time.Millisecond)
+	exitCode := 0
+
+	seedStore := NewManifestStore(dir)
+	completed := NewManifest(identity, CommandMetadata{Command: "echo hi"}, AccessReadOnly, false, createdAt, nil)
+	completed.Events = events
+	completed.State = StateExited
+	completed.StartedAt = &startedAt
+	completed.FinishedAt = &finishedAt
+	completed.Result = Result{ExitCode: &exitCode, Reason: "exited"}
+	if err := seedStore.Save(completed); err != nil {
+		t.Fatalf("seed store.Save(completed) err = %v, want nil", err)
+	}
+
+	runningHandle := testHandle(t, 22)
+	runningIdentity := Identity{Handle: runningHandle, Owner: owner, Origin: origin}
+	runningEvents := LifecycleEventIDs{
+		Started: mustUUID(t), Backgrounded: mustUUID(t),
+		Completed: mustUUID(t), Lost: mustUUID(t), CommandID: mustUUID(t),
+	}
+	running := NewManifest(runningIdentity, CommandMetadata{Command: "sleep 30"}, AccessReadOnly, false, createdAt, nil)
+	running.Events = runningEvents
+	running.State = StateRunning
+	running.StartedAt = &startedAt
+	if err := seedStore.Save(running); err != nil {
+		t.Fatalf("seed store.Save(running) err = %v, want nil", err)
+	}
+
+	resource, err := NewSupervisorResource(dir)
+	if err != nil {
+		t.Fatalf("NewSupervisorResource() err = %v, want nil", err)
+	}
+	sr := resource.(*SupervisorResource)
+	t.Cleanup(func() { _ = sr.Shutdown(context.Background()) })
+
+	publisher := &fakeToolLifecyclePublisher{}
+	notifier := &fakeToolCompletionNotifier{}
+	services, err := tool.NewSessionResourceServices(publisher, notifier)
+	if err != nil {
+		t.Fatalf("tool.NewSessionResourceServices() err = %v, want nil", err)
+	}
+	if err := resource.Activate(context.Background(), services); err != nil {
+		t.Fatalf("Activate() err = %v, want nil", err)
+	}
+
+	// The completed process's manifest and spool must be reconciled and
+	// queryable -- exactly ProcessOutput's own registry lookup.
+	sr.Supervisor.mu.Lock()
+	completedEntry, completedOK := sr.Supervisor.entries[handle]
+	runningEntry, runningOK := sr.Supervisor.entries[runningHandle]
+	sr.Supervisor.mu.Unlock()
+	if !completedOK {
+		t.Fatal("completed manifest was not reconciled into the live registry")
+	}
+	if completedEntry.process != nil {
+		t.Error("reconciled completed entry has a live tool.Process, want nil")
+	}
+
+	// The still-running manifest must be reconciled as lost_on_restore, not
+	// silently dropped or left StateRunning.
+	if !runningOK {
+		t.Fatal("running manifest was not reconciled into the live registry")
+	}
+	reloaded, err := sr.Manifests.Load(runningHandle)
+	if err != nil {
+		t.Fatalf("Manifests.Load(running) err = %v, want nil", err)
+	}
+	if reloaded.State != StateLostOnRestore {
+		t.Errorf("running manifest state after Activate = %v, want lost_on_restore", reloaded.State)
+	}
+	if runningEntry == nil {
+		t.Fatal("running entry is nil")
+	}
+
+	// The lost-on-restore reconciliation must have published its lifecycle
+	// event and completion notification through the freshly-activated
+	// services, using the manifest's own pre-persisted Lost/CommandID.
+	published := publisher.Calls()
+	if len(published) != 1 || published[0].Kind != tool.ProcessLifecycleLost {
+		t.Fatalf("published lifecycle events = %+v, want exactly one Lost record", published)
+	}
+	if published[0].EventID != runningEvents.Lost {
+		t.Errorf("published Lost EventID = %s, want the pre-persisted %s", published[0].EventID, runningEvents.Lost)
+	}
+	notified := notifier.Calls()
+	if len(notified) != 1 || notified[0].State != tool.ProcessLifecycleLostOnRestore {
+		t.Fatalf("notified completions = %+v, want exactly one LostOnRestore record", notified)
+	}
+	if notified[0].CommandID != runningEvents.CommandID {
+		t.Errorf("notified CommandID = %s, want the pre-persisted %s", notified[0].CommandID, runningEvents.CommandID)
+	}
+}
+
 // TestSupervisorResourceActivateRejectsInvalidServices proves Activate fails
 // closed on an unvalidated/invalid service set rather than silently leaving
 // the Supervisor half-wired or panicking.

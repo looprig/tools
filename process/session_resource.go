@@ -35,11 +35,12 @@ type SupervisorResource struct {
 
 // Activate wires the real, validated tool.SessionResourceServices Harness's
 // live session construction supplies into the shared Supervisor this
-// resource wraps. NewSupervisorResource itself constructs the Supervisor
-// notification-free (nil lifecycle/notifications at NewSupervisor time,
-// below) precisely because these real capabilities do not exist yet at
-// factory time -- SessionResource's own contract late-binds them here, after
-// the live session, hub, durable publisher, and notifier are ready
+// resource wraps, and then performs this resource's session-restore
+// reconciliation step. NewSupervisorResource itself constructs the
+// Supervisor notification-free (nil lifecycle/notifications at NewSupervisor
+// time, below) precisely because these real capabilities do not exist yet
+// at factory time -- SessionResource's own contract late-binds them here,
+// after the live session, hub, durable publisher, and notifier are ready
 // (pkg/tool.SessionResource's doc comment). Activate adapts services'
 // validated tool.ProcessLifecyclePublisher/tool.ProcessCompletionNotifier
 // into this package's private lifecycleSink/completionNotifier shapes
@@ -50,7 +51,31 @@ type SupervisorResource struct {
 // servicesLocked). services.Validate() rejects a nil or typed-nil service
 // before either is installed, so a caller that mishandles construction can
 // never leave the Supervisor half-wired.
-func (r *SupervisorResource) Activate(_ context.Context, services tool.SessionResourceServices) error {
+//
+// Activate then calls Supervisor.Restore over this resource's own
+// directory, exactly matching restore.go's own documented contract
+// ("intended to be called once, immediately after NewSupervisor and before
+// any Start/Wait call, as the caller's session-restore step"). Nothing else
+// in this package or in bash ever called it: NewSupervisorResource always
+// constructs a fresh, empty in-memory Supervisor regardless of whether its
+// directory already holds manifests a PRIOR process durably left there
+// (persisted sessions reuse the identical resource root across a real
+// restart), so a real session restore silently discarded every previously
+// known process -- completed output became permanently unreadable and a
+// still-running manifest was never marked lost. This is Activate's own
+// natural, single, guaranteed-once-before-any-use hook for that
+// reconciliation (SessionResource's own contract: "late-binds live session
+// services after construction AND RESTORE PLANNING" -- pkg/tool's doc
+// comment), so it needs no new "is this a restore" signal of its own:
+// Restore's own directory scan is a harmless no-op (an empty Reconciled
+// list, no error) when this resource's directory has nothing to reconcile
+// yet, i.e. for a genuinely new session -- see listManifestHandles' own
+// os.IsNotExist handling. Restore runs AFTER activateServices, not before:
+// a still-running manifest's lost-on-restore reconciliation
+// (markLostOnRestore/publishLostOnRestore, restore.go) publishes through
+// these exact services, and must not silently no-op against the
+// construction-time nils.
+func (r *SupervisorResource) Activate(ctx context.Context, services tool.SessionResourceServices) error {
 	if err := services.Validate(); err != nil {
 		return err
 	}
@@ -58,6 +83,9 @@ func (r *SupervisorResource) Activate(_ context.Context, services tool.SessionRe
 		lifecyclePublisherAdapter{publisher: services.ProcessLifecyclePublisher()},
 		completionNotifierAdapter{notifier: services.ProcessCompletionNotifier()},
 	)
+	if _, err := r.Supervisor.Restore(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
