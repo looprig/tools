@@ -1428,3 +1428,136 @@ Independent spec-compliance and code-quality review passed for all of Tasks
 reviewed to the same standard as Phases 1/2/4/6; only the live-Windows and
 live-Linux runtime evidence remains outstanding, structurally identical to
 Phase 3's own still-open gap.
+
+## Tasks 26–28 and Phase Gate 6 — CodeRig composition (2026-08-07)
+
+**Task 26A — resource storage composition (coderig).** Two implementations of
+harness's `rig.SessionResourceStorageProvider`: a stateless persisted provider
+resolving `<data-dir>/resources/<session-id>`, and a headless provider giving
+same-process (not cross-restart) stability. Attached to the existing
+`swarmStores` facade bundle rather than threaded as a new parameter through
+the rig-build call chain — verified sound (every rig-construction path
+reached, nil provider handled without ever calling the Rig option). Two review
+rounds; both closed clean.
+
+**Task 26B — Sandbox-to-Harness async adapter (coderig).** Mechanical
+two-phase type mapping wrapping Sandbox's `Executor`/`PreparedProcess`/
+`Process` to satisfy Harness's `tool.AsyncProcessRunner`/`PreparedProcess`/
+`Process`, following the existing `grantedExecutor` composition pattern. A
+small necessary fix landed in Sandbox's own public facade (never re-exported
+`ProcessStreamMode`/`ProcessSignal`, a hard compile blocker for any consumer
+outside `internal/exec`). Required real investigation, not a guess:
+`tool.ProcessResult.Reason` (9-value `ProcessTerminalReason`) has no Sandbox
+equivalent — derived from Go's own POSIX exit-code convention plus
+adapter-owned signal-severity tracking, verified against Go's actual stdlib
+source and Sandbox's real signal-delivery code. Two review rounds each closed
+one Important-severity gap (a doc-comment overstating cross-platform
+portability; `deriveReason`'s own headline invariant — exit code wins over
+recorded signal severity — had zero direct test coverage) plus several
+Suggestion-level items, all addressed.
+
+**Task 27 — install the four process definitions (coderig).** Wired the
+resolver into `bashDefinition`, appended `ProcessOutput`/`ProcessInput`/
+`ProcessStop` to the builder and reviewer rosters. Two real judgment calls,
+both verified against source before committing to them: (1) the plan's
+"operator" maps to CodeRig's current `builder` role (verified via alias
+functions, not just prose similarity); planner is deliberately excluded
+(read-only role, plan predates planner's own package by 5 days). (2) Coderig's
+own `bashDefinition` could not use `tools.BashDefinition` directly — that
+helper resolves its `BashOption`s once at definition-construction time, before
+any Loop exists, incompatible with CodeRig's per-Loop confined runner — so a
+fresh `bash.NewSupervisedFactory` call was built per-Build instead, verified
+against `tools.BashDefinition`'s actual source rather than assumed. Flipping
+on `tool.RequiresProcessServices` broke ~40 pre-existing tests across 12 files
+that assembled a rig without resource-storage wired (previously harmless);
+fixed with one shared `openTestStores` test helper. Two review rounds.
+
+**Task 28 — full CodeRig integration tests + CI.** 15 end-to-end scenarios
+through real CodeRig composition and real Sandbox (Darwin, `AccessUnconfined`
+profile — PTY included, per Phase 5's own work), plus a brand-new
+`.github/workflows/ci.yml` (CodeRig had none before this). Confined-profile
+scenarios (grant denial, lost manifests) correctly prove Darwin's typed
+`lifetime_enforcement_unavailable` fail-closed path rather than faking a
+supervised success path Darwin cannot provide, matching Phase 5's own Darwin
+precedent.
+
+This was the first time the full Harness→Tools→Sandbox stack was ever
+exercised through real composition rather than fakes at each layer boundary,
+and it found what unit-level review — however thorough — structurally
+could not:
+
+- **A real deadlock** (`tools`, `process/entry.go`): `doTerminalize` released
+  a completed process's workspace lease *after* calling its completion
+  notifier, which in real production wiring dispatches into the owning loop's
+  own command channel. If that loop's actor was itself synchronously blocked
+  acquiring the *same* still-held lease (a `SessionIdle`-triggered checkpoint
+  racing a just-backgrounded process), the lease could never release until
+  notify() reached an actor that could only become reachable *after* that
+  release — a genuine circular wait, reproduced as a real ~10s hang including
+  an unrelated second turn also stalling. Fixed by releasing lease/quota
+  before notifying (the process has already fully exited by the time this
+  method runs, so there was never a safety reason to hold the lease behind
+  the notification). New deterministic unit test proves the ordering directly
+  — reviewer independently reverted the fix and confirmed the test fails for
+  exactly the right reason before restoring it.
+- **Four more real defects**, each with its own regression test: `tools`
+  — lifecycle publication/completion notification was a documented no-op in
+  production; Start collapsed every runner failure to a generic code,
+  making Darwin's typed rejection unreachable through the real path;
+  session-restore's `Supervisor.Restore()` was dead code, never called in
+  production. `harness` — a session resource's private directory was
+  computed but never created on disk before its factory ran.
+- **A second, broader availability bug**, found by a reviewer digging past
+  the implementer's own (too-narrow) characterization of a disclosed
+  "shutdown takes longer" concern: a `SessionIdle`-triggered best-effort
+  checkpoint's permit acquisition was bound only to the full 60s policy
+  timeout with no shorter bound for a live synchronous caller — so *any* new
+  command submitted while a loop's own background process was still running
+  could stall or fail outright, not just `Close()`. Root-caused precisely
+  (the `accepted()` callback that was supposed to let a best-effort caller
+  stop waiting only fired *after* permit acquisition succeeded) and fixed
+  with a short bound specific to the live-caller path, falling into the
+  pre-existing "skip and retry" design already built for other permit
+  failures — required/manual checkpoints untouched. A reviewer independently
+  reproduced the original 20s-hang/outright-failure scenario against the real
+  stack and confirmed the fix resolves it (~350ms), then the reproduction was
+  turned into a permanent regression test. As a side effect, this same fix
+  dropped `TestIntegrationProcessShutsDownWithNoDescendants` from ~11.9s to
+  ~2s, confirming it was the same root mechanism.
+
+**Phase Gate 6 — run in this session:**
+
+```
+harness: go test -race ./...                                    ok, all packages
+harness: tagged integration discovery + run                     ok (TestProcessServicesIntegrationNewRestoreAndLease)
+harness: make secure                                             clean
+harness: native / linux / windows cross-builds                   clean
+coderig: go test -race ./...                                    ok, all packages
+coderig: tagged integration discovery                            16 tests (matches Task 28 exactly)
+coderig: tagged integration run                                  all 16 TestIntegrationProcess* tests pass;
+                                                                   see note below
+coderig: make secure                                              clean (gosec 0 issues; govulncheck: 0
+                                                                   vulnerabilities reachable from this code)
+coderig: native / linux cross-builds                              clean
+coderig: windows cross-build                                      fails — see note below
+```
+
+**Two pre-existing, out-of-scope findings, confirmed via direct baseline
+comparison (not assumed):**
+
+- `TestPermissionReviewEvidenceLookupAccessAndContainmentApproveRealTargets`
+  (an unrelated permission-review-classifier integration test) panics with a
+  nil-pointer dereference, reproducibly, in isolation. Confirmed via a
+  disposable worktree at CodeRig's own pre-Task-26 commit (`02b3ea2`) that
+  this is **not** a regression — it fails identically on that baseline. Real
+  bug, wrong subsystem, wrong task to fix it in.
+- The Windows cross-build fails inside `github.com/looprig/tui` (the
+  console/TUI module, never touched by this work):
+  `internal/input/blocks.go`'s use of `syscall.O_NOFOLLOW`, which doesn't
+  exist on Windows. Confirmed pre-existing the same way — the baseline commit
+  fails *worse* (the released `tools@v0.7.0` this baseline resolves against
+  has the identical class of bug in `permission/store.go`, already fixed on
+  this branch's own `tools` worktree but not yet in any tagged release).
+
+Both are out of scope for this feature and were not touched. Everything
+Tasks 26–28 actually own passed Phase Gate 6 clean.
