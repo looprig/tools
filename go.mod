@@ -10,7 +10,7 @@ tool (
 
 require (
 	github.com/looprig/core v0.5.0
-	github.com/looprig/harness v0.20.0
+	github.com/looprig/harness v0.21.0
 	github.com/looprig/inference v0.7.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
@@ -76,9 +76,3 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	honnef.co/go/tools v0.7.0 // indirect
 )
-
-// Dev-only: harness's async process contracts (tool.SessionResource etc.)
-// only exist on harness's own feat/long-running-commands branch, not yet
-// merged/tagged. Remove this replace once harness ships a real release tools
-// can pin.
-replace github.com/looprig/harness => ../harness
