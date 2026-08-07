@@ -803,6 +803,15 @@ func (s *Supervisor) handleExists(h Handle) bool {
 // immediately with a *Error wrapping CodeSupervisorShuttingDown, before
 // reserving any quota or touching prepared at all
 // (TestSupervisorShutdownRejectsAdmission).
+//
+// A prepared.Start failure is classified by classifyStartError, below,
+// rather than unconditionally reported as CodeSpawnFailed: a real
+// AsyncProcessRunner adapter (e.g. Coderig's process_adapter.go) reports a
+// more specific tool.ProcessError classification for a handful of
+// documented, distinct failure modes (lifetime containment unavailable, PTY
+// unavailable), and that specific reason must survive through this layer
+// for bash/supervised.go's own classifyProcessError to see it rather than a
+// generic spawn failure that already lost it here.
 func (s *Supervisor) Start(
 	ctx context.Context,
 	owner Owner,
@@ -901,13 +910,13 @@ func (s *Supervisor) Start(
 		manifest.State = StateFailed
 		manifest.FinishedAt = &finishedAt
 		manifest.Result = Result{Reason: reasonString(tool.ProcessTerminalFailed)}
-		// Best-effort: Start already reports CodeSpawnFailed regardless of
-		// whether this terminal Save itself succeeds, and there is no
-		// entry/completion-notification path to retry it through on this
-		// synchronous, single-writer path.
+		// Best-effort: Start already reports its own classification of err
+		// (classifyStartError, below) regardless of whether this terminal
+		// Save itself succeeds, and there is no entry/completion-notification
+		// path to retry it through on this synchronous, single-writer path.
 		_ = s.manifests.Save(manifest)
 
-		return "", Wrap(CodeSpawnFailed, err)
+		return "", Wrap(classifyStartError(err), err)
 	}
 
 	startedAt := time.Now().UTC()
@@ -1048,4 +1057,30 @@ func (s *Supervisor) Start(
 	go e.run(lifetimeCtx) // #nosec G118 -- lifetimeCtx is deliberately independent of ctx; see the comment where it's constructed above
 
 	return handle, nil
+}
+
+// classifyStartError classifies a prepared.Start failure into this
+// package's own stable Code domain. A runner that classifies its own
+// failure through Harness's typed tool.ProcessError -- e.g. Coderig's
+// process_adapter.go mapStartError, for
+// tool.ProcessErrorLifetimeEnforcementUnavailable when Sandbox's own
+// lifetime-containment proof is unavailable (today, every real
+// Seatbelt-confined Darwin spawn), or tool.ProcessErrorPTYUnavailable when
+// a requested PTY could not be honored at Start -- reports that exact, more
+// specific reason; every other Start failure (untyped, or a
+// tool.ProcessErrorCode this package's own domain has no direct
+// counterpart for) conservatively reports CodeSpawnFailed, exactly matching
+// this package's behavior before this classification existed
+// (TestSupervisorStartFailureReleasesQuota).
+func classifyStartError(err error) Code {
+	var perr *tool.ProcessError
+	if errors.As(err, &perr) {
+		switch perr.Code {
+		case tool.ProcessErrorLifetimeEnforcementUnavailable:
+			return CodeLifetimeEnforcementUnavailable
+		case tool.ProcessErrorPTYUnavailable:
+			return CodePTYUnavailable
+		}
+	}
+	return CodeSpawnFailed
 }

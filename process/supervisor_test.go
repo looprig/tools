@@ -793,6 +793,70 @@ func TestSupervisorReleasesLeaseOnce(t *testing.T) {
 	}
 }
 
+// TestSupervisorStartPreservesRunnerErrorClassification proves that when
+// PreparedProcess.Start fails with a typed *tool.ProcessError carrying a
+// more specific stable reason than a generic spawn failure -- exactly what
+// a real AsyncProcessRunner adapter reports (Coderig's process_adapter.go
+// mapStartError, for tool.ProcessErrorLifetimeEnforcementUnavailable when
+// Sandbox's own lifetime-containment proof is unavailable, e.g. every real
+// Seatbelt-confined Darwin spawn today, or tool.ProcessErrorPTYUnavailable
+// when a requested PTY could not be honored) -- Start reports the SAME
+// specific process.Code rather than collapsing it to the generic
+// CodeSpawnFailed every OTHER Start failure still reports
+// (TestSupervisorStartFailureReleasesQuota, unchanged). Before this test's
+// fix, this classification was lost inside Supervisor.Start itself: a real
+// caller (bash/supervised.go's runSupervised) received only "spawn_failed"
+// for a Darwin fail-closed rejection, never the spec's documented
+// "lifetime_enforcement_unavailable" -- discovered via Coderig's Task 28
+// end-to-end integration tests, the first place in this whole feature that
+// exercises a real Sandbox rejection through this exact call path.
+func TestSupervisorStartPreservesRunnerErrorClassification(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		runnerCode tool.ProcessErrorCode
+		wantCode   Code
+	}{
+		{name: "lifetime enforcement unavailable", runnerCode: tool.ProcessErrorLifetimeEnforcementUnavailable, wantCode: CodeLifetimeEnforcementUnavailable},
+		{name: "pty unavailable", runnerCode: tool.ProcessErrorPTYUnavailable, wantCode: CodePTYUnavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sup := newTestSupervisor(t, Config{
+				MaxRunningProcessesPerLoop:    4,
+				MaxRunningProcessesPerSession: 4,
+				MaxProcessInMemoryBytes:       1 << 20,
+				MaxAggregateInMemoryBytes:     10 << 20,
+				MaxProcessSpoolBytes:          1 << 20,
+				MaxAggregateSpoolBytes:        10 << 20,
+			})
+			owner := testOwner(t)
+			origin := testOrigin(t)
+
+			runnerErr := &tool.ProcessError{Code: tt.runnerCode, Cause: errors.New("runner-specific cause")}
+			prepared := &fakePreparedProcess{startErr: runnerErr}
+			lease := &fakeLease{}
+
+			_, err := sup.Start(context.Background(), owner, origin, prepared, lease, nil, nil, StorageCeiling{}, YieldSettings{})
+			if err == nil {
+				t.Fatal("Start() err = nil, want non-nil")
+			}
+			if !errors.Is(err, New(tt.wantCode)) {
+				t.Errorf("Start() err = %v, want %s", err, tt.wantCode)
+			}
+			if errors.Is(err, New(CodeSpawnFailed)) {
+				t.Errorf("Start() err = %v, want the specific runner classification, not the generic CodeSpawnFailed fallback", err)
+			}
+			if !errors.Is(err, runnerErr) {
+				t.Errorf("Start() err = %v, want it to still wrap the underlying runner error", err)
+			}
+		})
+	}
+}
+
 // --- TestSupervisorPublishesStableLifecycleIDs ---
 
 // TestSupervisorPublishesStableLifecycleIDs proves that Start allocates and
