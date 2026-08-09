@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -77,7 +78,7 @@ const bashSchema = `{
   "type": "object",
   "properties": {
     "command": {"type": "string", "description": "The shell command to run via 'sh -c'. May use pipes, globs, redirects, and '&&'."},
-    "workdir": {"type": "string", "description": "Workspace-relative working directory for the command (optional; defaults to the workspace root)."},
+    "workdir": {"type": "string", "description": "Working directory for the command, relative to the workspace or an absolute path contained within it (optional; defaults to the workspace root)."},
     "timeout": {"type": "integer", "minimum": 0, "description": "Maximum runtime in seconds (optional; default 30, hard cap 120 for a plain foreground call). 0 is valid only together with 'background' or 'yield_time_ms' and means 'run until session shutdown'."},
     "background": {"type": "boolean", "description": "Start the command under session supervision and return as soon as it is durably registered, without waiting for it to finish (optional, default false)."},
     "yield_time_ms": {"type": "integer", "minimum": 0, "description": "Optional initial wait budget in milliseconds under session supervision. If the command exits within the budget its terminal result is returned; otherwise a process handle plus the output observed so far is returned."},
@@ -266,16 +267,21 @@ func (b *BashTool) AuditSummary(argsJSON string) string {
 	return "Bash: " + a.Command
 }
 
-// resolveSpawnDir maps a workspace-relative workdir to the confined absolute directory
-// a Bash command runs in: the root VERBATIM when workdir is empty, else
-// workspace.ContainedPath(root, workdir) (which rejects any escape). It is the SINGLE
-// definition of "the spawn dir", shared by PrepareCall (which binds the request's
-// WorkingDirectory — the dir every grant is minted for) and InvokableRun (which
-// re-resolves and compares so a resolution change between approval and execution
-// refuses the run fail-closed).
+// resolveSpawnDir maps a relative or contained absolute workdir to the confined
+// directory a Bash command runs in. Absolute inputs are first made relative to
+// root, then workspace.ContainedPath remains the single symlink-aware authority
+// that rejects lexical and resolved escapes. PrepareCall and InvokableRun both
+// use this function so a resolution change after approval fails closed.
 func resolveSpawnDir(root, workdir string) (string, error) {
 	if workdir == "" {
 		return root, nil
+	}
+	if filepath.IsAbs(workdir) {
+		rel, err := filepath.Rel(root, workdir)
+		if err != nil {
+			return "", err
+		}
+		workdir = rel
 	}
 	return workspace.ContainedPath(root, workdir)
 }
@@ -302,12 +308,12 @@ func (b *BashTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 
 	// Enforce the APPROVED spawn directory: a resolution changed between
 	// prepare and run (a symlink swap) refuses the run fail-closed.
-	dir, err := resolveSpawnDir(b.root, art.workdirRel)
+	dir, err := resolveSpawnDir(b.root, art.workdirRaw)
 	if err != nil {
-		return tool.TextResult("error: workdir is outside the workspace: " + art.workdirRel), nil
+		return tool.TextResult("error: workdir is outside the workspace: " + art.workdirRaw), nil
 	}
 	if dir != art.dirAbs {
-		return tool.TextResult("error: workdir resolution changed since approval: " + art.workdirRel), nil
+		return tool.TextResult("error: workdir resolution changed since approval: " + art.workdirRaw), nil
 	}
 
 	// A SUPERVISED call (background or yield_time_ms, frozen at preparation

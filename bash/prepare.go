@@ -75,7 +75,7 @@ type fsDecl struct {
 type bashArtifact struct {
 	tool.TokenArtifact
 	command    string
-	workdirRel string
+	workdirRaw string
 	dirAbs     string
 	timeout    time.Duration
 
@@ -147,7 +147,7 @@ func (b *BashTool) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSO
 	}
 	artifact := &bashArtifact{
 		command:           command,
-		workdirRel:        a.Workdir,
+		workdirRaw:        a.Workdir,
 		dirAbs:            dir,
 		timeout:           supervision.Timeout,
 		supervised:        supervision.Supervised,

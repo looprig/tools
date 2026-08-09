@@ -3,6 +3,7 @@ package bash
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -70,6 +71,91 @@ func TestBashPrepareCallCommandRequirement(t *testing.T) {
 	}
 	if art == nil {
 		t.Fatal("artifact = nil, want a typed bash artifact")
+	}
+}
+
+// TestBashPrepareCallAbsoluteWorkdir reproduces the CodeRig call shape that
+// previously doubled the workspace root: an absolute workdir plus a tree-read
+// declaration for "." must resolve both the request cwd and read scope to the
+// single canonical workspace root.
+func TestBashPrepareCallAbsoluteWorkdir(t *testing.T) {
+	t.Parallel()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(root) error = %v", err)
+	}
+	b := NewBash(root)
+	args, err := json.Marshal(map[string]any{
+		"command": "find .",
+		"workdir": root,
+		"access": map[string]any{
+			"read": []map[string]any{{"scope": "tree", "path": "."}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+
+	req, _ := prepareBash(t, b, string(args))
+	if req.WorkingDirectory != root {
+		t.Errorf("Request.WorkingDirectory = %q, want the single workspace root %q", req.WorkingDirectory, root)
+	}
+	wantScope := "tree:" + root
+	var read tool.Requirement
+	for _, requirement := range req.Requirements {
+		if requirement.Kind == permission.CapabilityFilesystemRead {
+			read = requirement
+		}
+	}
+	if read.Scope != wantScope || read.GrantTarget != root {
+		t.Errorf("tree read scope/target = %q/%q, want %q/%q", read.Scope, read.GrantTarget, wantScope, root)
+	}
+}
+
+// TestBashPrepareCallAbsoluteWorkdirContainment accepts an absolute directory
+// inside the workspace but rejects both an absolute sibling and an in-workspace
+// symlink whose target escapes the workspace.
+func TestBashPrepareCallAbsoluteWorkdirContainment(t *testing.T) {
+	t.Parallel()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(root) error = %v", err)
+	}
+	inside := filepath.Join(root, "sub")
+	if err := os.Mkdir(inside, 0o755); err != nil {
+		t.Fatalf("Mkdir(%q) error = %v", inside, err)
+	}
+	outside := t.TempDir()
+	escape := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Fatalf("Symlink(%q, %q) error = %v", outside, escape, err)
+	}
+
+	tests := []struct {
+		name    string
+		workdir string
+		want    string
+		wantErr bool
+	}{
+		{name: "absolute inside", workdir: inside, want: inside},
+		{name: "absolute outside", workdir: outside, wantErr: true},
+		{name: "absolute symlink escape", workdir: escape, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			args, err := json.Marshal(map[string]any{"command": "pwd", "workdir": tt.workdir})
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			req, _, err := NewBash(root).PrepareCall(context.Background(), mustUUID(t), string(args))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("PrepareCall() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil && req.WorkingDirectory != tt.want {
+				t.Errorf("Request.WorkingDirectory = %q, want %q", req.WorkingDirectory, tt.want)
+			}
+		})
 	}
 }
 

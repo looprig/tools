@@ -224,7 +224,8 @@ func TestBashOutputTruncation(t *testing.T) {
 	}
 }
 
-// TestBashWorkdir confirms the command runs in the resolved workdir under root.
+// TestBashWorkdir confirms relative and absolute in-workspace workdirs resolve
+// to the same confined directory and execute there.
 func TestBashWorkdir(t *testing.T) {
 	t.Parallel()
 	requireSh(t)
@@ -236,9 +237,15 @@ func TestBashWorkdir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sub, "marker.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	out := runBash(t, root, map[string]any{"command": "ls", "workdir": "sub"})
-	if !strings.Contains(out, "marker.txt") {
-		t.Errorf("result %q does not show the workdir contents", out)
+	for _, workdir := range []string{"sub", sub} {
+		workdir := workdir
+		t.Run(workdir, func(t *testing.T) {
+			t.Parallel()
+			out := runBash(t, root, map[string]any{"command": "ls", "workdir": workdir})
+			if !strings.Contains(out, "marker.txt") {
+				t.Errorf("result %q does not show the workdir contents", out)
+			}
+		})
 	}
 }
 
