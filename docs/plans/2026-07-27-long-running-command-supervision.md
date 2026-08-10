@@ -6,7 +6,7 @@
 
 **Specification:** `docs/specs/long-running-command-supervision.md`
 
-**Architecture:** Tools owns a session-scoped process supervisor and the four model-facing tools. Harness owns generic async contracts, session resources, identity, workspace leases, lifecycle events, notifications, shutdown, and restore. Sandbox owns enforced asynchronous processes, pipes, PTY/ConPTY, grants, process trees, signals, and parent-death cleanup. Carbon owns only the adapter and production composition between the independent modules.
+**Architecture:** Tools owns a session-scoped process supervisor and the four model-facing tools. Harness owns generic async contracts, session resources, identity, workspace leases, lifecycle events, notifications, shutdown, and restore. Sandbox owns enforced asynchronous processes, pipes, PTY/ConPTY, grants, process trees, signals, and parent-death cleanup. Coderig owns only the adapter and production composition between the independent modules.
 
 **Tech Stack:** Go 1.26.4, Harness tool/session/event contracts, Sandbox Windows broker and Unix enforcement backends, `github.com/creack/pty` for Unix PTYs, `golang.org/x/sys/windows` for ConPTY and Job Objects, JSON manifests, atomic file replacement, race detector, tagged integration tests, Staticcheck, Gosec, Govulncheck, Windows and Linux CI.
 
@@ -21,7 +21,7 @@ This plan is executed in these sibling worktrees:
   harness/
   tools/
   sandbox/
-  carbon/
+  coderig/
 ```
 
 Unmodified local replacement modules are symlinked beside them. Run every Go
@@ -36,7 +36,7 @@ carries between commands:
 | Harness | `/Users/ipotter/code/looprig/.worktrees/long-running-commands/harness` |
 | Tools | `/Users/ipotter/code/looprig/.worktrees/long-running-commands/tools` |
 | Sandbox | `/Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox` |
-| Carbon | `/Users/ipotter/code/looprig/.worktrees/long-running-commands/carbon` |
+| Coderig | `/Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig` |
 
 Any relative `cd` shown later is explanatory only; the controller must replace
 it with the absolute workdir above. A fresh subagent must never run from the
@@ -111,8 +111,8 @@ claim.
 - Modify: `../harness/vendor/**`
 - Modify: `go.mod`
 - Modify: `go.sum`
-- Modify: `../carbon/go.mod`
-- Modify: `../carbon/go.sum`
+- Modify: `../coderig/go.mod`
+- Modify: `../coderig/go.sum`
 - Verify only: `../sandbox/go.mod`
 - Verify only: `../sandbox/go.sum`
 
@@ -139,8 +139,8 @@ GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache go mod tidy
 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache go mod vendor
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
 GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache go mod tidy
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/carbon
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache go mod tidy
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache go mod tidy
 ```
 
 By diff inspection, only existing requirements may be synchronized; no new
@@ -158,8 +158,8 @@ GOWORK=off GOCACHE=/private/tmp/looprig-tools-gocache GOFLAGS=-mod=readonly go t
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/sandbox
 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test ./internal/policy ./internal/platform ./pkg/profile
 CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go build -trimpath ./...
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/carbon
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test ./internal/app
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app
 ```
 
 Gate expectation: PASS. Separately run Sandbox's existing live
@@ -181,9 +181,9 @@ git commit -m "build: synchronize harness module baseline"
 cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/tools
 git add go.mod go.sum
 git commit -m "build: synchronize tools module baseline"
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/carbon
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
 git add go.mod go.sum
-git commit -m "build: synchronize carbon module baseline"
+git commit -m "build: synchronize coderig module baseline"
 ```
 
 Skip a repository's commit only when its module files are unchanged.
@@ -198,7 +198,7 @@ Skip a repository's commit only when its module files are unchanged.
 - Create: `../harness/pkg/tool/process_test.go`
 - Modify: `../harness/pkg/tool/README.md`
 
-Harness types are intentionally generic. Sandbox does not import them; Carbon
+Harness types are intentionally generic. Sandbox does not import them; Coderig
 adapts between the two named APIs.
 
 **Step 1: Write failing contract tests**
@@ -2096,7 +2096,7 @@ ProcessOutput, ProcessInput, and ProcessStop without a runner. The fake Harness
 `ProcessBinding` contains only the registry, and a companion definition may
 create the same runner-free supervisor before Bash is built. Tools cannot import
 Harness `internal/sessionruntime`; real registry composition is reserved for
-Carbon Task 28. Cover foreground compatibility, background start, yield,
+Coderig Task 28. Cover foreground compatibility, background start, yield,
 incremental output, wait-many, input, stop, spool retention, owner isolation,
 resource shutdown, and manifest restore.
 
@@ -2385,7 +2385,7 @@ Phase reviewers must approve Unix session/group composition, terminal foreground
 interrupt routing, ConPTY broker/Job integration, EOF semantics, and the absence
 of silent fallback.
 
-## Phase 6: Harness lifecycle and Carbon composition
+## Phase 6: Harness lifecycle and Coderig composition
 
 ### Task 24: Publish lifecycle events and deliver metadata-only notifications
 
@@ -2457,7 +2457,7 @@ fingerprinting/collision, ID-preserving index hydration, raw opening fences, and
 appender duplicate reporting.
 Inspect the diff and commit; run the focused command only at the owning phase gate.
 `feat(journal): deduplicate durable record retries`. Task 28 repeats the reopen
-proof through Carbon's real fsstore composition.
+proof through Coderig's real fsstore composition.
 
 **24B — checked process lifecycle publication**
 
@@ -2622,16 +2622,16 @@ git add internal/sessionruntime
 git commit -m "feat(session): manage supervised process lifecycle"
 ```
 
-### Task 26: Adapt Sandbox processes to Harness in Carbon
+### Task 26: Adapt Sandbox processes to Harness in Coderig
 
 **Files:**
 
-- Modify: `../carbon/internal/app/toolsets.go`
-- Modify: `../carbon/internal/app/persistence.go`
-- Modify: `../carbon/internal/app/persistence_test.go`
-- Modify: `../carbon/internal/app/rig_restore_integration_test.go`
-- Create: `../carbon/internal/app/process_adapter.go`
-- Create: `../carbon/internal/app/process_adapter_test.go`
+- Modify: `../coderig/internal/app/toolsets.go`
+- Modify: `../coderig/internal/app/persistence.go`
+- Modify: `../coderig/internal/app/persistence_test.go`
+- Modify: `../coderig/internal/app/rig_restore_integration_test.go`
+- Create: `../coderig/internal/app/process_adapter.go`
+- Create: `../coderig/internal/app/process_adapter_test.go`
 
 Execute as two implementation microtasks:
 
@@ -2639,14 +2639,14 @@ Execute as two implementation microtasks:
   `<data-dir>/resources/<session-id>` with a stable provider identity threaded
   through the Rig option; headless sessions receive an isolated process-owned
   temporary base whose SessionID subdirectory is stable for same-process
-  reconstruction and is discarded only when Carbon exits.
+  reconstruction and is discarded only when Coderig exits.
   Queued phase-gate tests are `TestProcessResourceRootOutsideWorkspace`,
   `TestProcessResourceRootStableAcrossRestore`,
   `TestProcessResourceRootIdentityMismatchFailsRestore`, and
   `TestHeadlessProcessResourceRootsAreIsolated`, plus
   `TestHeadlessProcessResourceRootStableForSameProcessRestore`. Its single
   queued phase-gate selector is `GOWORK=off
-  GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test
+  GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test
   ./internal/app -run 'Test(ProcessResourceRoot|HeadlessProcessResourceRoot)'`.
 - **26B — async adapter:** implement only the two-phase Sandbox-to-Harness type
   mapping below.
@@ -2658,7 +2658,7 @@ Test:
 - Harness request maps every field exactly once to Sandbox options;
 - grants and origin execution ID are preserved;
 - Sandbox prepared-process access maps exactly to Harness access without
-  Carbon parsing opaque grants;
+  Coderig parsing opaque grants;
 - Harness lease acquisition occurs between adapter prepare and start;
 - prepared close/start single-use semantics map exactly;
 - Sandbox process streams/wait/resize/signal/close map exactly;
@@ -2667,7 +2667,7 @@ Test:
 - Sandbox error codes map to Harness codes without losing causes;
 - no OS PID crosses the adapter;
 - adapter satisfies `tool.AsyncProcessRunner`;
-- the Carbon resolver captures one role `*sandbox.ExecutorSet`, calls
+- the Coderig resolver captures one role `*sandbox.ExecutorSet`, calls
   `set.For(loopID.String())` exactly, wraps the returned executor, and preserves
   lookup failures;
 - no Harness `ProcessBinding`, Rig option, lifecycle option, or provider is used
@@ -2676,8 +2676,8 @@ Test:
 **Step 2: Queue focused phase-gate coverage**
 
 ```bash
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/carbon
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'TestProcessAdapter'
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'TestProcessAdapter'
 ```
 
 Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
@@ -2685,7 +2685,7 @@ Failure rationale: the covered behavior is absent before implementation; the sel
 **Step 3: Implement the mechanical adapter**
 
 Follow the existing `grantedExecutor` composition pattern. Put no buffering,
-authorization, event, or supervisor policy in Carbon. Expose a Carbon-local
+authorization, event, or supervisor policy in Coderig. Expose a Coderig-local
 resolver constructor that captures the role's `*sandbox.ExecutorSet` and
 returns a `tools.AsyncProcessRunnerResolver`. Each resolver call uses
 `set.For(loopID.String())` and mechanically wraps that loop-bound executor as a
@@ -2703,13 +2703,13 @@ git commit -m "feat: adapt sandbox async processes"
 
 Inspect the diff and commit without executing tests. Queue the exact focused command from Step 2 for the owning phase gate.
 
-### Task 27: Install the four process definitions in Carbon
+### Task 27: Install the four process definitions in Coderig
 
 **Files:**
 
-- Modify: `../carbon/internal/app/toolsets.go`
-- Modify: `../carbon/internal/app/access_acceptance_test.go`
-- Create: `../carbon/internal/app/process_tools_test.go`
+- Modify: `../coderig/internal/app/toolsets.go`
+- Modify: `../coderig/internal/app/access_acceptance_test.go`
+- Create: `../coderig/internal/app/process_tools_test.go`
 
 **Step 1: Write failing roster/binding tests**
 
@@ -2725,14 +2725,14 @@ ProcessStop carry no resolver or runner and may create the shared runner-free
 supervisor first. Verify Harness `ProcessBinding` supplies only the shared
 session registry, sibling loops cannot access one another's handles, resolver
 failure aborts Build without producing Bash, and zero/missing LoopID is rejected
-by Harness binding before the factory/resolver is called. Verify Carbon does
+by Harness binding before the factory/resolver is called. Verify Coderig does
 not install the process-enabled roster on a foreign-engine loop and reports
 `process_notifications_unsupported` for an attempted explicit bind.
 
 **Step 2: Queue focused phase-gate coverage**
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'TestProcessTools|Test.*ToolDefinitions'
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'TestProcessTools|Test.*ToolDefinitions'
 ```
 
 Failure rationale: the covered behavior is absent before implementation; the selector must pass at the phase gate.
@@ -2740,7 +2740,7 @@ Failure rationale: the covered behavior is absent before implementation; the sel
 **Step 3: Wire definitions**
 
 Construct the operator and reviewer process resolvers from their respective role
-executor sets. Extend Carbon's existing `bashDefinition` to capture its role
+executor sets. Extend Coderig's existing `bashDefinition` to capture its role
 resolver; inside its Build factory, retain the synchronous
 `set.For(bindings.LoopID.String())` lookup and invoke the async resolver with the
 same explicit `bindings.LoopID`, then pass the concrete adapter into Task 15's
@@ -2761,19 +2761,19 @@ git commit -m "feat: install supervised process tools"
 
 Inspect the diff and commit without executing tests. Queue the exact focused command from Step 2 for the owning phase gate.
 
-### Task 28: Add full Carbon integration tests
+### Task 28: Add full Coderig integration tests
 
 **Files:**
 
-- Create: `../carbon/internal/app/process_integration_test.go`
-- Create: `../carbon/internal/app/process_restore_integration_test.go`
-- Create: `../carbon/.github/workflows/ci.yml`
+- Create: `../coderig/internal/app/process_integration_test.go`
+- Create: `../coderig/internal/app/process_restore_integration_test.go`
+- Create: `../coderig/.github/workflows/ci.yml`
 
 **Step 1: Write tagged end-to-end acceptance tests**
 
 Both new files begin with `//go:build integration`.
 
-Through real Carbon composition and Sandbox:
+Through real Coderig composition and Sandbox:
 
 1. run an unchanged foreground Bash;
 2. start a background command;
@@ -2826,7 +2826,7 @@ boundaries.
 Use this single focused default-tag composition command for the owning phase gate:
 
 ```bash
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'Test(ProcessAdapter|ProcessTools)'
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test ./internal/app -run 'Test(ProcessAdapter|ProcessTools)'
 ```
 
 **Step 3: Fix only integration defects through TDD**
@@ -2856,14 +2856,14 @@ make secure
 CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-harness-gocache GOFLAGS=-mod=vendor go build -trimpath ./...
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/carbon
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test -race ./...
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegrationProcess' ./internal/app
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./internal/app
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -list '^TestIntegrationProcess' ./internal/app
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./internal/app
 make secure
-CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go build -trimpath ./...
 ```
 
 No new fuzz target is owned by this phase. `make secure` runs each repository's
@@ -2886,7 +2886,7 @@ and absence of cross-loop authority.
 - Create: `process/security_integration_test.go`
 - Create: `../sandbox/internal/exec/process_security_integration_test.go`
 - Create: `../harness/internal/sessionruntime/process_security_integration_test.go`
-- Create: `../carbon/internal/app/process_security_integration_test.go`
+- Create: `../coderig/internal/app/process_security_integration_test.go`
 
 This heading is four separate implementation microtasks, never one cross-repository
 implementation assignment:
@@ -2903,10 +2903,10 @@ implementation assignment:
   `TestSecurityCrossLoopProcessHandle`,
   `TestSecurityLifecycleIDCrashBoundaries`, and
   `TestSecurityWorkspaceLeaseRestoreRace`. Commit only Harness files.
-- **29D — Carbon composed threats:** named integration tests
+- **29D — Coderig composed threats:** named integration tests
   `TestSecurityProcessPromptInjectionNotification`,
   `TestSecurityProcessOwnerIsolation`, and
-  `TestSecurityProcessShutdownLeavesNoDescendants`. Commit only Carbon files.
+  `TestSecurityProcessShutdownLeavesNoDescendants`. Commit only Coderig files.
 
 Execute each microtask with separate evidence:
 
@@ -2927,12 +2927,12 @@ Execute each microtask with separate evidence:
   ./internal/sessionruntime -run '^TestSecurity(Process|Workspace)'`. Author all
   three tagged security cases, but defer their discovery and execution to Phase
   Gate 7. Fix and commit only Harness files.
-- **29D:** from Carbon, use focused default-tag process adapter seams under
+- **29D:** from Coderig, use focused default-tag process adapter seams under
   `./internal/app`; its single queued phase-gate selector is `GOWORK=off
-  GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test
+  GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test
   ./internal/app -run '^TestSecurityProcessUnit'`. Author all three tagged
   composed-security cases, but defer their discovery and execution to Phase
-  Gate 7. Fix and commit only Carbon files.
+  Gate 7. Fix and commit only Coderig files.
 
 **Task 29 combined acceptance**
 
@@ -2975,13 +2975,13 @@ matrix passes.
 - Modify: `../harness/pkg/event/README.md`
 - Modify: `../sandbox/README.md`
 - Modify: `../sandbox/SPEC.md`
-- Create: `../carbon/README.md`
-- Modify: `../carbon/docs/specs/carbon-assembly.md`
+- Create: `../coderig/README.md`
+- Modify: `../coderig/docs/specs/coderig-assembly.md`
 
 **Step 1: Write failing documentation/example tests**
 
 Add compile-tested examples for legacy Bash, background, yield, polling,
-wait-many, input, stop, PTY, and Carbon composition. Add schema assertions that
+wait-many, input, stop, PTY, and Coderig composition. Add schema assertions that
 examples match the shipped tool definitions.
 
 **Step 2: Queue focused phase-gate coverage**
@@ -3072,13 +3072,13 @@ GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integratio
 GOWORK=off GOCACHE=/private/tmp/looprig-sandbox-gocache go test -tags integration -race ./...
 ```
 
-Carbon:
+Coderig:
 
 ```bash
-cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/carbon
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test -race ./...
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test -tags integration -list 'Test(Integration|Security)' ./...
-GOWORK=off GOCACHE=/private/tmp/looprig-carbon-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./...
+cd /Users/ipotter/code/looprig/.worktrees/long-running-commands/coderig
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -race ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -list 'Test(Integration|Security)' ./...
+GOWORK=off GOCACHE=/private/tmp/looprig-coderig-gocache GOFLAGS=-mod=readonly go test -tags integration -race ./...
 ```
 
 Expected: PASS with zero race reports.
@@ -3092,7 +3092,7 @@ CGO_ENABLED=0 GOWORK=off GOCACHE=/private/tmp/looprig-REPO-gocache go build -tri
 make secure
 ```
 
-For Harness, Tools, Sandbox, and Carbon where supported:
+For Harness, Tools, Sandbox, and Coderig where supported:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off go build -trimpath ./...

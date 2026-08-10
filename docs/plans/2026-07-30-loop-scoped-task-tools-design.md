@@ -342,7 +342,7 @@ description, active form, IDs, dependencies, or metadata.
 
 ## Consumer and Presentation Migration
 
-Carbon replaces Todo with the Tasks bundle in both operator and reviewer tool
+CodeRig replaces Todo with the Tasks bundle in both operator and reviewer tool
 definitions. Because those definitions back the primary and delegated Loops,
 the primary operator, operator children, and reviewer children all receive the
 four tools and each receives a fresh graph.
@@ -376,7 +376,7 @@ Tests cover:
 - concurrent direct access under the race detector;
 - one shared graph across one Loop's modes;
 - distinct graphs across two Loop bindings;
-- distinct graphs across a Carbon parent, operator child, and reviewer child;
+- distinct graphs across a CodeRig parent, operator child, and reviewer child;
 - presence of all four tools and absence of Todo in every migrated roster;
 - redacted live and reconstructed TUI summaries;
 - complete removal of the Todo package, symbol, documentation, and consumer use.
