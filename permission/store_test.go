@@ -288,7 +288,7 @@ func TestReadOnlyStoreRejectsWrites(t *testing.T) {
 // TestConcurrentInterprocessMerge proves concurrent writers on the same
 // path never lose a batch. Each goroutine uses its own Store instance with
 // its own lock-file descriptor, so BSD flock semantics genuinely contend
-// exactly as two CodeRig processes would (flock locks belong to the open
+// exactly as two Carbon processes would (flock locks belong to the open
 // file description, not the process).
 func TestConcurrentInterprocessMerge(t *testing.T) {
 	ctx := context.Background()

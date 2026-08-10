@@ -74,7 +74,7 @@ func TestBashPrepareCallCommandRequirement(t *testing.T) {
 	}
 }
 
-// TestBashPrepareCallAbsoluteWorkdir reproduces the CodeRig call shape that
+// TestBashPrepareCallAbsoluteWorkdir reproduces the Carbon call shape that
 // previously doubled the workspace root: an absolute workdir plus a tree-read
 // declaration for "." must resolve both the request cwd and read scope to the
 // single canonical workspace root.

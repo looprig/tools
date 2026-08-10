@@ -796,7 +796,7 @@ func TestSupervisorReleasesLeaseOnce(t *testing.T) {
 // TestSupervisorStartPreservesRunnerErrorClassification proves that when
 // PreparedProcess.Start fails with a typed *tool.ProcessError carrying a
 // more specific stable reason than a generic spawn failure -- exactly what
-// a real AsyncProcessRunner adapter reports (Coderig's process_adapter.go
+// a real AsyncProcessRunner adapter reports (Carbon's process_adapter.go
 // mapStartError, for tool.ProcessErrorLifetimeEnforcementUnavailable when
 // Sandbox's own lifetime-containment proof is unavailable, e.g. every real
 // Seatbelt-confined Darwin spawn today, or tool.ProcessErrorPTYUnavailable
@@ -807,7 +807,7 @@ func TestSupervisorReleasesLeaseOnce(t *testing.T) {
 // fix, this classification was lost inside Supervisor.Start itself: a real
 // caller (bash/supervised.go's runSupervised) received only "spawn_failed"
 // for a Darwin fail-closed rejection, never the spec's documented
-// "lifetime_enforcement_unavailable" -- discovered via Coderig's Task 28
+// "lifetime_enforcement_unavailable" -- discovered via Carbon's Task 28
 // end-to-end integration tests, the first place in this whole feature that
 // exercises a real Sandbox rejection through this exact call path.
 func TestSupervisorStartPreservesRunnerErrorClassification(t *testing.T) {

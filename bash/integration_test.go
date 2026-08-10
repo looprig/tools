@@ -23,7 +23,7 @@ package bash_test
 // get-or-create contract (SessionResourceRegistry's doc comment: "atomically
 // resolves one session-owned resource by key... factory receives a private
 // storage directory reserved for that key"). Real registry composition
-// against the genuine Harness session runtime is reserved for Coderig Task
+// against the genuine Harness session runtime is reserved for Carbon Task
 // 28, not this module.
 //
 // The injected tool.AsyncProcessRunner is backed by a real os/exec.Cmd

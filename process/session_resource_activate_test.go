@@ -31,7 +31,7 @@ import (
 // fakeCompletionNotifier, which satisfy this package's OWN narrower
 // lifecycleSink/completionNotifier interfaces and therefore never touch a
 // real tool.ProcessLifecycleMetadata/tool.ProcessCompletionNotification DTO
-// at all. These exist to prove the seam a real Coderig/Harness session
+// at all. These exist to prove the seam a real Carbon/Harness session
 // actually uses end to end.
 type fakeToolLifecyclePublisher struct {
 	mu    sync.Mutex
@@ -172,11 +172,11 @@ func TestSupervisorResourceActivateWiresRealLifecycleAndNotificationServices(t *
 // whether its directory already holds manifests from a PRIOR process
 // (persisted sessions reuse the identical <data-dir>/resources/<session-id>
 // root across a real restart -- persisted_resource_storage_provider's own
-// stability contract, coderig's persistence.go), and SupervisorResource
+// stability contract, carbon's persistence.go), and SupervisorResource
 // (this file) never bridged that gap either. A real session restore
 // therefore silently discarded every previously known process: completed
 // output became permanently unreadable and a still-running manifest was
-// never marked lost -- discovered via Coderig's Task 28 end-to-end restore
+// never marked lost -- discovered via Carbon's Task 28 end-to-end restore
 // integration test, which found a freshly-completed process's own output
 // unreadable ("not_found") immediately after a real close/reopen cycle.
 func TestSupervisorResourceActivateReconcilesPersistedManifests(t *testing.T) {

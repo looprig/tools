@@ -56,10 +56,10 @@ var _ completionNotifier = (*blockingCompletionNotifier)(nil)
 // SessionResourceServices-backed notifier ultimately dispatches into that
 // loop's own command channel), created a circular wait whenever the loop's
 // own SessionIdle-triggered workspace checkpoint needed this exact
-// still-held lease to proceed -- discovered via Coderig's Task 28
+// still-held lease to proceed -- discovered via Carbon's Task 28
 // end-to-end integration tests, which reproduced a genuine ~10 second
 // deadlock (bounded only by an unrelated shutdown drain timeout) the first
-// time a real Coderig session let a turn go idle while a background
+// time a real Carbon session let a turn go idle while a background
 // process it had just started was still running. Before this test's fix,
 // lease.ReleaseCalls()/the quota release both waited behind notify(),
 // exactly reproducing that deadlock's root cause in isolation.
