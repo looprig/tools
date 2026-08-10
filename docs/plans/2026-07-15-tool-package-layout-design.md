@@ -38,9 +38,9 @@ Shared behavior is internal only when two or more packages require it. Tool-spec
 
 ## Dependency direction
 
-The root facade may import tool packages. Tool packages may import harness contracts and shared internal packages. Tool packages must not import the root facade or one another except for a narrow, explicit shared contract. No production package may import harness internals, sandbox, confinement, or coderig.
+The root facade may import tool packages. Tool packages may import harness contracts and shared internal packages. Tool packages must not import the root facade or one another except for a narrow, explicit shared contract. No production package may import harness internals, sandbox, confinement, or carbon.
 
-`confinement` will use `bash`, `grep`, and `permission` directly for their extension options. `coderig` will use the root definition facade plus `permission`, `skill`, and `websearch` where it needs advanced construction.
+`confinement` will use `bash`, `grep`, and `permission` directly for their extension options. `carbon` will use the root definition facade plus `permission`, `skill`, and `websearch` where it needs advanced construction.
 
 ## Compatibility
 

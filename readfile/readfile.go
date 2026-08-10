@@ -82,7 +82,8 @@ type ReadFileOption func(*ReadFile)
 // being rejected at prepare time. It does not itself grant anything: an
 // uncontained resolved path still emits the same filesystem.read requirement
 // PrepareCall always has, so the consumer's bound access source (the selected
-// sandbox.Profile in coderig) makes the actual Allow/Deny/Gated decision --
+// sandbox.Profile in the product composition root) makes the actual
+// Allow/Deny/Gated decision --
 // the same authority a spawned Bash command's host reads already go through.
 // Without this option, ReadFile's behavior is unchanged: any path outside the
 // workspace is rejected lexically before a requirement is ever built. A

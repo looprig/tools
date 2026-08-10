@@ -55,16 +55,16 @@
 
 **Files:**
 - Modify: `../confinement/*.go`
-- Modify: `../coderig/*.go`
+- Modify: `../carbon/*.go`
 
 1. Move permission references to `tools/permission`.
 2. Move Bash and Grep option references to their focused packages.
 3. Move Skill and WebSearch provider references to their focused packages.
-4. Preserve behavior and public APIs of coderig and confinement.
+4. Preserve behavior and public APIs of carbon and confinement.
 
 ### Task 6: Verify and commit
 
-1. Run formatting checks across tools, coderig, and confinement.
+1. Run formatting checks across tools, carbon, and confinement.
 2. Run vet, Staticcheck, Gosec, module verification, race tests, and builds for all three repositories.
 3. Confirm unrelated repositories remain untouched.
 4. Commit the tools refactor and required first-party import migrations as separate repository commits.

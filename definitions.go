@@ -126,8 +126,8 @@ func Bash(options ...bash.BashOption) tool.Definition {
 // session-supervised Bash definition binds to, from the Harness-validated
 // bindings.LoopID at Build (design spec "Workspace coordination": "At
 // definition Build, Tools invokes the resolver with the validated
-// bindings.LoopID"). Tools owns this resolver shape; a consumer (e.g.
-// Coderig) supplies the concrete implementation over its own per-role
+// bindings.LoopID"). Tools owns this resolver shape; a product composition
+// root supplies the concrete implementation over its own per-role
 // executor set. Runner selection is therefore complete before the concrete
 // Bash tool is ever invoked — it never derives from invocation-time
 // provenance.

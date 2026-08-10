@@ -609,7 +609,7 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 	// the workspace regardless of when its lease is released: deferring
 	// release behind two best-effort notifications served no safety
 	// purpose. It did, however, create a real deadlock risk once a real
-	// completion notifier needs to reach its owning loop (Coderig/Harness's
+	// completion notifier needs to reach its owning loop (the product composition root/Harness's
 	// production wiring dispatches into that loop's own command channel):
 	// if that loop's actor is itself synchronously blocked trying to
 	// acquire a workspace lease this exact still-held lease conflicts with
@@ -617,7 +617,7 @@ func (e *entry) doTerminalize(ctx context.Context, state State, result Result, f
 	// process), the old ordering meant the lease could never be released
 	// until notify() reached an actor that could only become reachable
 	// AFTER that same lease was released -- a genuine circular wait,
-	// reproduced end to end by Coderig's Task 28 integration tests as a
+	// reproduced end to end by the product composition root's Task 28 integration tests as a
 	// ~10 second stall (bounded only by an unrelated shutdown drain
 	// timeout, not by anything in this package). Releasing first breaks
 	// that cycle unconditionally: a slow or unreachable notifier can no

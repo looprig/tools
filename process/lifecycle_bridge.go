@@ -14,9 +14,9 @@ import (
 // tool.ProcessLifecycleMetadata or tool.ProcessCompletionNotification DTO;
 // session_resource.go's SupervisorResource.Activate is this file's only
 // caller. No supervision policy lives here -- only field-for-field mapping,
-// mirroring how Coderig's own process_adapter.go stays purely mechanical
-// (see that file's package doc comment for the identical justification one
-// module up the stack).
+// mirroring how the product composition root's own process_adapter.go stays
+// purely mechanical (see that file's package doc comment for the identical
+// justification one module up the stack).
 
 // lifecyclePublisherAdapter adapts a validated tool.ProcessLifecyclePublisher
 // to this package's own lifecycleSink.

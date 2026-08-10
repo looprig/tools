@@ -181,7 +181,7 @@ func (s *Skill) decodeName(argsJSON string) (name string, ok bool) {
 // CapabilityContextLoad is the normalized capability kind for loading curated
 // context (a skill body) into the conversation. It is a PRODUCT-bound kind:
 // the consumer routes it to its own access source via a gate AccessBinding
-// (the access-profile spec names CodeRig's binding), never to the sandbox
+// (the access-profile spec names the product composition root's binding), never to the sandbox
 // profile, and it is never silently mapped to command execution. It has no
 // durable workspace-rule representation, so context.load requirements carry NO
 // reusable candidates.

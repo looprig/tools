@@ -10,12 +10,12 @@ blocks Phase 3 until supplied.
 
 - Harness: `2927ca28ad572dce8efa1960dc6748c6fdd0f35c`
 - Tools: `475d0df7e295e32f1cc96f88436a50e28e96c391`
-- Coderig: `0b9b02059daa91837434d1fe82c8d3e063fffbad`
+- Carbon: `0b9b02059daa91837434d1fe82c8d3e063fffbad`
 - Sandbox, verification only: `2ea26665a73a71c4739787d3154ddf19389ec7a4`
 
 All four worktrees were clean at handoff. Sandbox `go.mod` and `go.sum` hashes
 were unchanged. Harness changed only `.gitattributes`, `go.mod`, `go.sum`, and
-`vendor/**`; Tools and Coderig changed only their module files. Direct
+`vendor/**`; Tools and Carbon changed only their module files. Direct
 requirements were identical before and after synchronization.
 
 **RED evidence**
@@ -30,7 +30,7 @@ requirements were identical before and after synchronization.
 **Synchronization and GREEN evidence**
 
 - Harness `go mod tidy` and `go mod vendor`: exit 0.
-- Tools and Coderig `go mod tidy`: exit 0.
+- Tools and Carbon `go mod tidy`: exit 0.
 - Harness vendor-mode race tests for `./pkg/tool ./internal/sessionruntime`:
   exit 0.
 - Tools readonly race tests for `./bash .`: exit 0.
@@ -38,13 +38,13 @@ requirements were identical before and after synchronization.
   exit 0.
 - Sandbox `CGO_ENABLED=0 ... go build -trimpath ./...`: exit 0.
 - Harness fresh `go mod vendor -o <temp>` comparison: byte-for-byte equal.
-- Harness, Tools, and Coderig `go mod verify`, Vet, Staticcheck, and Gosec:
+- Harness, Tools, and Carbon `go mod verify`, Vet, Staticcheck, and Gosec:
   exit 0; Gosec reported zero issues.
 - Approved-network Govulncheck: Harness and Tools reported no vulnerabilities;
-  Coderig reported zero reachable vulnerabilities and one required-module
+  Carbon reported zero reachable vulnerabilities and one required-module
   vulnerability not called.
 
-Coderig `go test -race ./internal/app` compiled and began execution but the
+Carbon `go test -race ./internal/app` compiled and began execution but the
 managed runner denied `listen tcp4 127.0.0.1:0`. An unsandboxed rerun request was
 rejected by the approval reviewer. Sandbox `./internal/exec` was likewise
 blocked before repository behavior by outer `sandbox_apply: Operation not
@@ -222,13 +222,13 @@ lifecycle provider, or session binding for a runner is introduced.
 
 Follow-up architectural review found that the first correction still resolved a
 concrete per-loop runner too early and incorrectly made it a supervisor and
-companion-definition dependency. The plan now matches current Coderig
+companion-definition dependency. The plan now matches current Carbon
 composition:
 
 - only process-enabled Bash receives execution authority;
 - its Tools-owned resolver is captured at definition construction and invoked at
   Build with the validated `bindings.LoopID`;
-- the Coderig resolver calls the same role `ExecutorSet.For(loopID.String())`
+- the Carbon resolver calls the same role `ExecutorSet.For(loopID.String())`
   path as the existing Bash definition and access gate;
 - resolver failure aborts Build, while missing/zero LoopID is rejected by
   Harness before the factory;
@@ -775,8 +775,8 @@ Phase 6's Tasks 24-25 (`../harness/pkg/journal`, `pkg/hub`, `pkg/sessionstore`,
 event publication, metadata-only notifications, shutdown/construction-abort/
 restore ordering) were checked and confirmed Harness-only, no Sandbox files,
 independent of Phase 3 the same way Phase 4 was. Only Phase 6's Tasks 26-28
-("Adapt Sandbox processes to Harness in Coderig", "Install the four process
-definitions in Coderig", "full Coderig integration tests") need the real
+("Adapt Sandbox processes to Harness in Carbon", "Install the four process
+definitions in Carbon", "full Carbon integration tests") need the real
 Sandbox executor.
 
 **Explicit user override, recorded 2026-07-30:** offered the choice between
@@ -1083,8 +1083,8 @@ override to Phase 5.
 
 **Decision: TASKS 24-25 COMPLETE AND REVIEWED — NOT A FULL PHASE GATE 6
 CLOSE.** Phase 6 has five tasks (24-28). Tasks 26-28 ("Adapt Sandbox processes
-to Harness in Coderig", "Install the four process definitions in Coderig",
-"full Coderig integration tests") require Sandbox's real async executor,
+to Harness in Carbon", "Install the four process definitions in Carbon",
+"full Carbon integration tests") require Sandbox's real async executor,
 which is not yet available, and were NOT attempted. Tasks 24-25 are pure
 Harness work with no Sandbox dependency — checked, verified against the plan
 text before starting, the same way Phase 4's independence from Phase 3 was
@@ -1253,7 +1253,7 @@ passed before the gate, same as prior phases in this plan)
 follow-ups above, both recorded with enough detail to action independently.
 
 **What remains before Phase 6 could be called fully closed:** Tasks 26-28
-(Sandbox adapter, process-definition installation, full Coderig integration
+(Sandbox adapter, process-definition installation, full Carbon integration
 tests) — all three need a Sandbox executor with actual native CI evidence
 behind it (see the Phase 3 section above), not just the darwin/Docker-verified
 implementation this session produced under override. Phase Gate 6's own
@@ -1429,9 +1429,9 @@ reviewed to the same standard as Phases 1/2/4/6; only the live-Windows and
 live-Linux runtime evidence remains outstanding, structurally identical to
 Phase 3's own still-open gap.
 
-## Tasks 26–28 and Phase Gate 6 — CodeRig composition (2026-08-07)
+## Tasks 26–28 and Phase Gate 6 — Carbon composition (2026-08-07)
 
-**Task 26A — resource storage composition (coderig).** Two implementations of
+**Task 26A — resource storage composition (carbon).** Two implementations of
 harness's `rig.SessionResourceStorageProvider`: a stateless persisted provider
 resolving `<data-dir>/resources/<session-id>`, and a headless provider giving
 same-process (not cross-restart) stability. Attached to the existing
@@ -1440,7 +1440,7 @@ the rig-build call chain — verified sound (every rig-construction path
 reached, nil provider handled without ever calling the Rig option). Two review
 rounds; both closed clean.
 
-**Task 26B — Sandbox-to-Harness async adapter (coderig).** Mechanical
+**Task 26B — Sandbox-to-Harness async adapter (carbon).** Mechanical
 two-phase type mapping wrapping Sandbox's `Executor`/`PreparedProcess`/
 `Process` to satisfy Harness's `tool.AsyncProcessRunner`/`PreparedProcess`/
 `Process`, following the existing `grantedExecutor` composition pattern. A
@@ -1456,26 +1456,26 @@ portability; `deriveReason`'s own headline invariant — exit code wins over
 recorded signal severity — had zero direct test coverage) plus several
 Suggestion-level items, all addressed.
 
-**Task 27 — install the four process definitions (coderig).** Wired the
+**Task 27 — install the four process definitions (carbon).** Wired the
 resolver into `bashDefinition`, appended `ProcessOutput`/`ProcessInput`/
 `ProcessStop` to the builder and reviewer rosters. Two real judgment calls,
 both verified against source before committing to them: (1) the plan's
-"operator" maps to CodeRig's current `builder` role (verified via alias
+"operator" maps to Carbon's current `builder` role (verified via alias
 functions, not just prose similarity); planner is deliberately excluded
-(read-only role, plan predates planner's own package by 5 days). (2) Coderig's
+(read-only role, plan predates planner's own package by 5 days). (2) Carbon's
 own `bashDefinition` could not use `tools.BashDefinition` directly — that
 helper resolves its `BashOption`s once at definition-construction time, before
-any Loop exists, incompatible with CodeRig's per-Loop confined runner — so a
+any Loop exists, incompatible with Carbon's per-Loop confined runner — so a
 fresh `bash.NewSupervisedFactory` call was built per-Build instead, verified
 against `tools.BashDefinition`'s actual source rather than assumed. Flipping
 on `tool.RequiresProcessServices` broke ~40 pre-existing tests across 12 files
 that assembled a rig without resource-storage wired (previously harmless);
 fixed with one shared `openTestStores` test helper. Two review rounds.
 
-**Task 28 — full CodeRig integration tests + CI.** 15 end-to-end scenarios
-through real CodeRig composition and real Sandbox (Darwin, `AccessUnconfined`
+**Task 28 — full Carbon integration tests + CI.** 15 end-to-end scenarios
+through real Carbon composition and real Sandbox (Darwin, `AccessUnconfined`
 profile — PTY included, per Phase 5's own work), plus a brand-new
-`.github/workflows/ci.yml` (CodeRig had none before this). Confined-profile
+`.github/workflows/ci.yml` (Carbon had none before this). Confined-profile
 scenarios (grant denial, lost manifests) correctly prove Darwin's typed
 `lifetime_enforcement_unavailable` fail-closed path rather than faking a
 supervised success path Darwin cannot provide, matching Phase 5's own Darwin
@@ -1532,14 +1532,14 @@ harness: go test -race ./...                                    ok, all packages
 harness: tagged integration discovery + run                     ok (TestProcessServicesIntegrationNewRestoreAndLease)
 harness: make secure                                             clean
 harness: native / linux / windows cross-builds                   clean
-coderig: go test -race ./...                                    ok, all packages
-coderig: tagged integration discovery                            16 tests (matches Task 28 exactly)
-coderig: tagged integration run                                  all 16 TestIntegrationProcess* tests pass;
+carbon: go test -race ./...                                    ok, all packages
+carbon: tagged integration discovery                            16 tests (matches Task 28 exactly)
+carbon: tagged integration run                                  all 16 TestIntegrationProcess* tests pass;
                                                                    see note below
-coderig: make secure                                              clean (gosec 0 issues; govulncheck: 0
+carbon: make secure                                              clean (gosec 0 issues; govulncheck: 0
                                                                    vulnerabilities reachable from this code)
-coderig: native / linux cross-builds                              clean
-coderig: windows cross-build                                      fails — see note below
+carbon: native / linux cross-builds                              clean
+carbon: windows cross-build                                      fails — see note below
 ```
 
 **Two pre-existing, out-of-scope findings, confirmed via direct baseline
@@ -1548,7 +1548,7 @@ comparison (not assumed):**
 - `TestPermissionReviewEvidenceLookupAccessAndContainmentApproveRealTargets`
   (an unrelated permission-review-classifier integration test) panics with a
   nil-pointer dereference, reproducibly, in isolation. Confirmed via a
-  disposable worktree at CodeRig's own pre-Task-26 commit (`02b3ea2`) that
+  disposable worktree at Carbon's own pre-Task-26 commit (`02b3ea2`) that
   this is **not** a regression — it fails identically on that baseline. Real
   bug, wrong subsystem, wrong task to fix it in.
 - The Windows cross-build fails inside `github.com/looprig/tui` (the

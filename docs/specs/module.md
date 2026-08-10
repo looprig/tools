@@ -106,7 +106,7 @@ messages.
 2. Replace harness workspace observation construction with an internal implementation behind `tool.WorkspaceObservations`.
 3. Move the Subagent implementation behind harness delegation internals.
 4. Delete `harness/pkg/tools` after all production and tests stop importing it.
-5. Update CodeRig and consumer examples to import `github.com/looprig/tools`.
+5. Update Carbon and consumer examples to import `github.com/looprig/tools`.
 6. Add dependency tests proving harness does not import tools, sandbox, or confinement.
 
 No compatibility shim is required. The project has no external consumers of the old package.
@@ -141,5 +141,5 @@ The documentation must make clear that importing the standard tools module is op
 - file tools share binding observations correctly
 - Bash invalidates the same workspace observations
 - harness has no import of `github.com/looprig/tools`
-- CodeRig has no local generic tool-definition wrappers
+- Carbon has no local generic tool-definition wrappers
 - the new module passes race, lint, security, and integration tests

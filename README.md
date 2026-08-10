@@ -72,7 +72,7 @@ Bash network deltas, Fetch, and WebSearch all emit the same `network` capability
 - Unsegmentable or unprovably simple shell input never matches a family rule.
 - Definition builders reject nil (including typed-nil) dependencies at build time with a `DefinitionBuildError`.
 
-See the access-profile specification (`coderig/docs/specs/access-profiles.md`) for the cross-module design, and the historical [module specification](docs/specs/module.md) for the original extraction plan.
+See the access-profile specification (`carbon/docs/specs/access-profiles.md`) for the cross-module design, and the historical [module specification](docs/specs/module.md) for the original extraction plan.
 
 Run the full local security suite with:
 

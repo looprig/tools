@@ -32,7 +32,7 @@ var errLockWouldBlock = errors.New("lock is held by another process")
 // One Store serves one explicit permission-file path supplied by the
 // consumer; the store never computes HOME-relative or otherwise implicit
 // locations. An interactive workspace store re-reads the file for every
-// query, so concurrent CodeRig processes observe each other's atomically
+// query, so concurrent product processes observe each other's atomically
 // renamed updates without watching. A read-only (headless) store loads one
 // immutable snapshot at construction and never reloads.
 //

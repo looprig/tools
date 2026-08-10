@@ -4,7 +4,7 @@
 
 **Goal:** Replace Todo with `TaskCreate`, `TaskUpdate`, `TaskGet`, and `TaskList`, giving every parent and subagent Loop its own bounded in-memory task graph.
 
-**Architecture:** A new `task` package owns an unexported mutex-protected store and four sequential concrete tools. `tools.TaskDefinitions()` returns one `tool.NewBundleDefinition` whose per-binding factory creates a fresh store. Todo is deleted without a compatibility shim; CodeRig selects Tasks for primary and delegated Loops, while the Harness-owned Subagent control tool remains unchanged.
+**Architecture:** A new `task` package owns an unexported mutex-protected store and four sequential concrete tools. `tools.TaskDefinitions()` returns one `tool.NewBundleDefinition` whose per-binding factory creates a fresh store. Todo is deleted without a compatibility shim; Carbon selects Tasks for primary and delegated Loops, while the Harness-owned Subagent control tool remains unchanged.
 
 **Tech Stack:** Go 1.26, `encoding/json`, `sync.Mutex`, Looprig `tool.Definition`, `tool.InvokableTool`, `tool.CallPreparer`, `tool.Sequential`, `core/uuid`, and existing Harness managed delegation.
 
@@ -647,14 +647,14 @@ git add CLAUDE.md CONTRIBUTING.md README.md example_readme_test.go docs/specs/mo
 git commit -m "docs: document loop-scoped task tools"
 ```
 
-### Task 10: Migrate CodeRig primary and subagent Loops
+### Task 10: Migrate Carbon primary and subagent Loops
 
 **Files:**
-- Modify: `../coderig/internal/app/toolsets.go`
-- Modify: `../coderig/internal/app/swarm_test.go`
-- Modify: `../coderig/internal/app/managed_delegation_test.go`
-- Modify: `../coderig/go.mod`
-- Modify: `../coderig/go.sum`
+- Modify: `../carbon/internal/app/toolsets.go`
+- Modify: `../carbon/internal/app/swarm_test.go`
+- Modify: `../carbon/internal/app/managed_delegation_test.go`
+- Modify: `../carbon/go.mod`
+- Modify: `../carbon/go.sum`
 
 **Step 1: Write failing roster tests**
 
@@ -682,11 +682,11 @@ definition metadata.
 **Step 3: Run RED**
 
 ```bash
-cd ../coderig
+cd ../carbon
 GOWORK=off go test -race ./internal/app -run 'Test.*Task|TestManagedSubagentTaskIsolation|TestSwarmDefinitionsAntiDrift' -v
 ```
 
-Expected: FAIL while CodeRig still selects Todo.
+Expected: FAIL while Carbon still selects Todo.
 
 **Step 4: Replace consumer wiring**
 
@@ -703,11 +703,11 @@ GOWORK=off go test -race ./internal/app -run 'Test.*Task|TestManagedSubagentTask
 
 Expected: PASS.
 
-**Step 6: Commit in the CodeRig repository**
+**Step 6: Commit in the Carbon repository**
 
 ```bash
 git add internal/app/toolsets.go internal/app/swarm_test.go internal/app/managed_delegation_test.go go.mod go.sum
-git commit -m "feat: give every CodeRig Loop scoped task tools"
+git commit -m "feat: give every Carbon Loop scoped task tools"
 ```
 
 ### Task 11: Remove Todo presentation and keep Task summaries redacted
@@ -819,7 +819,7 @@ git commit -m "docs: replace Todo with loop-scoped Tasks"
 From `/Users/ipotter/code/looprig` run:
 
 ```bash
-rg -n 'TodoDefinition|NewTodo|github.com/looprig/tools/todo|toolNameTodo' tools coderig tui www tests -g '*.go' -g '*.md'
+rg -n 'TodoDefinition|NewTodo|github.com/looprig/tools/todo|toolNameTodo' tools carbon tui www tests -g '*.go' -g '*.md'
 ```
 
 Expected: no matches. Historical dated plans may retain Todo only when explicitly
@@ -838,10 +838,10 @@ git diff --check
 
 Expected: PASS with no race or static/security findings.
 
-**Step 3: Verify CodeRig and real managed delegation**
+**Step 3: Verify Carbon and real managed delegation**
 
 ```bash
-cd ../coderig
+cd ../carbon
 GOWORK=off go test -race ./internal/app
 GOWORK=off make test
 GOWORK=off make secure

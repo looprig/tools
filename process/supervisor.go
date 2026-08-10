@@ -806,7 +806,7 @@ func (s *Supervisor) handleExists(h Handle) bool {
 //
 // A prepared.Start failure is classified by classifyStartError, below,
 // rather than unconditionally reported as CodeSpawnFailed: a real
-// AsyncProcessRunner adapter (e.g. Coderig's process_adapter.go) reports a
+// AsyncProcessRunner adapter (e.g. the product composition root's process_adapter.go) reports a
 // more specific tool.ProcessError classification for a handful of
 // documented, distinct failure modes (lifetime containment unavailable, PTY
 // unavailable), and that specific reason must survive through this layer
@@ -837,7 +837,7 @@ func (s *Supervisor) Start(
 	// exercises exactly that override); otherwise every lifecycle publish
 	// this process ever makes -- Start-time AND, via the entry it
 	// registers below, its eventual terminal publish -- falls back to the
-	// session-wide value a real caller (Bash, via Coderig's composed
+	// session-wide value a real caller (Bash, via the product composition root's composed
 	// session) never supplies directly. notifications has no per-call
 	// counterpart at all: it is always the session-wide value.
 	sessionLifecycle, notifications := s.servicesLocked()
@@ -1061,7 +1061,7 @@ func (s *Supervisor) Start(
 
 // classifyStartError classifies a prepared.Start failure into this
 // package's own stable Code domain. A runner that classifies its own
-// failure through Harness's typed tool.ProcessError -- e.g. Coderig's
+// failure through Harness's typed tool.ProcessError -- e.g. the product composition root's
 // process_adapter.go mapStartError, for
 // tool.ProcessErrorLifetimeEnforcementUnavailable when Sandbox's own
 // lifetime-containment proof is unavailable (today, every real

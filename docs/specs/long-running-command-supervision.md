@@ -2,7 +2,7 @@
 
 **Status:** Approved
 
-**Owners:** Tools, Harness, Sandbox; Coderig composes the concrete adapters
+**Owners:** Tools, Harness, Sandbox; Carbon composes the concrete adapters
 
 **Scope:** Supervised foreground, yielded, background, and interactive shell commands
 
@@ -30,7 +30,7 @@ commands that outlive an individual tool invocation.
 Tools and Sandbox intentionally remain independent modules. Because Go interface
 method signatures do not permit a Sandbox method returning a Sandbox-named
 process type to implement a Harness method returning a Harness-named process
-interface, Coderig provides the small adapter that imports both modules. Neither
+interface, Carbon provides the small adapter that imports both modules. Neither
 low-level module gains a reverse dependency.
 
 ## Goals
@@ -132,7 +132,7 @@ formats, or shell semantics.
 
 Harness does not provision an async runner through Rig/session lifecycle
 options, and `ProcessBinding` contains only the session resource registry.
-Coderig constructs a role-local Sandbox-to-Harness resolver over its
+Carbon constructs a role-local Sandbox-to-Harness resolver over its
 `ExecutorSet` and passes it only to the role's process-enabled Bash definition.
 
 ### Sandbox
@@ -152,13 +152,13 @@ Sandbox owns operating-system enforcement:
 Sandbox must not know sessions, loops, model tool names, output cursors, or
 Harness event types.
 
-### Coderig
+### Carbon
 
-Coderig is the production composition root. It owns:
+Carbon is the production composition root. It owns:
 
 - the adapter from Sandbox's public asynchronous process API to Harness's public
   async runner/process contracts;
-- configuration of the durable resource root beneath Coderig's data directory
+- configuration of the durable resource root beneath Carbon's data directory
   for persisted sessions and an isolated temporary root for headless sessions;
 - construction of one runner-free Tools supervisor through the Harness
   session-resource registry, regardless of which process definition first
@@ -421,13 +421,13 @@ The supervisor is created once per Harness session and registered as a session
 resource. Harness bindings expose a keyed session-resource registry; every
 process-tool definition resolves the same supervisor key with atomic
 get-or-create semantics. The registry obtains storage from an explicit
-session-resource storage provider. Persisted Coderig sessions use a stable
+session-resource storage provider. Persisted Carbon sessions use a stable
 `<data-dir>/resources/<session-id>` root on both new and restore; headless
 sessions use isolated temporary storage and do not claim cross-process restore.
-The Coderig process owns each headless temporary root for its lifetime and keys
+The Carbon process owns each headless temporary root for its lifetime and keys
 the session subdirectory by SessionID. Reconstructing the same headless session
-in the same Coderig process therefore reopens the same resource root; only an
-actual Coderig restart forfeits headless restore.
+in the same Carbon process therefore reopens the same resource root; only an
+actual Carbon restart forfeits headless restore.
 Unavailable or identity-mismatched durable storage fails session construction.
 The resource root is never the workspace.
 
@@ -689,7 +689,7 @@ filesystem access granted at spawn becomes a workspace lease held for the entire
 process lifetime.
 
 Lease classification comes from a two-phase enforcing-runner protocol, not from
-the model's declaration or Coderig parsing opaque grants:
+the model's declaration or Carbon parsing opaque grants:
 
 1. `PrepareProcess` validates and reserves grants/resources without spawning,
    returning an opaque prepared process and its authoritative effective access;
@@ -697,13 +697,13 @@ the model's declaration or Coderig parsing opaque grants:
 3. `Start` consumes the preparation exactly once and spawns;
 4. any failure closes the preparation and releases all reservations.
 
-The Coderig adapter only maps Sandbox's normalized access type to Harness's
+The Carbon adapter only maps Sandbox's normalized access type to Harness's
 generic read-only, scoped-write, or broad-write description. If the runner
 cannot truthfully prepare access or prove lifetime containment, supervised spawn
 fails with `lifetime_enforcement_unavailable`.
 
 This adapter is not a per-session Harness binding and is not a supervisor
-dependency. Coderig captures a narrow resolver over each role's
+dependency. Carbon captures a narrow resolver over each role's
 `ExecutorSet` in that role's process-enabled Bash definition. At definition
 Build, Tools invokes the resolver with the validated `bindings.LoopID`; the
 resolver calls the same `ExecutorSet.For(bindings.LoopID.String())` key/path
@@ -758,7 +758,7 @@ type ProcessActivitySource interface {
 ```
 
 Sandbox may expose the equivalent interface without importing Harness and
-Coderig maps the value mechanically. Every reported filesystem activity
+Carbon maps the value mechanically. Every reported filesystem activity
 invalidates the loop's complete observation cache; scoped observation
 invalidation is not part of this feature. Malformed or overflowed activity is
 treated as broad activity. Activity can never narrow or mutate the immutable
@@ -796,7 +796,7 @@ type Process interface {
 ```
 
 Harness owns these public types but does not manufacture or bind an
-implementation. A Coderig resolver constructs the Sandbox adapter for the
+implementation. A Carbon resolver constructs the Sandbox adapter for the
 validated loop-bound executor at Bash definition Build; `ProcessBinding`
 remains registry-only. The runner is absent from supervisor construction and
 from all three companion definitions.
@@ -815,7 +815,7 @@ Exact Go names may follow existing package conventions, but the contract must:
 - not expose an OS PID as the model-facing identity.
 
 Sandbox exposes its equivalent concrete public API without importing Harness.
-Coderig wraps the Sandbox request and process in the Harness interfaces; the
+Carbon wraps the Sandbox request and process in the Harness interfaces; the
 adapter is mechanical and is contract-tested in both directions. Sandbox's
 implementation must start the child in its final enforcement and process-tree
 container before executable code can run.
@@ -1015,7 +1015,7 @@ Acceptance gate:
 
 Wire session construction, resource shutdown, durable lifecycle events,
 metadata-only completion notifications, workspace restore, manifest restore,
-and Coderig's Sandbox-to-Harness async adapter and process-tool composition.
+and Carbon's Sandbox-to-Harness async adapter and process-tool composition.
 
 Acceptance gate:
 
@@ -1051,7 +1051,7 @@ coverage, never per-task execution instructions.
 
 Unit tests are necessary but insufficient. Each phase that crosses a module or
 OS boundary adds tagged integration coverage. Sandbox integration tests execute
-real descendants, grants, process-tree teardown, and PTY behavior. Coderig
+real descendants, grants, process-tree teardown, and PTY behavior. Carbon
 integration tests exercise the composed Bash-to-Tools-to-Harness-to-Sandbox
 path. Harness integration tests cover shutdown, restore, checked events, and
 workspace leases. Focused functional tests, race tests, tagged integration
