@@ -111,7 +111,7 @@ func TestProductionDependencyBoundary(t *testing.T) {
 	forbidden := []string{
 		"github.com/looprig/sandbox",
 		"github.com/looprig/confinement",
-		"github.com/looprig/coderig",
+		"github.com/looprig/carbon",
 		"github.com/looprig/harness/internal/",
 	}
 	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
