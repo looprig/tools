@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -102,66 +103,91 @@ func TestDiscoverWorkspaceSkillsRejectsCandidateDirectorySymlink(t *testing.T) {
 	}
 }
 
-func TestDiscoverWorkspaceSkillsOmitsUnreadableAndUnsafeFinalFilesWithoutDroppingNeighbors(t *testing.T) {
+func TestDiscoverWorkspaceSkillsOmitsBadFinalFileWithoutDroppingNeighbors(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	writeSkill := func(name string) string {
+	setup := func(t *testing.T) (string, func(string) string) {
 		t.Helper()
-		dir := filepath.Join(root, workspaceSkillsDir, name)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("MkdirAll(%q): %v", name, err)
+		root := t.TempDir()
+		writeSkill := func(name string) string {
+			t.Helper()
+			dir := filepath.Join(root, workspaceSkillsDir, name)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("MkdirAll(%q): %v", name, err)
+			}
+			path := filepath.Join(dir, skillFileName)
+			document := fmt.Sprintf("---\nname: %s\ndescription: %s description.\n---\nSECRET %s BODY\n", name, name, name)
+			if err := os.WriteFile(path, []byte(document), 0o644); err != nil {
+				t.Fatalf("WriteFile(%q): %v", name, err)
+			}
+			return path
 		}
-		path := filepath.Join(dir, skillFileName)
-		document := fmt.Sprintf("---\nname: %s\ndescription: %s description.\n---\nSECRET %s BODY\n", name, name, name)
-		if err := os.WriteFile(path, []byte(document), 0o644); err != nil {
-			t.Fatalf("WriteFile(%q): %v", name, err)
+		writeSkill("alpha")
+		writeSkill("zeta")
+		return root, writeSkill
+	}
+	assertValidNeighbors := func(t *testing.T, root string) {
+		t.Helper()
+		got := DiscoverWorkspaceSkills(root)
+		want := []SkillMeta{
+			{Name: "alpha", Description: "alpha description."},
+			{Name: "zeta", Description: "zeta description."},
 		}
-		return path
-	}
-
-	writeSkill("alpha")
-	writeSkill("zeta")
-
-	unreadable := writeSkill("unreadable")
-	if err := os.Chmod(unreadable, 0); err != nil {
-		t.Fatalf("Chmod(unreadable): %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o600) })
-	if f, err := os.Open(unreadable); err == nil {
-		_ = f.Close()
-		t.Log("filesystem does not enforce mode-based unreadability for this process; substituting a missing final file")
-		if err := os.Remove(unreadable); err != nil {
-			t.Fatalf("Remove(unreadable fallback): %v", err)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("DiscoverWorkspaceSkills() = %#v, want valid neighbors %#v", got, want)
 		}
 	}
 
-	unsafeDir := filepath.Join(root, workspaceSkillsDir, "nonregular", skillFileName)
-	if err := os.MkdirAll(unsafeDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(nonregular SKILL.md): %v", err)
-	}
+	t.Run("missing final file", func(t *testing.T) {
+		root, _ := setup(t)
+		if err := os.MkdirAll(filepath.Join(root, workspaceSkillsDir, "missing"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(missing): %v", err)
+		}
+		assertValidNeighbors(t, root)
+	})
 
-	linkedDir := filepath.Join(root, workspaceSkillsDir, "final-link")
-	if err := os.MkdirAll(linkedDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll(final-link): %v", err)
-	}
-	outside := filepath.Join(t.TempDir(), skillFileName)
-	outsideDocument := "---\nname: final-link\ndescription: Following this symlink would advertise outside metadata.\n---\nSECRET OUTSIDE BODY\n"
-	if err := os.WriteFile(outside, []byte(outsideDocument), 0o644); err != nil {
-		t.Fatalf("WriteFile(outside final-link target): %v", err)
-	}
-	if err := os.Symlink(outside, filepath.Join(linkedDir, skillFileName)); err != nil {
-		t.Logf("Symlink unavailable; non-regular final file still covers fail-soft final-path rejection: %v", err)
-	}
+	t.Run("unreadable final file", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("mode-bit unreadability is not portable to Windows")
+		}
+		root, writeSkill := setup(t)
+		unreadable := writeSkill("unreadable")
+		if err := os.Chmod(unreadable, 0); err != nil {
+			t.Fatalf("Chmod(unreadable): %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(unreadable, 0o600) })
+		if f, err := os.Open(unreadable); err == nil {
+			_ = f.Close()
+			t.Skip("current privileges can still read a mode-000 file")
+		}
+		assertValidNeighbors(t, root)
+	})
 
-	got := DiscoverWorkspaceSkills(root)
-	want := []SkillMeta{
-		{Name: "alpha", Description: "alpha description."},
-		{Name: "zeta", Description: "zeta description."},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("DiscoverWorkspaceSkills() = %#v, want valid neighbors %#v", got, want)
-	}
+	t.Run("nonregular final target", func(t *testing.T) {
+		root, _ := setup(t)
+		unsafeDir := filepath.Join(root, workspaceSkillsDir, "nonregular", skillFileName)
+		if err := os.MkdirAll(unsafeDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(nonregular SKILL.md): %v", err)
+		}
+		assertValidNeighbors(t, root)
+	})
+
+	t.Run("final-component symlink", func(t *testing.T) {
+		root, _ := setup(t)
+		linkedDir := filepath.Join(root, workspaceSkillsDir, "final-link")
+		if err := os.MkdirAll(linkedDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(final-link): %v", err)
+		}
+		outside := filepath.Join(t.TempDir(), skillFileName)
+		outsideDocument := "---\nname: final-link\ndescription: Following this symlink would advertise outside metadata.\n---\nSECRET OUTSIDE BODY\n"
+		if err := os.WriteFile(outside, []byte(outsideDocument), 0o644); err != nil {
+			t.Fatalf("WriteFile(outside final-link target): %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(linkedDir, skillFileName)); err != nil {
+			t.Skipf("Symlink unavailable: %v", err)
+		}
+		assertValidNeighbors(t, root)
+	})
 }
 
 func TestDiscoverWorkspaceSkillsBoundsAggregateWork(t *testing.T) {
