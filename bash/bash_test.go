@@ -208,12 +208,19 @@ func TestBashTimeout(t *testing.T) {
 }
 
 // TestBashOutputTruncation generates more than 32 KiB of output and asserts the
-// truncation notice is present and the capture is bounded.
+// capture preserves both the beginning and end around its truncation notice.
 func TestBashOutputTruncation(t *testing.T) {
 	t.Parallel()
 	requireSh(t)
-	// yes prints an endless stream; head bounds it well above 32 KiB.
-	out := runBash(t, t.TempDir(), map[string]any{"command": "yes AAAAAAAAAA | head -c 100000"})
+	// Keep all output on stderr so POSIX sh's stream ordering is deterministic;
+	// the loop avoids non-portable `head -c`/`yes` assumptions.
+	command := "printf '%s\\n' BEGIN-SENTINEL >&2; i=0; while [ \"$i\" -lt 40000 ]; do printf x >&2; i=$((i + 1)); done; printf '\\n%s\\n' END-SENTINEL >&2"
+	out := runBash(t, t.TempDir(), map[string]any{"command": command})
+	for _, sentinel := range []string{"BEGIN-SENTINEL", "END-SENTINEL"} {
+		if !strings.Contains(out, sentinel) {
+			t.Errorf("result missing %s; got %d bytes", sentinel, len(out))
+		}
+	}
 	if !strings.Contains(out, "truncated") {
 		t.Fatalf("result missing truncation notice; got %d bytes", len(out))
 	}
