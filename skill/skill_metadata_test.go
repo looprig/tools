@@ -102,6 +102,63 @@ func TestDiscoverWorkspaceSkillsRejectsCandidateDirectorySymlink(t *testing.T) {
 	}
 }
 
+func TestDiscoverWorkspaceSkillsOmitsUnreadableAndUnsafeFinalFilesWithoutDroppingNeighbors(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeSkill := func(name string) string {
+		t.Helper()
+		dir := filepath.Join(root, workspaceSkillsDir, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", name, err)
+		}
+		path := filepath.Join(dir, skillFileName)
+		document := fmt.Sprintf("---\nname: %s\ndescription: %s description.\n---\nSECRET %s BODY\n", name, name, name)
+		if err := os.WriteFile(path, []byte(document), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q): %v", name, err)
+		}
+		return path
+	}
+
+	writeSkill("alpha")
+	writeSkill("zeta")
+
+	unreadable := writeSkill("unreadable")
+	if err := os.Chmod(unreadable, 0); err != nil {
+		t.Fatalf("Chmod(unreadable): %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o600) })
+	if f, err := os.Open(unreadable); err == nil {
+		_ = f.Close()
+		t.Log("filesystem does not enforce mode-based unreadability for this process; substituting a missing final file")
+		if err := os.Remove(unreadable); err != nil {
+			t.Fatalf("Remove(unreadable fallback): %v", err)
+		}
+	}
+
+	unsafeDir := filepath.Join(root, workspaceSkillsDir, "nonregular", skillFileName)
+	if err := os.MkdirAll(unsafeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(nonregular SKILL.md): %v", err)
+	}
+
+	linkedDir := filepath.Join(root, workspaceSkillsDir, "final-link")
+	if err := os.MkdirAll(linkedDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(final-link): %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, workspaceSkillsDir, "alpha", skillFileName), filepath.Join(linkedDir, skillFileName)); err != nil {
+		t.Logf("Symlink unavailable; non-regular final file still covers fail-soft final-path rejection: %v", err)
+	}
+
+	got := DiscoverWorkspaceSkills(root)
+	want := []SkillMeta{
+		{Name: "alpha", Description: "alpha description."},
+		{Name: "zeta", Description: "zeta description."},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DiscoverWorkspaceSkills() = %#v, want valid neighbors %#v", got, want)
+	}
+}
+
 func TestDiscoverWorkspaceSkillsBoundsAggregateWork(t *testing.T) {
 	t.Parallel()
 
