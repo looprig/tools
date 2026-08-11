@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "repository": "tools",
+  "proofSources": [
+    {
+      "id": "example-tools-definitions-fixture",
+      "type": "executable-fixture",
+      "path": "examples/definitions/example_test.go",
+      "symbol": "Example_definitionRequirements"
+    },
+    {
+      "id": "example-tools-preparation-fixture",
+      "type": "executable-fixture",
+      "path": "examples/preparation/example_test.go",
+      "symbol": "Example_preparedBashCall"
+    },
+    {
+      "id": "example-tools-processes-fixture",
+      "type": "executable-fixture",
+      "path": "examples/processes/example_test.go",
+      "symbol": "Example_processLifecycle"
+    },
+    {
+      "id": "example-tools-skills-fixture",
+      "type": "executable-fixture",
+      "path": "examples/skills/example_test.go",
+      "symbol": "Example_embeddedSkill"
+    },
+    {
+      "id": "example-tools-tasks-fixture",
+      "type": "executable-fixture",
+      "path": "examples/tasks/example_test.go",
+      "symbol": "Example_taskBundle"
+    },
+    {
+      "id": "example-tools-permissions-fixture",
+      "type": "executable-fixture",
+      "path": "examples/permissions/example_test.go",
+      "symbol": "Example_exactPermissionRules"
+    },
+    {
+      "id": "example-tools-manifest-contract-test",
+      "type": "test",
+      "path": "docs_examples_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-tools-definitions-example",
+      "ecosystem": "go",
+      "owner": "tools",
+      "sourcePath": "examples/definitions/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/tools": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-tools-docs-gocache go test ./examples/...",
+      "assertion": "The runnable example distinguishes pure task definitions from workspace-bound Bash definitions and builds the effectful tool from explicit bindings.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No cleanup is required; definitions are built over inert in-memory collaborators.",
+      "liveGate": null,
+      "proofIds": [
+        "example-tools-definitions-fixture",
+        "example-tools-manifest-contract-test"
+      ]
+    },
+    {
+      "id": "example-tools-preparation-example",
+      "ecosystem": "go",
+      "owner": "tools",
+      "sourcePath": "examples/preparation/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/tools": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-tools-docs-gocache go test ./examples/...",
+      "assertion": "The runnable example proves Bash preparation performs no effect and execution consumes the prepared command even if invocation arguments change.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No cleanup is required; the injected command runner records calls in memory.",
+      "liveGate": null,
+      "proofIds": [
+        "example-tools-preparation-fixture",
+        "example-tools-manifest-contract-test"
+      ]
+    },
+    {
+      "id": "example-tools-processes-example",
+      "ecosystem": "go",
+      "owner": "tools",
+      "sourcePath": "examples/processes/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/tools": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-tools-docs-gocache go test ./examples/...",
+      "assertion": "The runnable example proves session shutdown terminates a supervised process and releases its workspace lease, while restore marks a persisted running process lost.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The example shuts down the supervisor and removes both temporary manifest and spool roots.",
+      "liveGate": null,
+      "proofIds": [
+        "example-tools-processes-fixture",
+        "example-tools-manifest-contract-test"
+      ]
+    },
+    {
+      "id": "example-tools-skills-example",
+      "ecosystem": "go",
+      "owner": "tools",
+      "sourcePath": "examples/skills/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/tools": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-tools-docs-gocache go test ./examples/...",
+      "assertion": "The runnable example loads one embedded skill through an agent-scoped allow-set and proves an unlisted name fails closed.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No cleanup is required; the skill catalogue is an in-memory filesystem.",
+      "liveGate": null,
+      "proofIds": [
+        "example-tools-skills-fixture",
+        "example-tools-manifest-contract-test"
+      ]
+    },
+    {
+      "id": "example-tools-tasks-example",
+      "ecosystem": "go",
+      "owner": "tools",
+      "sourcePath": "examples/tasks/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/tools": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-tools-docs-gocache go test ./examples/...",
+      "assertion": "The runnable example proves tools from one task bundle share a private Loop-local task graph across prepared create and list calls.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No cleanup is required; the task graph is private in-memory state.",
+      "liveGate": null,
+      "proofIds": [
+        "example-tools-tasks-fixture",
+        "example-tools-manifest-contract-test"
+      ]
+    },
+    {
+      "id": "example-tools-permissions-example",
+      "ecosystem": "go",
+      "owner": "tools",
+      "sourcePath": "examples/permissions/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/tools": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off GOCACHE=/tmp/looprig-tools-docs-gocache go test ./examples/...",
+      "assertion": "The runnable example persists an exact command rule and proves it does not authorize a different command.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The example removes its temporary owner-only permission-store directory.",
+      "liveGate": null,
+      "proofIds": [
+        "example-tools-permissions-fixture",
+        "example-tools-manifest-contract-test"
+      ]
+    }
+  ]
+}
