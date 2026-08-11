@@ -73,6 +73,14 @@ func (f *fakeToolCompletionNotifier) Calls() []tool.ProcessCompletionNotificatio
 
 var _ tool.ProcessCompletionNotifier = (*fakeToolCompletionNotifier)(nil)
 
+type fakeWorkflowActivityPublisher struct{}
+
+func (*fakeWorkflowActivityPublisher) PublishWorkflowActivity(context.Context, tool.WorkflowActivityMetadata) error {
+	return nil
+}
+
+var _ tool.WorkflowActivityPublisher = (*fakeWorkflowActivityPublisher)(nil)
+
 // TestSupervisorResourceActivateWiresRealLifecycleAndNotificationServices is
 // this file's headline proof. See the file doc comment above.
 func TestSupervisorResourceActivateWiresRealLifecycleAndNotificationServices(t *testing.T) {
@@ -88,7 +96,7 @@ func TestSupervisorResourceActivateWiresRealLifecycleAndNotificationServices(t *
 
 	publisher := &fakeToolLifecyclePublisher{}
 	notifier := &fakeToolCompletionNotifier{}
-	services, err := tool.NewSessionResourceServices(publisher, notifier)
+	services, err := tool.NewSessionResourceServices(publisher, notifier, &fakeWorkflowActivityPublisher{})
 	if err != nil {
 		t.Fatalf("tool.NewSessionResourceServices() err = %v, want nil", err)
 	}
@@ -233,7 +241,7 @@ func TestSupervisorResourceActivateReconcilesPersistedManifests(t *testing.T) {
 
 	publisher := &fakeToolLifecyclePublisher{}
 	notifier := &fakeToolCompletionNotifier{}
-	services, err := tool.NewSessionResourceServices(publisher, notifier)
+	services, err := tool.NewSessionResourceServices(publisher, notifier, &fakeWorkflowActivityPublisher{})
 	if err != nil {
 		t.Fatalf("tool.NewSessionResourceServices() err = %v, want nil", err)
 	}
