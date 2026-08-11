@@ -145,7 +145,12 @@ func TestDiscoverWorkspaceSkillsOmitsUnreadableAndUnsafeFinalFilesWithoutDroppin
 	if err := os.MkdirAll(linkedDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(final-link): %v", err)
 	}
-	if err := os.Symlink(filepath.Join(root, workspaceSkillsDir, "alpha", skillFileName), filepath.Join(linkedDir, skillFileName)); err != nil {
+	outside := filepath.Join(t.TempDir(), skillFileName)
+	outsideDocument := "---\nname: final-link\ndescription: Following this symlink would advertise outside metadata.\n---\nSECRET OUTSIDE BODY\n"
+	if err := os.WriteFile(outside, []byte(outsideDocument), 0o644); err != nil {
+		t.Fatalf("WriteFile(outside final-link target): %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(linkedDir, skillFileName)); err != nil {
 		t.Logf("Symlink unavailable; non-regular final file still covers fail-soft final-path rejection: %v", err)
 	}
 
