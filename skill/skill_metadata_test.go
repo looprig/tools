@@ -108,7 +108,7 @@ func TestDiscoverWorkspaceSkillsBoundsAggregateWork(t *testing.T) {
 	t.Run("result limit", func(t *testing.T) {
 		root := t.TempDir()
 		const wantLimit = 32
-		for i := 0; i < wantLimit+8; i++ {
+		for i := wantLimit + 7; i >= 0; i-- {
 			name := fmt.Sprintf("skill-%02d", i)
 			dir := filepath.Join(root, workspaceSkillsDir, name)
 			if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -125,9 +125,9 @@ func TestDiscoverWorkspaceSkillsBoundsAggregateWork(t *testing.T) {
 		if len(got) != wantLimit || stats.results != wantLimit {
 			t.Fatalf("results = (%d metadata, %d stats), want hard limit %d", len(got), stats.results, wantLimit)
 		}
-		for i := 1; i < len(got); i++ {
-			if got[i-1].Name >= got[i].Name {
-				t.Fatalf("metadata is not canonically sorted: %#v", got)
+		for i, meta := range got {
+			if want := fmt.Sprintf("skill-%02d", i); meta.Name != want {
+				t.Fatalf("metadata[%d].Name = %q, want deterministic member %q", i, meta.Name, want)
 			}
 		}
 	})
@@ -154,25 +154,26 @@ func TestDiscoverWorkspaceSkillsBoundsAggregateWork(t *testing.T) {
 		}
 	})
 
-	t.Run("candidate and batch limits", func(t *testing.T) {
+	t.Run("oversized directory is empty and batched", func(t *testing.T) {
 		root := t.TempDir()
-		dir := filepath.Join(root, workspaceSkillsDir)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("MkdirAll(.skills): %v", err)
-		}
-		for i := 0; i < 300; i++ {
-			name := filepath.Join(dir, fmt.Sprintf("entry-%03d", i))
-			if err := os.WriteFile(name, nil, 0o644); err != nil {
+		for i := 0; i < 257; i++ {
+			name := fmt.Sprintf("entry-%03d", i)
+			dir := filepath.Join(root, workspaceSkillsDir, name)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("MkdirAll(%q): %v", name, err)
+			}
+			document := fmt.Sprintf("---\nname: %s\ndescription: Entry %d.\n---\nBODY\n", name, i)
+			if err := os.WriteFile(filepath.Join(dir, skillFileName), []byte(document), 0o644); err != nil {
 				t.Fatalf("WriteFile(%q): %v", name, err)
 			}
 		}
 
 		var stats workspaceDiscoveryStats
 		if got := discoverWorkspaceSkills(root, &stats); len(got) != 0 {
-			t.Fatalf("discoverWorkspaceSkills() = %#v, want no file candidates", got)
+			t.Fatalf("discoverWorkspaceSkills() returned %d entries, want empty for oversized directory", len(got))
 		}
-		if stats.candidates != 256 {
-			t.Fatalf("candidates inspected = %d, want hard limit 256", stats.candidates)
+		if stats.candidates != 257 || !stats.oversized {
+			t.Fatalf("directory stats = {candidates:%d oversized:%v}, want {257 true}", stats.candidates, stats.oversized)
 		}
 		if stats.maxBatch > 32 || stats.readBatches < 2 {
 			t.Fatalf("ReadDir batching = {max:%d calls:%d}, want max 32 across multiple calls", stats.maxBatch, stats.readBatches)

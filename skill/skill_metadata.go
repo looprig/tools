@@ -1,6 +1,7 @@
 package skill
 
 import (
+	"io"
 	"io/fs"
 	"os"
 	"sort"
@@ -9,8 +10,8 @@ import (
 
 const (
 	// Discovery reads an untrusted directory in fixed-size batches and stops at
-	// explicit aggregate ceilings. Candidate order is the directory order
-	// supplied by os.File.ReadDir; accepted results are canonically sorted.
+	// explicit aggregate ceilings. One entry beyond the candidate ceiling is
+	// read solely to detect overflow and fail the catalog closed.
 	workspaceSkillReadDirBatch  = 32
 	maxWorkspaceSkillCandidates = 256
 	maxWorkspaceSkillDocuments  = 64
@@ -21,11 +22,11 @@ const (
 // .skills/<name>/SKILL.md candidates beneath root. Discovery is intentionally
 // metadata-only and fail-soft: malformed, unreadable, empty, mismatched, or
 // unsafe candidates are omitted, and filesystem errors are not exposed to the
-// caller. It reads directory entries in batches of 32, inspects at most 256
-// candidates and 64 documents, and returns at most 32 records. When a ceiling
-// is reached, selection follows the directory order supplied by os.File.ReadDir;
-// returned records are always sorted by canonical name. Skill bodies remain
-// available only through the gated Skill tool.
+// caller. It reads directory entries in batches of 32 and reads at most 257
+// entries: a directory exceeding 256 entries produces an empty catalog. For a
+// bounded directory, eligible names are sorted before at most 64 documents are
+// inspected and at most 32 records returned. Skill bodies remain available only
+// through the gated Skill tool.
 func DiscoverWorkspaceSkills(root string) []SkillMeta {
 	return discoverWorkspaceSkills(root, nil)
 }
@@ -38,6 +39,7 @@ type workspaceDiscoveryStats struct {
 	candidates  int
 	documents   int
 	results     int
+	oversized   bool
 }
 
 func discoverWorkspaceSkills(root string, stats *workspaceDiscoveryStats) []SkillMeta {
@@ -67,16 +69,14 @@ func discoverWorkspaceSkills(root string, stats *workspaceDiscoveryStats) []Skil
 	}
 	defer func() { _ = dir.Close() }()
 
-	metas := make([]SkillMeta, 0, maxWorkspaceSkillResults)
-	seen := make(map[string]struct{}, maxWorkspaceSkillResults)
+	candidateNames := make([]string, 0, maxWorkspaceSkillCandidates)
 	candidates := 0
-	documents := 0
-
-enumerate:
-	for candidates < maxWorkspaceSkillCandidates &&
-		documents < maxWorkspaceSkillDocuments &&
-		len(metas) < maxWorkspaceSkillResults {
-		entries, readErr := dir.ReadDir(workspaceSkillReadDirBatch)
+	for candidates <= maxWorkspaceSkillCandidates {
+		batchSize := workspaceSkillReadDirBatch
+		if remaining := maxWorkspaceSkillCandidates + 1 - candidates; remaining < batchSize {
+			batchSize = remaining
+		}
+		entries, readErr := dir.ReadDir(batchSize)
 		if stats != nil {
 			stats.readBatches++
 			if len(entries) > stats.maxBatch {
@@ -84,14 +84,15 @@ enumerate:
 			}
 		}
 		for _, entry := range entries {
-			if candidates >= maxWorkspaceSkillCandidates ||
-				documents >= maxWorkspaceSkillDocuments ||
-				len(metas) >= maxWorkspaceSkillResults {
-				break enumerate
-			}
 			candidates++
 			if stats != nil {
 				stats.candidates = candidates
+			}
+			if candidates > maxWorkspaceSkillCandidates {
+				if stats != nil {
+					stats.oversized = true
+				}
+				return nil
 			}
 
 			name := entry.Name()
@@ -99,54 +100,67 @@ enumerate:
 			if entry.Type()&fs.ModeSymlink != 0 || !entry.IsDir() || validateSkillName(name) != nil {
 				continue
 			}
-
-			candidateInfo, err := skillsRoot.Lstat(name)
-			if err != nil || candidateInfo.Mode()&fs.ModeSymlink != 0 || !candidateInfo.IsDir() {
-				continue
-			}
-			candidateRoot, err := skillsRoot.OpenRoot(name)
-			if err != nil {
-				continue
-			}
-			openedCandidateInfo, statErr := candidateRoot.Stat(".")
-			if statErr != nil || !os.SameFile(candidateInfo, openedCandidateInfo) {
-				_ = candidateRoot.Close()
-				continue
-			}
-
-			documents++
-			if stats != nil {
-				stats.documents = documents
-			}
-			var meta SkillMeta
-			artifactPath := workspaceSkillsDir + "/" + name + "/" + skillFileName
-			_, err = loadWorkspaceSkillAtRoot(candidateRoot, skillFileName, artifactPath, name, &meta)
-			_ = candidateRoot.Close()
-			if err != nil {
-				continue
-			}
-			// The directory is the loadable canonical identity. Requiring the parsed
-			// name to match avoids advertising an identity the Skill tool cannot load.
-			if meta.Name == "" || meta.Description == "" || meta.Name != name {
-				continue
-			}
-			if _, exists := seen[meta.Name]; exists {
-				continue
-			}
-			seen[meta.Name] = struct{}{}
-			metas = append(metas, SkillMeta{
-				Name:        strings.Clone(meta.Name),
-				Description: strings.Clone(meta.Description),
-			})
-			if stats != nil {
-				stats.results = len(metas)
-			}
+			candidateNames = append(candidateNames, name)
 		}
 		if readErr != nil {
+			if readErr != io.EOF {
+				return nil
+			}
 			break
 		}
 	}
 
-	sort.Slice(metas, func(i, j int) bool { return metas[i].Name < metas[j].Name })
+	sort.Strings(candidateNames)
+	metas := make([]SkillMeta, 0, maxWorkspaceSkillResults)
+	seen := make(map[string]struct{}, maxWorkspaceSkillResults)
+	documents := 0
+	for _, name := range candidateNames {
+		if documents >= maxWorkspaceSkillDocuments || len(metas) >= maxWorkspaceSkillResults {
+			break
+		}
+
+		candidateInfo, err := skillsRoot.Lstat(name)
+		if err != nil || candidateInfo.Mode()&fs.ModeSymlink != 0 || !candidateInfo.IsDir() {
+			continue
+		}
+		candidateRoot, err := skillsRoot.OpenRoot(name)
+		if err != nil {
+			continue
+		}
+		openedCandidateInfo, statErr := candidateRoot.Stat(".")
+		if statErr != nil || !os.SameFile(candidateInfo, openedCandidateInfo) {
+			_ = candidateRoot.Close()
+			continue
+		}
+
+		documents++
+		if stats != nil {
+			stats.documents = documents
+		}
+		var meta SkillMeta
+		artifactPath := workspaceSkillsDir + "/" + name + "/" + skillFileName
+		_, err = loadWorkspaceSkillAtRoot(candidateRoot, skillFileName, artifactPath, name, &meta)
+		_ = candidateRoot.Close()
+		if err != nil {
+			continue
+		}
+		// The directory is the loadable canonical identity. Requiring the parsed
+		// name to match avoids advertising an identity the Skill tool cannot load.
+		if meta.Name == "" || meta.Description == "" || meta.Name != name {
+			continue
+		}
+		if _, exists := seen[meta.Name]; exists {
+			continue
+		}
+		seen[meta.Name] = struct{}{}
+		metas = append(metas, SkillMeta{
+			Name:        strings.Clone(meta.Name),
+			Description: strings.Clone(meta.Description),
+		})
+		if stats != nil {
+			stats.results = len(metas)
+		}
+	}
+
 	return metas
 }
