@@ -59,8 +59,9 @@ const maxBashTimeout = 120 * time.Second
 const defaultBashTimeout = 30 * time.Second
 
 // maxBashOutputBytes caps the COMBINED stdout+stderr capture so a chatty command
-// cannot exhaust memory or flood the model context. Output beyond this is dropped
-// and a truncation notice is appended.
+// cannot exhaust memory or flood the model context. The retained data is a fixed
+// head plus rolling tail; omitted bytes are replaced by a marker outside this
+// retained-data ceiling.
 const maxBashOutputBytes = 32 * 1024 // 32 KiB
 
 // bashShell and bashShellFlag are the interpreter and flag for the documented

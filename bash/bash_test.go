@@ -231,6 +231,86 @@ func TestBashOutputTruncation(t *testing.T) {
 	}
 }
 
+func TestCappedBufferHeadTail(t *testing.T) {
+	tests := []struct {
+		name       string
+		limit      int
+		writes     []string
+		want       string
+		wantMarker string
+		wantTotal  int64
+	}{
+		{
+			name:      "exact limit remains untruncated",
+			limit:     6,
+			writes:    []string{"ab", "cdef"},
+			want:      "abcdef",
+			wantTotal: 6,
+		},
+		{
+			name:       "zero limit retains no bytes",
+			limit:      0,
+			writes:     []string{"abc"},
+			want:       "\n[output truncated: omitted 3 of 3 bytes]\n",
+			wantMarker: "[output truncated: omitted 3 of 3 bytes]",
+			wantTotal:  3,
+		},
+		{
+			name:       "one byte limit rolls the tail",
+			limit:      1,
+			writes:     []string{"ab"},
+			want:       "\n[output truncated: omitted 1 of 2 bytes]\nb",
+			wantMarker: "[output truncated: omitted 1 of 2 bytes]",
+			wantTotal:  2,
+		},
+		{
+			name:       "odd limit gives extra byte to tail",
+			limit:      5,
+			writes:     []string{"abcdef"},
+			want:       "ab\n[output truncated: omitted 1 of 6 bytes]\ndef",
+			wantMarker: "[output truncated: omitted 1 of 6 bytes]",
+			wantTotal:  6,
+		},
+		{
+			name:       "multiple chunk boundaries roll the tail",
+			limit:      10,
+			writes:     []string{"abc", "defgh", "ij", "klmnop"},
+			want:       "abcde\n[output truncated: omitted 6 of 16 bytes]\nlmnop",
+			wantMarker: "[output truncated: omitted 6 of 16 bytes]",
+			wantTotal:  16,
+		},
+		{
+			name:       "large single write keeps both ends",
+			limit:      8,
+			writes:     []string{strings.Repeat("0123456789", 10)},
+			want:       "0123\n[output truncated: omitted 92 of 100 bytes]\n6789",
+			wantMarker: "[output truncated: omitted 92 of 100 bytes]",
+			wantTotal:  100,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf cappedBuffer
+			buf.limit = tt.limit
+			for _, write := range tt.writes {
+				if got, err := buf.Write([]byte(write)); got != len(write) || err != nil {
+					t.Fatalf("Write() = (%d, %v), want (%d, nil)", got, err, len(write))
+				}
+			}
+			if buf.total != tt.wantTotal {
+				t.Errorf("total = %d, want %d", buf.total, tt.wantTotal)
+			}
+			if got := buf.cappedString(); got != tt.want {
+				t.Errorf("cappedString() = %q, want %q", got, tt.want)
+			}
+			if tt.wantMarker != "" && !strings.Contains(buf.cappedString(), tt.wantMarker) {
+				t.Errorf("cappedString() missing exact marker %q", tt.wantMarker)
+			}
+		})
+	}
+}
+
 // TestBashWorkdir confirms relative and absolute in-workspace workdirs resolve
 // to the same confined directory and execute there.
 func TestBashWorkdir(t *testing.T) {
