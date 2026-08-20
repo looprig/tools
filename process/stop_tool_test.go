@@ -616,6 +616,11 @@ func TestProcessStopConfirmedExitPublishesCompletedLifecycleEvent(t *testing.T) 
 		t.Fatalf("Status = %q, want %q", result.Status, StateKilled)
 	}
 
+	// ProcessStop confirms the process tree through e.exited, which closes
+	// before terminal lifecycle publication. e.done is the existing signal
+	// that the entire terminal transition, including publication, finished.
+	waitEntryDone(t, e, stopWaitTimeout)
+
 	if got := sink.PublishCalls(); got != 1 {
 		t.Fatalf("lifecycleSink.publish called %d times, want exactly 1", got)
 	}
