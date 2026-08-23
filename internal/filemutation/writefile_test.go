@@ -8,8 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/readfile"
 )
+
+var _ tool.MutationPreviewer = (*writeFileArtifact)(nil)
 
 // runWriteFile invokes WriteFile (bound to the given per-loop observation map) and
 // extracts the single text block, failing on any structural surprise (including a
@@ -23,6 +26,225 @@ func runWriteFile(t *testing.T, root string, obs *fileObservations, args map[str
 		t.Fatalf("marshal args: %v", err)
 	}
 	return prepareRun(context.Background(), t, NewWriteFile(root, obs), string(b))
+}
+
+func prepareWritePreviewArtifact(t *testing.T, root, path, content string, opts ...FileMutatorOption) *writeFileArtifact {
+	t.Helper()
+	_, preparedArtifact, err := NewWriteFile(root, newFileObservations(), opts...).PrepareCall(
+		context.Background(),
+		mustUUID(t),
+		mustJSON(t, map[string]any{"path": path, "content": content}),
+	)
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	art, ok := preparedArtifact.(*writeFileArtifact)
+	if !ok {
+		t.Fatalf("PrepareCall() artifact = %T, want *writeFileArtifact", preparedArtifact)
+	}
+	return art
+}
+
+func TestWriteFilePreviewMarksCreateAndRendersContent(t *testing.T) {
+	root := t.TempDir()
+	art := prepareWritePreviewArtifact(t, root, "nested/new.go", "hello\nworld\n")
+
+	preview, ok := art.MutationPreview()
+
+	if !ok {
+		t.Fatal("MutationPreview() declined a well-formed create")
+	}
+	if preview.Path != "nested/new.go" {
+		t.Errorf("MutationPreview().Path = %q, want %q", preview.Path, "nested/new.go")
+	}
+	if !preview.Creates {
+		t.Error("MutationPreview().Creates = false for an absent target")
+	}
+	for _, want := range []string{"--- a/nested/new.go", "+++ b/nested/new.go", "+hello", "+world"} {
+		if !strings.Contains(preview.UnifiedDiff, want) {
+			t.Errorf("MutationPreview().UnifiedDiff missing %q:\n%s", want, preview.UnifiedDiff)
+		}
+	}
+}
+
+func TestWriteFilePreviewDistinguishesEmptyExistingFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "empty.go"), nil, 0o600); err != nil {
+		t.Fatalf("seed empty target: %v", err)
+	}
+	art := prepareWritePreviewArtifact(t, root, "empty.go", "hello\n")
+
+	preview, ok := art.MutationPreview()
+
+	if !ok {
+		t.Fatal("MutationPreview() declined an empty existing file")
+	}
+	if preview.Creates {
+		t.Error("MutationPreview().Creates = true for an existing empty file")
+	}
+}
+
+func TestWriteFilePreviewRendersOverwrite(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("keep\nold\n"), 0o600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	art := prepareWritePreviewArtifact(t, root, "a.go", "keep\nnew\n")
+
+	preview, ok := art.MutationPreview()
+
+	if !ok {
+		t.Fatal("MutationPreview() declined a UTF-8 overwrite")
+	}
+	if preview.Creates {
+		t.Error("MutationPreview().Creates = true for an existing file")
+	}
+	for _, want := range []string{"-old", "+new"} {
+		if !strings.Contains(preview.UnifiedDiff, want) {
+			t.Errorf("MutationPreview().UnifiedDiff missing %q:\n%s", want, preview.UnifiedDiff)
+		}
+	}
+}
+
+func TestWriteFilePreviewDeclinesUnsafeExistingTargets(t *testing.T) {
+	t.Run("oversized", func(t *testing.T) {
+		root := t.TempDir()
+		body := strings.Repeat("x", int(maxPreviewFileBytes)+1)
+		if err := os.WriteFile(filepath.Join(root, "large.txt"), []byte(body), 0o600); err != nil {
+			t.Fatalf("seed oversized target: %v", err)
+		}
+		art := prepareWritePreviewArtifact(t, root, "large.txt", "small\n")
+		if preview, ok := art.MutationPreview(); ok || preview != (tool.MutationPreview{}) {
+			t.Fatalf("MutationPreview() = (%+v, %v), want (zero, false)", preview, ok)
+		}
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Mkdir(filepath.Join(root, "dir"), 0o700); err != nil {
+			t.Fatalf("seed directory target: %v", err)
+		}
+		art := prepareWritePreviewArtifact(t, root, "dir", "new\n")
+		if preview, ok := art.MutationPreview(); ok || preview != (tool.MutationPreview{}) {
+			t.Fatalf("MutationPreview() = (%+v, %v), want (zero, false)", preview, ok)
+		}
+	})
+
+	t.Run("final component symlink", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "target.txt"), []byte("secret\n"), 0o600); err != nil {
+			t.Fatalf("seed symlink target: %v", err)
+		}
+		if err := os.Symlink("target.txt", filepath.Join(root, "link.txt")); err != nil {
+			t.Skipf("symlink unsupported: %v", err)
+		}
+		art := prepareWritePreviewArtifact(t, root, "link.txt", "new\n")
+		if preview, ok := art.MutationPreview(); ok || preview != (tool.MutationPreview{}) {
+			t.Fatalf("MutationPreview() = (%+v, %v), want (zero, false)", preview, ok)
+		}
+	})
+
+	t.Run("non UTF-8", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "binary.dat"), []byte{0xff, 0xfe, 0x00}, 0o600); err != nil {
+			t.Fatalf("seed non-UTF-8 target: %v", err)
+		}
+		art := prepareWritePreviewArtifact(t, root, "binary.dat", "new\n")
+		if preview, ok := art.MutationPreview(); ok || preview != (tool.MutationPreview{}) {
+			t.Fatalf("MutationPreview() = (%+v, %v), want (zero, false)", preview, ok)
+		}
+	})
+}
+
+func TestWriteFilePreviewDeclinesAfterParentResolutionChanges(t *testing.T) {
+	root := t.TempDir()
+	insideParent := filepath.Join(root, "dir")
+	if err := os.Mkdir(insideParent, 0o700); err != nil {
+		t.Fatalf("create approved parent: %v", err)
+	}
+	insideTarget := filepath.Join(insideParent, "target.txt")
+	if err := os.WriteFile(insideTarget, []byte("approved old\n"), 0o600); err != nil {
+		t.Fatalf("seed approved target: %v", err)
+	}
+	art := prepareWritePreviewArtifact(t, root, "dir/target.txt", "new\n")
+
+	outsideParent := t.TempDir()
+	const outsideBody = "outside-secret\n"
+	if err := os.WriteFile(filepath.Join(outsideParent, "target.txt"), []byte(outsideBody), 0o600); err != nil {
+		t.Fatalf("seed outside target: %v", err)
+	}
+	if err := os.Remove(insideTarget); err != nil {
+		t.Fatalf("remove approved target: %v", err)
+	}
+	if err := os.Remove(insideParent); err != nil {
+		t.Fatalf("remove approved parent: %v", err)
+	}
+	if err := os.Symlink(outsideParent, insideParent); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	preview, ok := art.MutationPreview()
+
+	if ok || preview != (tool.MutationPreview{}) {
+		t.Fatalf("MutationPreview() after parent retarget = (%+v, %v), want (zero, false); outside content %q must not be previewed", preview, ok, outsideBody)
+	}
+}
+
+func TestWriteFilePreviewWithHostWritesDeclinesAfterParentResolutionChanges(t *testing.T) {
+	root := t.TempDir()
+	hostRoot := t.TempDir()
+	approvedParent := filepath.Join(hostRoot, "approved")
+	if err := os.Mkdir(approvedParent, 0o700); err != nil {
+		t.Fatalf("create approved host parent: %v", err)
+	}
+	approvedTarget := filepath.Join(approvedParent, "target.txt")
+	if err := os.WriteFile(approvedTarget, []byte("approved old\n"), 0o600); err != nil {
+		t.Fatalf("seed approved host target: %v", err)
+	}
+	art := prepareWritePreviewArtifact(t, root, approvedTarget, "new\n", WithHostWrites())
+
+	retargetedParent := t.TempDir()
+	const outsideBody = "host-secret\n"
+	if err := os.WriteFile(filepath.Join(retargetedParent, "target.txt"), []byte(outsideBody), 0o600); err != nil {
+		t.Fatalf("seed retargeted host target: %v", err)
+	}
+	if err := os.Remove(approvedTarget); err != nil {
+		t.Fatalf("remove approved host target: %v", err)
+	}
+	if err := os.Remove(approvedParent); err != nil {
+		t.Fatalf("remove approved host parent: %v", err)
+	}
+	if err := os.Symlink(retargetedParent, approvedParent); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	preview, ok := art.MutationPreview()
+
+	if ok || preview != (tool.MutationPreview{}) {
+		t.Fatalf("MutationPreview() after host parent retarget = (%+v, %v), want (zero, false); outside content %q must not be previewed", preview, ok, outsideBody)
+	}
+}
+
+func TestWriteFilePreviewDeclinesOversizedContentWithoutChangingWrite(t *testing.T) {
+	root := t.TempDir()
+	content := strings.Repeat("x", maxPreviewResultBytes+1)
+	art := prepareWritePreviewArtifact(t, root, "large.txt", content)
+
+	if preview, ok := art.MutationPreview(); ok || preview != (tool.MutationPreview{}) {
+		t.Fatalf("MutationPreview() = (%+v, %v), want (zero, false)", preview, ok)
+	}
+
+	out := runWriteFile(t, root, newFileObservations(), map[string]any{"path": "large.txt", "content": content})
+	if strings.HasPrefix(out, "error:") {
+		t.Fatalf("normal WriteFile execution rejected preview-oversized content: %q", out)
+	}
+	fi, err := os.Stat(filepath.Join(root, "large.txt"))
+	if err != nil {
+		t.Fatalf("stat written target: %v", err)
+	}
+	if fi.Size() != int64(len(content)) {
+		t.Fatalf("written size = %d, want %d", fi.Size(), len(content))
+	}
 }
 
 // observeFile runs a real ReadFile bound to obs so a subsequent WriteFile/EditFile

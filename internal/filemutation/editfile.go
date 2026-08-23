@@ -36,15 +36,19 @@ import (
 // editFileToolName is the EXACT tool name — it MUST equal "EditFile".
 const editFileToolName = "EditFile"
 
-// maxEditFileBytes caps the file EditFile will read so a pathological target
-// cannot exhaust memory. It matches the 1 MiB ceiling used elsewhere in the
-// package for human-edited/source files.
-const maxEditFileBytes int64 = 1 << 20
+// maxPreviewFileBytes caps any file read to render a mutation preview so a
+// pathological target cannot exhaust memory. It matches the 1 MiB ceiling used
+// elsewhere in the package for human-edited/source files.
+const maxPreviewFileBytes int64 = 1 << 20
 
-// maxPreviewResultBytes bounds the fully materialized post-edit text used only
-// to render a gate preview. The input read has the same 1 MiB safety scale, but
-// a short repeated anchor and large replacement could otherwise expand it far
-// beyond that bound before the diff renderer applies its own smaller output cap.
+// maxEditFileBytes preserves EditFile's historical read ceiling while the
+// shared preview reader also serves WriteFile overwrites.
+const maxEditFileBytes int64 = maxPreviewFileBytes
+
+// maxPreviewResultBytes bounds the fully materialized post-mutation text used
+// only to render a gate preview. The input read has the same 1 MiB safety scale,
+// but a short repeated edit anchor or a large prepared write could otherwise
+// exceed that bound before the diff renderer applies its smaller output cap.
 const maxPreviewResultBytes = 1 << 20
 
 // editFileSchema is the JSON Schema for EditFile's argument object.
@@ -461,7 +465,7 @@ func (e *EditFile) commitUncontained(target mutationTarget, old, replacement str
 
 // readForPreview opens path with a no-follow open (a final-component symlink or
 // reparse point fails to open — see internal/nofollow), confirms a regular file
-// via the fd stat, and reads up to maxEditFileBytes. path is the LEXICAL joined
+// via the fd stat, and reads up to maxPreviewFileBytes. path is the LEXICAL joined
 // path recorded in the prepared mutation target. Errors are typed
 // writeFileError (non-secret reason, never contents).
 func readForPreview(path string) (string, error) {
@@ -491,11 +495,11 @@ func readForPreview(path string) (string, error) {
 		return "", &writeFileError{reason: "not a regular file"}
 	}
 
-	data, err := io.ReadAll(io.LimitReader(f, maxEditFileBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, maxPreviewFileBytes+1))
 	if err != nil {
 		return "", &writeFileError{reason: "could not read the file", cause: err}
 	}
-	if int64(len(data)) > maxEditFileBytes {
+	if int64(len(data)) > maxPreviewFileBytes {
 		return "", &writeFileError{reason: "file is too large to edit (exceeds the " + strconv.FormatInt(maxEditFileBytes, 10) + "-byte cap)"}
 	}
 	return string(data), nil

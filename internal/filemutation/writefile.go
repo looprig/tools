@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
@@ -154,8 +155,46 @@ func (w *WriteFile) AuditSummary(argsJSON string) string {
 // tool.PreparedArtifact marker; the typed fields stay tool-private.
 type writeFileArtifact struct {
 	tool.TokenArtifact
-	target  mutationTarget
-	content string
+	root       string
+	hostWrites bool
+	target     mutationTarget
+	content    string
+}
+
+// MutationPreview renders the prepared full-file content as a create or
+// overwrite. Every failure declines: changed path resolution, an oversized or
+// irregular existing target, non-UTF-8 existing content, and prepared content
+// above the safe preview materialization cap all return ok == false without
+// changing eventual WriteFile execution. Harness calls this only at gate-open,
+// never during PrepareCall.
+func (a *writeFileArtifact) MutationPreview() (tool.MutationPreview, bool) {
+	if err := enforceApprovedResolution(a.root, a.target, a.hostWrites); err != nil {
+		return tool.MutationPreview{}, false
+	}
+	if len(a.content) > maxPreviewResultBytes {
+		return tool.MutationPreview{}, false
+	}
+
+	var before string
+	creates := false
+	switch classifyWriteTarget(a.target.lexical) {
+	case writeTargetAbsent:
+		creates = true
+	case writeTargetRegular:
+		var err error
+		before, err = readForPreview(a.target.lexical)
+		if err != nil || !utf8.ValidString(before) {
+			return tool.MutationPreview{}, false
+		}
+	case writeTargetIrregular:
+		return tool.MutationPreview{}, false
+	}
+
+	return tool.MutationPreview{
+		Path:        a.target.display,
+		Creates:     creates,
+		UnifiedDiff: renderUnifiedDiff(a.target.display, before, a.content, diffContextLines, maxReviewDiffBytes),
+	}, true
 }
 
 // prepareWrite is the SINGLE parse-validate-canonicalize step for a WriteFile
@@ -173,7 +212,12 @@ func (w *WriteFile) prepareWrite(argsJSON string) (*writeFileArtifact, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &writeFileArtifact{target: target, content: a.Content}, nil
+	return &writeFileArtifact{
+		root:       w.root,
+		hostWrites: w.hostWrites,
+		target:     target,
+		content:    a.Content,
+	}, nil
 }
 
 // PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
