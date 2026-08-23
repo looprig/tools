@@ -40,10 +40,6 @@ const editFileToolName = "EditFile"
 // package for human-edited/source files.
 const maxEditFileBytes int64 = 1 << 20
 
-// diffPreviewContextLines is how many unchanged lines of context the diff preview
-// shows on each side of a changed region (keeps the preview compact but readable).
-const diffPreviewContextLines = 2
-
 // editFileSchema is the JSON Schema for EditFile's argument object.
 const editFileSchema = `{
   "type": "object",
@@ -288,7 +284,7 @@ func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, ol
 			return err
 		}
 		*obs = tool.FileObservation{Observed: true, Present: true, Hash: sha256.Sum256([]byte(updated))}
-		preview = diffPreview(target.display, original, updated)
+		preview = editPreview(target.display, original, updated)
 		return nil
 	})
 	return preview, err
@@ -376,7 +372,7 @@ func (e *EditFile) commitUncontained(target mutationTarget, old, replacement str
 	if err := atomicWriteFile(target.lexical, []byte(updated)); err != nil {
 		return "", err
 	}
-	return diffPreview(target.display, original, updated), nil
+	return editPreview(target.display, original, updated), nil
 }
 
 // readForEdit opens path with a no-follow open (a final-component symlink or

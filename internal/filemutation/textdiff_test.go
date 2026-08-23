@@ -25,8 +25,26 @@ func TestLCSOpsInterleavedChange(t *testing.T) {
 	}
 }
 
+func TestCoarseOpsCoarsensWholeInput(t *testing.T) {
+	got := coarseOps([]string{"shared", "old"}, []string{"shared", "new"})
+	want := []diffOp{
+		{Kind: opDelete, Line: "shared"},
+		{Kind: opDelete, Line: "old"},
+		{Kind: opInsert, Line: "shared"},
+		{Kind: opInsert, Line: "new"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d ops, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("op %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
 func TestLCSOpsPreservesUnchangedMiddle(t *testing.T) {
-	// The case today's diffPreview gets wrong: two changed regions with
+	// The case a prefix/suffix preview gets wrong: two changed regions with
 	// unchanged lines between them must NOT collapse into one block.
 	before := []string{"1", "same", "same", "2"}
 	after := []string{"one", "same", "same", "two"}
@@ -39,6 +57,29 @@ func TestLCSOpsPreservesUnchangedMiddle(t *testing.T) {
 	}
 	if equals != 2 {
 		t.Fatalf("got %d equal ops, want 2 (the unchanged middle): %+v", equals, ops)
+	}
+}
+
+func TestRetainedLineHelpers(t *testing.T) {
+	lines := splitLines("first\nsecond\n")
+	if len(lines) != 2 || lines[0] != "first" || lines[1] != "second" {
+		t.Fatalf("splitLines = %#v, want [first second]", lines)
+	}
+	if lines := splitLines(""); lines != nil {
+		t.Fatalf("splitLines(empty) = %#v, want nil", lines)
+	}
+
+	before := []string{"same", "old", "tail"}
+	after := []string{"same", "new", "tail"}
+	prefix := commonPrefixLen(before, after)
+	if prefix != 1 {
+		t.Fatalf("commonPrefixLen = %d, want 1", prefix)
+	}
+	if suffix := commonSuffixLen(before, after, prefix); suffix != 1 {
+		t.Fatalf("commonSuffixLen = %d, want 1", suffix)
+	}
+	if suffix := commonSuffixLen([]string{"same"}, []string{"same"}, 1); suffix != 0 {
+		t.Fatalf("commonSuffixLen overlapping prefix = %d, want 0", suffix)
 	}
 }
 
@@ -291,5 +332,27 @@ func TestRenderUnifiedDiffDropsWholeHunksToFitBudget(t *testing.T) {
 	}
 	if got := renderUnifiedDiff("a.go", before, after, 1, 0); got != "" {
 		t.Fatalf("zero budget rendered %q, want empty", got)
+	}
+}
+
+func TestEditPreviewKeepsUnchangedMiddleSeparate(t *testing.T) {
+	// Regression for the retired prefix/suffix preview: two distant replace_all matches used
+	// to collapse into one hunk spanning every unchanged line between them.
+	before := "match\n" + strings.Repeat("keep\n", 30) + "match\n"
+	after := "REPL\n" + strings.Repeat("keep\n", 30) + "REPL\n"
+
+	got := editPreview("a.go", before, after)
+
+	if strings.Count(got, "@@ -") != 2 {
+		t.Fatalf("want 2 hunks, got:\n%s", got)
+	}
+	if strings.Contains(got, "-keep") || strings.Contains(got, "+keep") {
+		t.Errorf("unchanged lines were marked as changed:\n%s", got)
+	}
+}
+
+func TestEditPreviewNoChangeNote(t *testing.T) {
+	if got := editPreview("a.go", "x\n", "x\n"); got != "edited a.go (no changes)" {
+		t.Fatalf("got %q", got)
 	}
 }

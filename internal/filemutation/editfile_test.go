@@ -53,7 +53,7 @@ func TestEditFile(t *testing.T) {
 			seed:        "alpha\nbravo\ncharlie\n",
 			args:        map[string]any{"path": "f.txt", "old": "bravo", "new": "BRAVO"},
 			wantBody:    "alpha\nBRAVO\ncharlie\n",
-			wantContain: []string{"- bravo", "+ BRAVO"},
+			wantContain: []string{"-bravo", "+BRAVO"},
 		},
 		{
 			name:    "zero matches is not-found error",
@@ -187,7 +187,7 @@ func TestEditFileDiffPreview(t *testing.T) {
 	obs := newFileObservations()
 	observeFile(t, root, obs, "f.txt")
 	out := runEditFile(t, root, obs, map[string]any{"path": "f.txt", "old": "two", "new": "TWO"})
-	for _, want := range []string{"--- a/f.txt", "+++ b/f.txt", "- two", "+ TWO"} {
+	for _, want := range []string{"--- a/f.txt", "+++ b/f.txt", "-two", "+TWO"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("diff preview %q missing %q", out, want)
 		}

@@ -2,13 +2,12 @@ package filemutation
 
 import "testing"
 
-// FuzzDiffPreview asserts diffPreview is TOTAL over its untrusted before/after
+// FuzzEditPreview asserts editPreview is TOTAL over its untrusted before/after
 // (and path) inputs: for any combination it returns a string WITHOUT PANICKING
-// and WITHOUT HANGING. The diff math walks bounded common prefix/suffix indices,
-// so the contract under fuzz is the no-panic / always-returns-a-string property
-// (mirrors the package's other fuzzers). The result value is otherwise
-// unconstrained — it is a human-readable preview, not a machine patch.
-func FuzzDiffPreview(f *testing.F) {
+// and WITHOUT HANGING. The bounded diff renderer preserves that property; the
+// result value is otherwise unconstrained — it is a human-readable preview, not
+// a machine patch.
+func FuzzEditPreview(f *testing.F) {
 	seeds := []struct {
 		path   string
 		before string
@@ -34,6 +33,6 @@ func FuzzDiffPreview(f *testing.F) {
 		// Must always return a string without panicking. A zero-length result is
 		// permissible; the property is no-panic + termination. _ keeps the value
 		// referenced so the call is not optimized away.
-		_ = diffPreview(path, before, after)
+		_ = editPreview(path, before, after)
 	})
 }

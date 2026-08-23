@@ -45,6 +45,10 @@ const maxDiffRegionLines = 2000
 // identical context and text.
 const diffContextLines = 3
 
+// maxToolResultDiffBytes is a smaller model-result cap than the gate review
+// budget.
+const maxToolResultDiffBytes = 8 << 10
+
 func lcsOps(before, after []string) []diffOp {
 	return lcsSourceOps(sourceLinesFromStrings(before), sourceLinesFromStrings(after))
 }
@@ -131,6 +135,41 @@ func sourceLinesFromStrings(lines []string) []sourceLine {
 		source[i].Text = line
 	}
 	return source
+}
+
+// splitLines splits s into lines WITHOUT a trailing empty element for a final
+// newline (so "a\nb\n" -> ["a","b"], and "" -> []), which keeps the diff line
+// math clean.
+func splitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	lines := strings.Split(s, "\n")
+	// Drop a single trailing empty element produced by a terminating newline.
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	return lines
+}
+
+// commonPrefixLen returns the number of leading lines a and b share.
+func commonPrefixLen(a, b []string) int {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return n
+}
+
+// commonSuffixLen returns the number of trailing lines a and b share, without
+// overlapping the already-counted common prefix (so a change is never
+// double-counted on both ends).
+func commonSuffixLen(a, b []string, prefix int) int {
+	n := 0
+	for n < len(a)-prefix && n < len(b)-prefix && a[len(a)-1-n] == b[len(b)-1-n] {
+		n++
+	}
+	return n
 }
 
 func sourceLines(s string) []sourceLine {
@@ -289,6 +328,13 @@ func renderUnifiedDiff(path, before, after string, contextLines, maxBytes int) s
 		output.WriteString(renderedHunk)
 	}
 	return output.String()
+}
+
+func editPreview(path, before, after string) string {
+	if before == after {
+		return "edited " + path + " (no changes)"
+	}
+	return "edited " + path + "\n" + renderUnifiedDiff(path, before, after, diffContextLines, maxToolResultDiffBytes)
 }
 
 func renderHunk(h hunk) string {
