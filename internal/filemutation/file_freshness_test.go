@@ -409,7 +409,8 @@ func TestIrregularWriteTargetIsTyped(t *testing.T) {
 	})
 	t.Run("EditFile", func(t *testing.T) {
 		obs := newFileObservations()
-		_, cerr := NewEditFile(root, obs).commit(key, mutTarget, "body", "X", false)
+		art := &editFileArtifact{target: mutTarget, old: "body", replacement: "X"}
+		_, cerr := NewEditFile(root, obs).commit(key, art)
 		assertIrregularNotStale(t, cerr)
 	})
 

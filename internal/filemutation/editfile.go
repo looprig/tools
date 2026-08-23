@@ -146,7 +146,7 @@ type editFileArtifact struct {
 	replaceAll  bool
 
 	// previewedHash is sha256 of the exact bytes read by the last successful
-	// MutationPreview. Task 13 binds a host edit's commit to those reviewed bytes.
+	// MutationPreview. A host edit's commit is bound to those reviewed bytes.
 	previewedHash [32]byte
 	previewed     bool
 }
@@ -314,7 +314,7 @@ func (e *EditFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	// O_NOFOLLOW read rejects a final-component symlink rather than following it, and
 	// the atomic write targets the same lexical name so it REPLACES a final-component
 	// symlink rather than following it.
-	preview, err := e.commit(key, art.target, art.old, art.replacement, art.replaceAll)
+	preview, err := e.commit(key, art)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
@@ -325,12 +325,12 @@ func (e *EditFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 // that path's optimistic-concurrency critical section, or (for an UNCONTAINED host
 // target) bypassing the observation map entirely — see commitUncontained's doc
 // comment for why. key is the observation-map key (meaningful only for a contained
-// target); target carries the lexical on-disk name, the display path used in error
-// messages/the diff header, and the contained flag that selects which policy
-// applies; old/replacement/replaceAll are the requested edit.
-func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, old, replacement string, replaceAll bool) (string, error) {
+// target); art is the prepared edit and, after a successful MutationPreview, also
+// carries the exact hash of the bytes the human approved.
+func (e *EditFile) commit(key canonicalObservationKey, art *editFileArtifact) (string, error) {
+	target := art.target
 	if !target.contained {
-		return e.commitUncontained(target, old, replacement, replaceAll)
+		return e.commitUncontained(art)
 	}
 	var preview string
 	err := e.obs.WithPath(string(key), func(obs *tool.FileObservation) error {
@@ -364,7 +364,7 @@ func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, ol
 			return &StaleFileError{Path: target.display}
 		}
 
-		updated, errMsg := applyReplacement(original, old, replacement, replaceAll)
+		updated, errMsg := applyReplacement(original, art.old, art.replacement, art.replaceAll)
 		if errMsg != "" {
 			return &editAnchorError{message: errMsg}
 		}
@@ -386,15 +386,13 @@ func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, ol
 // decision WithHostReads() enforces on the read side, and commitUncontained
 // enforces on WriteFile's write side).
 //
-// EditFile's freshness mechanism differs from WriteFile's in a way that matters
-// here: EditFile ALREADY reads the current file fresh at commit time
-// (readForPreview), and the recorded observation hash is used ONLY as a comparator
-// against that fresh read — never as the source of the bytes being edited. So for
-// an uncontained target, this method simply SKIPS the
-// obs.Observed/obs.Present/obs.Hash comparison; everything else (the fresh read,
-// the exact-`old`-substring anchor match, the atomic write-back, the diff preview)
-// stays IDENTICAL to the contained path. The anchor match in applyReplacement is
-// itself real freshness protection, but its strength depends on replace_all:
+// EditFile reads the current file fresh at commit time (readForPreview). When a
+// successful MutationPreview ran, this method binds that fresh read to the exact
+// bytes the human approved. When no preview ran (for example an auto-allowed
+// call), there is no approved diff to bind and the historical host-edit behavior
+// remains: the observation CAS is skipped and the anchor match in applyReplacement
+// provides the remaining freshness protection. Its strength depends on
+// replace_all:
 //   - replace_all=false: it degrades gracefully. applyReplacement requires
 //     EXACTLY ONE occurrence of `old`, so if the file changed underneath since
 //     the model last saw it in a way that alters the occurrence count (zero, or
@@ -409,15 +407,12 @@ func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, ol
 //     because its CAS check requires a fresh full-file read matching the exact
 //     current on-disk hash before any edit is authorized, so ANY drift (not just
 //     a changed occurrence count) is caught before applyReplacement ever runs.
-//     This is an accepted, intentional residual risk of skipping the CAS check
-//     for host targets (see TestEditFileHostWritesReplaceAllOverReplacesDriftedOccurrences),
-//     not an oversight.
+//     This remains an accepted residual risk only for calls that never rendered a
+//     preview (see TestEditFileHostWritesReplaceAllOverReplacesDriftedOccurrences).
 //
-// This is why no NEW freshness mechanism is needed for the non-replace_all
-// uncontained case — the anchor match already does freshness-adjacent work, and
-// the CAS check on top of it was specifically about not editing based on a stale
-// cached hash the model never actually re-verified, which does not apply once
-// host edits get no cached authority at all.
+// Without a preview, the non-replace_all case therefore retains its historical
+// anchor-based behavior. A successful preview is stronger in both modes: the
+// full-file hash above refuses any drift before the anchor is applied.
 //
 // Unlike WriteFile, EditFile never creates a file (an absent target is already an
 // honest "file not found" — there is nothing to edit), so no parent-directory
@@ -431,7 +426,8 @@ func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, ol
 // target NO same-loop serialization at all — unlike a contained target, which
 // still serializes on the WithPath lock even coordinator-free. See WriteFile's
 // commitUncontained doc comment for the full discussion.
-func (e *EditFile) commitUncontained(target mutationTarget, old, replacement string, replaceAll bool) (string, error) {
+func (e *EditFile) commitUncontained(art *editFileArtifact) (string, error) {
+	target := art.target
 	switch classifyWriteTarget(target.lexical) {
 	case writeTargetAbsent:
 		return "", &writeFileError{reason: "file not found"}
@@ -448,12 +444,16 @@ func (e *EditFile) commitUncontained(target mutationTarget, old, replacement str
 		return "", rerr
 	}
 
-	// No observation check, no hash comparison: an uncontained edit is authorized by
-	// the fresh approval alone, never by a same-loop observation (in either
-	// direction). The anchor match below is the freshness protection that remains —
-	// full strength for replace_all=false, weaker for replace_all=true (see this
-	// method's doc comment).
-	updated, errMsg := applyReplacement(original, old, replacement, replaceAll)
+	// Bind the commit to what the human approved. An uncontained target has no
+	// observation CAS, so without this the file can drift between the previewed
+	// diff and these bytes — and replace_all would silently over-replace the
+	// drifted occurrences. Skipped when no preview ran: there is no approved
+	// diff to bind to.
+	if art.previewed && sha256.Sum256([]byte(original)) != art.previewedHash {
+		return "", &writeFileError{reason: "file changed since preview; the approved diff no longer applies"}
+	}
+
+	updated, errMsg := applyReplacement(original, art.old, art.replacement, art.replaceAll)
 	if errMsg != "" {
 		return "", &editAnchorError{message: errMsg}
 	}

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -47,6 +48,91 @@ func prepareEditPreviewArtifact(t *testing.T, root, path, old, replacement strin
 		t.Fatalf("PrepareCall() artifact = %T, want *editFileArtifact", preparedArtifact)
 	}
 	return art
+}
+
+func commitPreparedEditArtifact(t *testing.T, edit *EditFile, call tool.PreparedCall) string {
+	t.Helper()
+	ctx := loop.WithPreparedCall(context.Background(), call)
+	result, err := edit.InvokableRun(ctx, "")
+	if err != nil {
+		t.Fatalf("InvokableRun() Go error = %v", err)
+	}
+	return textBlock(t, result)
+}
+
+func prepareHostEditArtifact(t *testing.T, path, old, replacement string, replaceAll bool) (*EditFile, tool.PreparedCall, *editFileArtifact) {
+	t.Helper()
+	edit := NewEditFile(t.TempDir(), newFileObservations(), WithHostWrites())
+	executionID := mustUUID(t)
+	request, preparedArtifact, err := edit.PrepareCall(
+		context.Background(),
+		executionID,
+		mustJSON(t, map[string]any{
+			"path":        path,
+			"old":         old,
+			"new":         replacement,
+			"replace_all": replaceAll,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	art, ok := preparedArtifact.(*editFileArtifact)
+	if !ok {
+		t.Fatalf("PrepareCall() artifact = %T, want *editFileArtifact", preparedArtifact)
+	}
+	return edit, tool.PreparedCall{ExecutionID: executionID, Request: request, Artifact: art}, art
+}
+
+func TestUncontainedCommitRefusesWhenTheFileDriftedAfterPreview(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "host.go")
+	if err := os.WriteFile(path, []byte("x\nold\nz\n"), 0o600); err != nil {
+		t.Fatalf("seed host target: %v", err)
+	}
+	edit, call, art := prepareHostEditArtifact(t, path, "old", "new", false)
+	if _, ok := art.MutationPreview(); !ok {
+		t.Fatal("MutationPreview() declined")
+	}
+	if err := os.WriteFile(path, []byte("x\nold\nDIFFERENT\n"), 0o600); err != nil {
+		t.Fatalf("drift host target: %v", err)
+	}
+
+	out := commitPreparedEditArtifact(t, edit, call)
+
+	if !strings.HasPrefix(out, "error:") {
+		t.Fatalf("commit result = %q, want a refusal", out)
+	}
+	if !strings.Contains(out, "changed since preview") {
+		t.Errorf("commit result = %q, want a changed-since-preview refusal", out)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read refused host target: %v", err)
+	}
+	if string(got) != "x\nold\nDIFFERENT\n" {
+		t.Errorf("refused commit changed body to %q", got)
+	}
+}
+
+func TestUncontainedCommitProceedsWithoutAPreview(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "host.go")
+	if err := os.WriteFile(path, []byte("old\n"), 0o600); err != nil {
+		t.Fatalf("seed host target: %v", err)
+	}
+	edit, call, _ := prepareHostEditArtifact(t, path, "old", "new", false)
+
+	out := commitPreparedEditArtifact(t, edit, call)
+
+	if strings.HasPrefix(out, "error:") {
+		t.Fatalf("an unpreviewed commit was refused: %s", out)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read committed host target: %v", err)
+	}
+	if string(got) != "new\n" {
+		t.Errorf("committed body = %q, want %q", got, "new\n")
+	}
 }
 
 func TestEditFilePreviewRendersPendingChange(t *testing.T) {

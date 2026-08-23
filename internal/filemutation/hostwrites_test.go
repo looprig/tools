@@ -61,12 +61,14 @@ import (
 //     weaken anchor enforcement for replace_all=false: a WRONG `old` anchor
 //     still fails with the distinct editAnchorError, never a silent
 //     wrong-edit.
-// 16. For replace_all=true, the anchor match is WEAKER protection: it only
+// 16. For an unpreviewed replace_all=true call, the anchor match is WEAKER
+//     protection: it only
 //     confirms `old` exists somewhere, not that the occurrence set is
 //     unchanged. An uncontained target whose on-disk occurrence count
 //     drifted since a hypothetical prior read is silently over-replaced --
-//     an accepted, intentional residual risk (a contained target's CAS check
-//     would catch this drift; see commitUncontained's doc comment).
+//     an accepted, intentional residual risk when there is no approved diff to
+//     bind (a contained target's CAS check would catch this drift; see
+//     commitUncontained's doc comment).
 
 // resolvedAbsHost resolves input against root exactly as resolveMutationTarget
 // does for a host (uncontained) target, giving tests the canonical abs to
@@ -756,8 +758,8 @@ func TestEditFileHostWritesWrongAnchorStillFails(t *testing.T) {
 }
 
 // TestEditFileHostWritesReplaceAllOverReplacesDriftedOccurrences makes explicit
-// and regression-proof the residual risk documented on commitUncontained: for
-// replace_all=true, applyReplacement only requires `old` to occur AT LEAST
+// and regression-proof the unpreviewed residual risk documented on
+// commitUncontained: for replace_all=true, applyReplacement only requires `old` to occur AT LEAST
 // ONCE and then replaces EVERY occurrence -- it confirms `old` still exists
 // somewhere, not that the occurrence SET is unchanged from whatever the model
 // last saw. This test simulates a model that looked at the file when it held
@@ -769,8 +771,9 @@ func TestEditFileHostWritesWrongAnchorStillFails(t *testing.T) {
 // CAS check requires a fresh full-file read matching the exact current
 // on-disk hash before authorizing ANY edit, so this drift would be caught
 // before applyReplacement ever ran. This is the accepted, intentional
-// residual risk of skipping the freshness comparator for host targets -- this
-// test exists to keep that risk visible and testable, not to change it.
+// residual risk of an auto-allowed host edit that rendered no preview and thus
+// has no approved bytes to bind -- this test exists to keep that behavior visible
+// and testable, not to change it.
 func TestEditFileHostWritesReplaceAllOverReplacesDriftedOccurrences(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -787,7 +790,7 @@ func TestEditFileHostWritesReplaceAllOverReplacesDriftedOccurrences(t *testing.T
 
 	out := prepareRun(context.Background(), t, e, mustJSON(t, map[string]any{"path": target, "old": "old", "new": "NEW", "replace_all": true}))
 	if strings.HasPrefix(out, "error:") {
-		t.Fatalf("uncontained replace_all edit = %q, want success (this is the accepted residual risk, not a refusal)", out)
+		t.Fatalf("unpreviewed uncontained replace_all edit = %q, want success (there is no approved diff to bind)", out)
 	}
 	got, err := os.ReadFile(target)
 	if err != nil {
