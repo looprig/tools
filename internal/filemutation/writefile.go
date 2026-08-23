@@ -159,6 +159,14 @@ type writeFileArtifact struct {
 	hostWrites bool
 	target     mutationTarget
 	content    string
+
+	// A successful preview binds an uncontained commit to the target state the
+	// human reviewed. Failed later preview attempts deliberately leave the last
+	// successful binding intact: clearing it would turn a declined refresh into
+	// permission to write unreviewed bytes.
+	previewedHash    [sha256.Size]byte
+	previewedPresent bool
+	previewed        bool
 }
 
 // MutationPreview renders the prepared full-file content as a create or
@@ -176,6 +184,7 @@ func (a *writeFileArtifact) MutationPreview() (tool.MutationPreview, bool) {
 	}
 
 	var before string
+	var previewedHash [sha256.Size]byte
 	creates := false
 	switch classifyWriteTarget(a.target.lexical) {
 	case writeTargetAbsent:
@@ -186,15 +195,23 @@ func (a *writeFileArtifact) MutationPreview() (tool.MutationPreview, bool) {
 		if err != nil || !utf8.ValidString(before) {
 			return tool.MutationPreview{}, false
 		}
+		previewedHash = sha256.Sum256([]byte(before))
 	case writeTargetIrregular:
 		return tool.MutationPreview{}, false
 	}
 
-	return tool.MutationPreview{
+	preview := tool.MutationPreview{
 		Path:        a.target.display,
 		Creates:     creates,
 		UnifiedDiff: renderUnifiedDiff(a.target.display, before, a.content, diffContextLines, maxReviewDiffBytes),
-	}, true
+	}
+	// Publish the binding only after every fallible preview step succeeds. A
+	// repeated successful preview intentionally replaces the prior binding with
+	// the state represented by the newly returned diff.
+	a.previewedHash = previewedHash
+	a.previewedPresent = !creates
+	a.previewed = true
+	return preview, true
 }
 
 // prepareWrite is the SINGLE parse-validate-canonicalize step for a WriteFile
@@ -283,10 +300,19 @@ func (w *WriteFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResul
 	// on-disk write targets the LEXICAL joined path (NOT the symlink-resolved form),
 	// mirroring ReadFile/EditFile: an atomic Rename/Link on this lexical name never
 	// follows a final-component symlink.
-	if err := w.commit(key, art.target, []byte(art.content)); err != nil {
+	if err := w.commitPrepared(key, art); err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
 	return tool.TextResult("wrote " + art.target.display + " (" + strconv.Itoa(len(art.content)) + " bytes)"), nil
+}
+
+// commitPrepared preserves commit's historical unpreviewed behavior while
+// carrying a successful gate-open binding into the uncontained write path.
+func (w *WriteFile) commitPrepared(key canonicalObservationKey, art *writeFileArtifact) error {
+	if !art.target.contained {
+		return w.commitUncontained(art.target, []byte(art.content), art)
+	}
+	return w.commit(key, art.target, []byte(art.content))
 }
 
 // commit performs the write for one target while (for a CONTAINED target) holding
@@ -298,7 +324,7 @@ func (w *WriteFile) InvokableRun(ctx context.Context, _ string) (*tool.ToolResul
 // content to write.
 func (w *WriteFile) commit(key canonicalObservationKey, target mutationTarget, data []byte) error {
 	if !target.contained {
-		return w.commitUncontained(target, data)
+		return w.commitUncontained(target, data, nil)
 	}
 	return w.obs.WithPath(string(key), func(obs *tool.FileObservation) error {
 		switch classifyWriteTarget(target.lexical) {
@@ -373,7 +399,18 @@ func (w *WriteFile) commit(key canonicalObservationKey, target mutationTarget, d
 // coordinator-free. This is not a corruption risk (os.Rename/os.Link stay atomic
 // at the OS level; the worst case is last-write-wins), but it is a real asymmetry
 // with the contained path.
-func (w *WriteFile) commitUncontained(target mutationTarget, data []byte) error {
+func (w *WriteFile) commitUncontained(target mutationTarget, data []byte, art *writeFileArtifact) error {
+	// Uncontained writes intentionally have no observation-map CAS. Once a
+	// preview succeeds, compare both presence and (when present) the complete
+	// content hash against the reviewed state before selecting create/overwrite.
+	// With no successful preview, retain the historical auto-allowed behavior.
+	if art != nil && art.previewed {
+		currentHash, present, err := hashFileOnDisk(target.lexical)
+		if err != nil || present != art.previewedPresent || (present && currentHash != art.previewedHash) {
+			return &writeFileError{reason: "file changed since preview; the approved diff no longer applies"}
+		}
+	}
+
 	switch classifyWriteTarget(target.lexical) {
 	case writeTargetAbsent:
 		// Unlike the contained path, stageTempFile's MkdirAll must NOT be allowed to

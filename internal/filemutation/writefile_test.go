@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/tools/readfile"
 )
@@ -43,6 +44,35 @@ func prepareWritePreviewArtifact(t *testing.T, root, path, content string, opts 
 		t.Fatalf("PrepareCall() artifact = %T, want *writeFileArtifact", preparedArtifact)
 	}
 	return art
+}
+
+func prepareHostWriteArtifact(t *testing.T, path, content string) (*WriteFile, tool.PreparedCall, *writeFileArtifact) {
+	t.Helper()
+	write := NewWriteFile(t.TempDir(), newFileObservations(), WithHostWrites())
+	executionID := mustUUID(t)
+	request, preparedArtifact, err := write.PrepareCall(
+		context.Background(),
+		executionID,
+		mustJSON(t, map[string]any{"path": path, "content": content}),
+	)
+	if err != nil {
+		t.Fatalf("PrepareCall() error = %v", err)
+	}
+	art, ok := preparedArtifact.(*writeFileArtifact)
+	if !ok {
+		t.Fatalf("PrepareCall() artifact = %T, want *writeFileArtifact", preparedArtifact)
+	}
+	return write, tool.PreparedCall{ExecutionID: executionID, Request: request, Artifact: art}, art
+}
+
+func commitPreparedWriteArtifact(t *testing.T, write *WriteFile, call tool.PreparedCall) string {
+	t.Helper()
+	ctx := loop.WithPreparedCall(context.Background(), call)
+	result, err := write.InvokableRun(ctx, "")
+	if err != nil {
+		t.Fatalf("InvokableRun() Go error = %v", err)
+	}
+	return textBlock(t, result)
 }
 
 func TestWriteFilePreviewMarksCreateAndRendersContent(t *testing.T) {
@@ -103,6 +133,143 @@ func TestWriteFilePreviewRendersOverwrite(t *testing.T) {
 		if !strings.Contains(preview.UnifiedDiff, want) {
 			t.Errorf("MutationPreview().UnifiedDiff missing %q:\n%s", want, preview.UnifiedDiff)
 		}
+	}
+}
+
+func TestUncontainedWriteCommitRefusesTargetChangedAfterPreview(t *testing.T) {
+	tests := []struct {
+		name       string
+		seed       func(t *testing.T, path string)
+		transition func(t *testing.T, path string)
+		assert     func(t *testing.T, path string)
+	}{
+		{
+			name: "existing content drifted",
+			seed: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("reviewed old\n"), 0o600); err != nil {
+					t.Fatalf("seed target: %v", err)
+				}
+			},
+			transition: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("drifted old\n"), 0o600); err != nil {
+					t.Fatalf("drift target: %v", err)
+				}
+			},
+			assert: func(t *testing.T, path string) {
+				t.Helper()
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("read refused target: %v", err)
+				}
+				if string(got) != "drifted old\n" {
+					t.Fatalf("refused target body = %q, want drifted bytes preserved", got)
+				}
+			},
+		},
+		{
+			name: "existing disappeared",
+			seed: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("reviewed old\n"), 0o600); err != nil {
+					t.Fatalf("seed target: %v", err)
+				}
+			},
+			transition: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("remove target: %v", err)
+				}
+			},
+			assert: func(t *testing.T, path string) {
+				t.Helper()
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("refused target was recreated (lstat error %v)", err)
+				}
+			},
+		},
+		{
+			name: "existing became irregular",
+			seed: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("reviewed old\n"), 0o600); err != nil {
+					t.Fatalf("seed target: %v", err)
+				}
+			},
+			transition: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("remove target: %v", err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("replace target with directory: %v", err)
+				}
+			},
+			assert: func(t *testing.T, path string) {
+				t.Helper()
+				fi, err := os.Lstat(path)
+				if err != nil || !fi.IsDir() {
+					t.Fatalf("refused irregular target = (%v, %v), want directory preserved", fi, err)
+				}
+			},
+		},
+		{
+			name: "absent became existing",
+			seed: func(*testing.T, string) {},
+			transition: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("appeared\n"), 0o600); err != nil {
+					t.Fatalf("create target after preview: %v", err)
+				}
+			},
+			assert: func(t *testing.T, path string) {
+				t.Helper()
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("read refused target: %v", err)
+				}
+				if string(got) != "appeared\n" {
+					t.Fatalf("refused target body = %q, want appeared bytes preserved", got)
+				}
+			},
+		},
+		{
+			name: "absent became irregular",
+			seed: func(*testing.T, string) {},
+			transition: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("create directory after preview: %v", err)
+				}
+			},
+			assert: func(t *testing.T, path string) {
+				t.Helper()
+				fi, err := os.Lstat(path)
+				if err != nil || !fi.IsDir() {
+					t.Fatalf("refused irregular target = (%v, %v), want directory preserved", fi, err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "host.txt")
+			tc.seed(t, path)
+			write, call, art := prepareHostWriteArtifact(t, path, "approved new\n")
+			if _, ok := art.MutationPreview(); !ok {
+				t.Fatal("MutationPreview() declined")
+			}
+			tc.transition(t, path)
+
+			out := commitPreparedWriteArtifact(t, write, call)
+
+			if !strings.HasPrefix(out, "error:") || !strings.Contains(out, "changed since preview") {
+				t.Fatalf("commit result = %q, want changed-since-preview refusal", out)
+			}
+			tc.assert(t, path)
+		})
 	}
 }
 
