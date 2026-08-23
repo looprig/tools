@@ -146,8 +146,11 @@ type editFileArtifact struct {
 	replaceAll  bool
 
 	// previewedHash is sha256 of the exact bytes read by the last successful
-	// MutationPreview. A host edit's commit is bound to those reviewed bytes.
+	// MutationPreview. A host edit's commit is bound to those reviewed bytes;
+	// previewedDiff is the exact rendered text shared by the gate and a
+	// successful result when the committed input still matches that preview.
 	previewedHash [32]byte
+	previewedDiff string
 	previewed     bool
 }
 
@@ -173,13 +176,25 @@ func (a *editFileArtifact) MutationPreview() (tool.MutationPreview, bool) {
 		return tool.MutationPreview{}, false
 	}
 
+	diff := renderUnifiedDiff(a.target.display, original, updated, diffContextLines, maxReviewDiffBytes)
 	a.previewedHash = sha256.Sum256([]byte(original))
+	a.previewedDiff = diff
 	a.previewed = true
 	return tool.MutationPreview{
 		Path:        a.target.display,
 		Creates:     false,
-		UnifiedDiff: renderUnifiedDiff(a.target.display, original, updated, diffContextLines, maxReviewDiffBytes),
+		UnifiedDiff: diff,
 	}, true
+}
+
+// resultPreview returns the historical model-facing result when no matching
+// preview exists. When gate-open successfully rendered these exact input bytes,
+// it reuses that rendering verbatim instead of rerendering at a second budget.
+func (a *editFileArtifact) resultPreview(original, updated string) string {
+	if original != updated && a.previewed && sha256.Sum256([]byte(original)) == a.previewedHash {
+		return "edited " + a.target.display + "\n" + a.previewedDiff
+	}
+	return editPreview(a.target.display, original, updated)
 }
 
 // previewReplacementResultBytes calculates applyReplacement's successful
@@ -372,7 +387,7 @@ func (e *EditFile) commit(key canonicalObservationKey, art *editFileArtifact) (s
 			return err
 		}
 		*obs = tool.FileObservation{Observed: true, Present: true, Hash: sha256.Sum256([]byte(updated))}
-		preview = editPreview(target.display, original, updated)
+		preview = art.resultPreview(original, updated)
 		return nil
 	})
 	return preview, err
@@ -460,7 +475,7 @@ func (e *EditFile) commitUncontained(art *editFileArtifact) (string, error) {
 	if err := atomicWriteFile(target.lexical, []byte(updated)); err != nil {
 		return "", err
 	}
-	return editPreview(target.display, original, updated), nil
+	return art.resultPreview(original, updated), nil
 }
 
 // readForPreview opens path with a no-follow open (a final-component symlink or

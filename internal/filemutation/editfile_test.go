@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -267,6 +268,39 @@ func TestEditFilePreviewRendersPendingChange(t *testing.T) {
 		if !strings.Contains(preview.UnifiedDiff, want) {
 			t.Errorf("MutationPreview().UnifiedDiff missing %q:\n%s", want, preview.UnifiedDiff)
 		}
+	}
+}
+
+func TestEditFileSuccessfulResultReusesExactLargePreviewDiff(t *testing.T) {
+	var original strings.Builder
+	for i := 0; i < 160; i++ {
+		fmt.Fprintf(&original, "OLD-%03d\n", i)
+		for contextLine := 0; contextLine < 8; contextLine++ {
+			fmt.Fprintf(&original, "keep-%03d-%d\n", i, contextLine)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "host.go")
+	if err := os.WriteFile(path, []byte(original.String()), 0o600); err != nil {
+		t.Fatalf("seed host target: %v", err)
+	}
+	edit, call, art := prepareHostEditArtifact(t, path, "OLD", "NEW", true)
+	preview, ok := art.MutationPreview()
+	if !ok {
+		t.Fatal("MutationPreview() declined a valid large multi-hunk edit")
+	}
+	if len(preview.UnifiedDiff) <= maxToolResultDiffBytes {
+		t.Fatalf("test fixture preview is only %d bytes; want more than the legacy %d-byte result budget", len(preview.UnifiedDiff), maxToolResultDiffBytes)
+	}
+
+	result := commitPreparedEditArtifact(t, edit, call)
+	prefix := "edited " + path + "\n"
+	if !strings.HasPrefix(result, prefix) {
+		t.Fatalf("result = %q, want prefix %q", result, prefix)
+	}
+	resultDiff := strings.TrimPrefix(result, prefix)
+	if resultDiff != preview.UnifiedDiff {
+		t.Fatalf("successful result diff differs from the reviewed preview:\nresult bytes=%d\npreview bytes=%d", len(resultDiff), len(preview.UnifiedDiff))
 	}
 }
 
