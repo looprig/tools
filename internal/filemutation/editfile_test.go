@@ -1,6 +1,7 @@
 package filemutation
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -82,6 +83,111 @@ func prepareHostEditArtifact(t *testing.T, path, old, replacement string, replac
 		t.Fatalf("PrepareCall() artifact = %T, want *editFileArtifact", preparedArtifact)
 	}
 	return edit, tool.PreparedCall{ExecutionID: executionID, Request: request, Artifact: art}, art
+}
+
+// TestPrepareCallNeverReadsTheTarget is the ungated-oracle guard. A PrepareCall
+// error reaches the model with NO gate opening, so if preparation touched the
+// file, "does string S occur in host file F, and how many times?" would be
+// answerable with zero approvals. Preparation must resolve paths only.
+func TestPrepareCallNeverReadsTheTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		file []byte // nil means do not create it
+		old  string
+	}{
+		{name: "missing file", file: nil, old: "anything"},
+		{name: "substring absent", file: []byte("x\n"), old: "not-present"},
+		{name: "substring ambiguous", file: []byte("dup\ndup\n"), old: "dup"},
+		{name: "invalid UTF-8", file: []byte{0xff, 0xfe}, old: "anything"},
+		{name: "oversized", file: bytes.Repeat([]byte("x"), int(maxPreviewFileBytes)+1), old: "x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if tc.file != nil {
+				if err := os.WriteFile(filepath.Join(root, "a.go"), tc.file, 0o600); err != nil {
+					t.Fatalf("seed target: %v", err)
+				}
+			}
+			_, _, err := NewEditFile(root, newFileObservations()).PrepareCall(
+				context.Background(),
+				mustUUID(t),
+				mustJSON(t, map[string]any{"path": "a.go", "old": tc.old, "new": "new"}),
+			)
+			if err != nil {
+				t.Fatalf("PrepareCall failed, leaking file state to the model: %v", err)
+			}
+		})
+	}
+}
+
+// TestPreviewFailureDoesNotChangeTheToolResult pins that declining a preview is
+// invisible to the model.
+func TestPreviewFailureDoesNotChangeTheToolResult(t *testing.T) {
+	run := func(t *testing.T, previewFirst bool) (string, string) {
+		t.Helper()
+		root := t.TempDir()
+		target := filepath.Join(t.TempDir(), "host.go")
+		const original = "x\n"
+		if err := os.WriteFile(target, []byte(original), 0o600); err != nil {
+			t.Fatalf("seed target: %v", err)
+		}
+
+		edit := NewEditFile(root, newFileObservations(), WithHostWrites())
+		executionID := mustUUID(t)
+		request, preparedArtifact, err := edit.PrepareCall(
+			context.Background(),
+			executionID,
+			mustJSON(t, map[string]any{"path": target, "old": "old", "new": "new"}),
+		)
+		if err != nil {
+			t.Fatalf("PrepareCall() error = %v", err)
+		}
+		art, ok := preparedArtifact.(*editFileArtifact)
+		if !ok {
+			t.Fatalf("PrepareCall() artifact = %T, want *editFileArtifact", preparedArtifact)
+		}
+		if previewFirst {
+			preview, ok := art.MutationPreview()
+			if ok || preview != (tool.MutationPreview{}) {
+				t.Fatalf("MutationPreview() = (%+v, %v), want a declined zero preview", preview, ok)
+			}
+		}
+		// Drift both fresh setups to the same applicable content after the optional
+		// declined preview. A failed preview must not arm the host-only hash binding.
+		const beforeCommit = "x\nold\nz\n"
+		if err := os.WriteFile(target, []byte(beforeCommit), 0o600); err != nil {
+			t.Fatalf("drift target after preparation: %v", err)
+		}
+
+		out := commitPreparedEditArtifact(t, edit, tool.PreparedCall{
+			ExecutionID: executionID,
+			Request:     request,
+			Artifact:    art,
+		})
+		body, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read target after commit: %v", err)
+		}
+		// Each fresh host setup necessarily has a distinct absolute path. Normalize
+		// only that display value before comparing the model-facing text.
+		return strings.ReplaceAll(out, target, "<target>"), string(body)
+	}
+
+	withPreview, withPreviewBody := run(t, true)
+	withoutPreview, withoutPreviewBody := run(t, false)
+
+	if withPreview != withoutPreview {
+		t.Fatalf("previewing changed the model-facing result:\n%q\nvs\n%q", withPreview, withoutPreview)
+	}
+	if withPreviewBody != withoutPreviewBody {
+		t.Fatalf("previewing changed the file effect:\n%q\nvs\n%q", withPreviewBody, withoutPreviewBody)
+	}
+	if strings.HasPrefix(withPreview, "error:") {
+		t.Fatalf("equivalent host edits failed after a declined preview: %q", withPreview)
+	}
+	if want := "x\nnew\nz\n"; withPreviewBody != want {
+		t.Fatalf("host edit body = %q, want %q", withPreviewBody, want)
+	}
 }
 
 func TestUncontainedCommitRefusesWhenTheFileDriftedAfterPreview(t *testing.T) {
