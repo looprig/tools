@@ -1,6 +1,9 @@
 package filemutation
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLCSOpsInterleavedChange(t *testing.T) {
 	before := []string{"a", "b", "c"}
@@ -136,5 +139,157 @@ func TestBuildHunksMaxContextDoesNotOverflow(t *testing.T) {
 	}
 	if len(hunks[0].Ops) != len(ops) {
 		t.Errorf("hunk has %d ops, want all %d ops", len(hunks[0].Ops), len(ops))
+	}
+}
+
+func TestRenderUnifiedDiffHeadersAndPrefixes(t *testing.T) {
+	got := renderUnifiedDiff("a.go", "x\nold\nz\n", "x\nnew\nz\n", 1, 1<<20)
+
+	for _, want := range []string{
+		"--- a/a.go\n",
+		"+++ b/a.go\n",
+		"@@ -1,3 +1,3 @@\n",
+		"\n-old\n",
+		"\n+new\n",
+		"\n x\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("diff missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderUnifiedDiffIdenticalIsEmpty(t *testing.T) {
+	if got := renderUnifiedDiff("a.go", "same\n", "same\n", 3, 1<<20); got != "" {
+		t.Fatalf("identical content rendered %q, want empty", got)
+	}
+}
+
+func TestRenderUnifiedDiffFinalNewlineSemantics(t *testing.T) {
+	tests := []struct {
+		name         string
+		before       string
+		after        string
+		contextLines int
+		want         string
+	}{
+		{
+			name:         "EOL removed only",
+			before:       "line\n",
+			after:        "line",
+			contextLines: 1,
+			want: "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n" +
+				"-line\n+line\n\\ No newline at end of file\n",
+		},
+		{
+			name:         "EOL added only",
+			before:       "line",
+			after:        "line\n",
+			contextLines: 1,
+			want: "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n" +
+				"-line\n\\ No newline at end of file\n+line\n",
+		},
+		{
+			name:         "append after unterminated final line",
+			before:       "old",
+			after:        "old\nnew\n",
+			contextLines: 0,
+			want: "--- a/f\n+++ b/f\n@@ -1,1 +1,2 @@\n" +
+				"-old\n\\ No newline at end of file\n+old\n+new\n",
+		},
+		{
+			name:         "truncate to an unterminated final line",
+			before:       "old\nnew\n",
+			after:        "old",
+			contextLines: 0,
+			want: "--- a/f\n+++ b/f\n@@ -1,2 +1,1 @@\n" +
+				"-old\n-new\n+old\n\\ No newline at end of file\n",
+		},
+		{
+			name:         "both sides no final EOL and content changes",
+			before:       "old",
+			after:        "new",
+			contextLines: 1,
+			want: "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n" +
+				"-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+		},
+		{
+			name:         "unchanged final no EOL remains context",
+			before:       "old\nsame",
+			after:        "new\nsame",
+			contextLines: 1,
+			want: "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n" +
+				"-old\n+new\n same\n\\ No newline at end of file\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := renderUnifiedDiff("f", tt.before, tt.after, tt.contextLines, 1<<20); got != tt.want {
+				t.Fatalf("rendered:\n%s\nwant:\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRenderUnifiedDiffEscapesHeaderPath(t *testing.T) {
+	path := "dir/\n@@ -9,9 +9,9 @@\n+forged\r\t\"\\\x01"
+	got := renderUnifiedDiff(path, "old\n", "new\n", 0, 1<<20)
+
+	beforeHeaders, afterHeaders, hunks := 0, 0, 0
+	var headerLines []string
+	for _, line := range strings.Split(got, "\n") {
+		switch {
+		case strings.HasPrefix(line, "--- "):
+			beforeHeaders++
+			headerLines = append(headerLines, line)
+		case strings.HasPrefix(line, "+++ "):
+			afterHeaders++
+			headerLines = append(headerLines, line)
+		case strings.HasPrefix(line, "@@ "):
+			hunks++
+		case strings.HasPrefix(line, "+forged"):
+			t.Fatalf("forged added line in rendered diff:\n%s", got)
+		}
+	}
+	if beforeHeaders != 1 || afterHeaders != 1 || hunks != 1 {
+		t.Fatalf("headers/hunks = %d/%d/%d, want 1/1/1:\n%s", beforeHeaders, afterHeaders, hunks, got)
+	}
+	for _, header := range headerLines {
+		if strings.ContainsAny(header, "\r\t") {
+			t.Fatalf("raw control character in header %q", header)
+		}
+		for _, want := range []string{`\n@@ -9,9 +9,9 @@\n+forged`, `\r\t\"\\\x01`} {
+			if !strings.Contains(header, want) {
+				t.Errorf("header %q missing escaped path fragment %q", header, want)
+			}
+		}
+	}
+}
+
+func TestRenderUnifiedDiffDropsWholeHunksToFitBudget(t *testing.T) {
+	before := strings.Repeat("keep\n", 40) + "one\n" + strings.Repeat("keep\n", 40) + "two\n"
+	after := strings.Repeat("keep\n", 40) + "ONE\n" + strings.Repeat("keep\n", 40) + "TWO\n"
+	wantOmitted := "--- a/a.go\n+++ b/a.go\n@@ -40,3 +40,3 @@\n" +
+		" keep\n-one\n+ONE\n keep\n... 1 hunks omitted\n"
+	wantFull := wantOmitted[:len(wantOmitted)-len("... 1 hunks omitted\n")] +
+		"@@ -81,2 +81,2 @@\n keep\n-two\n+TWO\n"
+
+	got := renderUnifiedDiff("a.go", before, after, 1, 90)
+
+	if len(got) > 90 {
+		t.Fatalf("rendered %d bytes, want <= 90:\n%s", len(got), got)
+	}
+	if got != wantOmitted {
+		t.Fatalf("rendered:\n%s\nwant:\n%s", got, wantOmitted)
+	}
+	if got := renderUnifiedDiff("a.go", before, after, 1, len(wantFull)); got != wantFull {
+		t.Fatalf("exact complete budget rendered:\n%s\nwant:\n%s", got, wantFull)
+	}
+	if got := renderUnifiedDiff("a.go", before, after, 1, len(wantFull)-1); got != wantOmitted {
+		t.Fatalf("one-byte-short budget rendered:\n%s\nwant:\n%s", got, wantOmitted)
+	}
+	if got := renderUnifiedDiff("a.go", before, after, 1, 0); got != "" {
+		t.Fatalf("zero budget rendered %q, want empty", got)
 	}
 }
