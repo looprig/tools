@@ -48,7 +48,7 @@ import (
 //     option is set.
 //
 // EditFile's freshness mechanism differs from WriteFile's (it already reads
-// the file fresh at commit time via readForEdit; the recorded observation
+// the file fresh at commit time via readForPreview; the recorded observation
 // hash is only ever a COMPARATOR, never the source of the edited bytes), so
 // its commit-time behaviors 9-13 above are pinned separately below (see "---
 // EditFile commit-time host-write behavior ---"), plus two EditFile-only
@@ -255,7 +255,7 @@ func TestEditFilePrepareCallUncontainedRequirementHasNilCandidates(t *testing.T)
 	}
 	// Unlike WriteFile, an uncontained EditFile target also carries a paired
 	// filesystem.read requirement (EditFile performs an in-process read via
-	// readForEdit before writing back) -- see
+	// readForPreview before writing back) -- see
 	// TestEditFilePrepareCallPairedReadRequirementUncontainedOnly for the
 	// dedicated pin on that second requirement's shape. This test stays
 	// focused on the WRITE requirement's Candidates.
@@ -673,7 +673,7 @@ func TestWriteFileInfoHostWritesDesc(t *testing.T) {
 // --- EditFile commit-time host-write behavior ---
 //
 // EditFile's freshness mechanism differs from WriteFile's: EditFile ALREADY
-// reads the current file fresh at commit time (readForEdit), and the
+// reads the current file fresh at commit time (readForPreview), and the
 // recorded observation hash is used only as a COMPARATOR against that fresh
 // read -- never as the source of the bytes being edited. So for an
 // uncontained target, EditFile.commit skips ONLY the

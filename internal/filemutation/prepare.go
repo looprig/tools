@@ -141,7 +141,7 @@ func mutationRequest(toolName, executionID string, target mutationTarget, extra 
 // pairedReadRequirement builds the paired direct filesystem.read requirement
 // EditFile emits alongside its filesystem.write requirement for an
 // UNCONTAINED target only (EditFile always performs an in-process read via
-// readForEdit before writing). Candidates is nil for the same reason an
+// readForPreview before writing). Candidates is nil for the same reason an
 // uncontained write requirement's Candidates is nil (see writeRequirement):
 // a persisted "approve always" read rule for a host path would silently
 // authorize every future read there with no further prompt.

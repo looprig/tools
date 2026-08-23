@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
@@ -39,6 +40,12 @@ const editFileToolName = "EditFile"
 // cannot exhaust memory. It matches the 1 MiB ceiling used elsewhere in the
 // package for human-edited/source files.
 const maxEditFileBytes int64 = 1 << 20
+
+// maxPreviewResultBytes bounds the fully materialized post-edit text used only
+// to render a gate preview. The input read has the same 1 MiB safety scale, but
+// a short repeated anchor and large replacement could otherwise expand it far
+// beyond that bound before the diff renderer applies its own smaller output cap.
+const maxPreviewResultBytes = 1 << 20
 
 // editFileSchema is the JSON Schema for EditFile's argument object.
 const editFileSchema = `{
@@ -127,10 +134,80 @@ func (e *EditFile) AuditSummary(argsJSON string) string {
 // tool.PreparedArtifact marker; the typed fields stay tool-private.
 type editFileArtifact struct {
 	tool.TokenArtifact
+	root        string
+	hostWrites  bool
 	target      mutationTarget
 	old         string
 	replacement string
 	replaceAll  bool
+
+	// previewedHash is sha256 of the exact bytes read by the last successful
+	// MutationPreview. Task 13 binds a host edit's commit to those reviewed bytes.
+	previewedHash [32]byte
+	previewed     bool
+}
+
+// MutationPreview reads the target and renders the pending edit. Every failure
+// declines: a missing, oversized, or irregular file, non-UTF-8 content, and an
+// edit that cannot be applied all return ok == false without changing the
+// prepared request or eventual tool result. Harness calls this only at gate-open,
+// never during PrepareCall.
+func (a *editFileArtifact) MutationPreview() (tool.MutationPreview, bool) {
+	if err := enforceApprovedResolution(a.root, a.target, a.hostWrites); err != nil {
+		return tool.MutationPreview{}, false
+	}
+	original, err := readForPreview(a.target.lexical)
+	if err != nil || !utf8.ValidString(original) {
+		return tool.MutationPreview{}, false
+	}
+	resultBytes, ok := previewReplacementResultBytes(original, a.old, a.replacement, a.replaceAll)
+	if !ok || resultBytes > maxPreviewResultBytes {
+		return tool.MutationPreview{}, false
+	}
+	updated, errMsg := applyReplacement(original, a.old, a.replacement, a.replaceAll)
+	if errMsg != "" {
+		return tool.MutationPreview{}, false
+	}
+
+	a.previewedHash = sha256.Sum256([]byte(original))
+	a.previewed = true
+	return tool.MutationPreview{
+		Path:        a.target.display,
+		Creates:     false,
+		UnifiedDiff: renderUnifiedDiff(a.target.display, original, updated, diffContextLines, maxReviewDiffBytes),
+	}, true
+}
+
+// previewReplacementResultBytes calculates applyReplacement's successful
+// result size without allocating that result. The multiply/add checks reject an
+// int overflow; MutationPreview separately rejects a valid size above its cap.
+// Occurrence failures return a harmless size because applyReplacement remains
+// the single owner of the existing not-found and ambiguous-match semantics.
+func previewReplacementResultBytes(original, old, replacement string, replaceAll bool) (int, bool) {
+	if old == "" {
+		return 0, false
+	}
+	matches := strings.Count(original, old)
+	if matches == 0 || (!replaceAll && matches > 1) {
+		return 0, true
+	}
+	replacements := 1
+	if replaceAll {
+		replacements = matches
+	}
+
+	// strings.Count reports non-overlapping matches, so removedBytes cannot
+	// exceed len(original); guard the relation explicitly before multiplying.
+	if replacements > len(original)/len(old) {
+		return 0, false
+	}
+	removedBytes := replacements * len(old)
+	retainedBytes := len(original) - removedBytes
+	maxInt := int(^uint(0) >> 1)
+	if len(replacement) > 0 && replacements > (maxInt-retainedBytes)/len(replacement) {
+		return 0, false
+	}
+	return retainedBytes + replacements*len(replacement), true
 }
 
 // prepareEdit is the SINGLE parse-validate-canonicalize step for an EditFile
@@ -151,7 +228,14 @@ func (e *EditFile) prepareEdit(argsJSON string) (*editFileArtifact, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &editFileArtifact{target: target, old: a.Old, replacement: a.New, replaceAll: a.ReplaceAll}, nil
+	return &editFileArtifact{
+		root:        e.root,
+		hostWrites:  e.hostWrites,
+		target:      target,
+		old:         a.Old,
+		replacement: a.New,
+		replaceAll:  a.ReplaceAll,
+	}, nil
 }
 
 // PrepareCall decodes and validates the untrusted arguments ONCE, resolves the
@@ -163,7 +247,7 @@ func (e *EditFile) prepareEdit(argsJSON string) (*editFileArtifact, error) {
 // For an UNCONTAINED target ONLY, the request also carries a paired
 // filesystem.read requirement for the SAME canonical path (see
 // pairedReadRequirement): EditFile always performs an in-process read via
-// readForEdit before writing back, and a prior host read/write must never
+// readForPreview before writing back, and a prior host read/write must never
 // silently authorize this one — every host read tied to an edit gets its own
 // fresh gate decision. A contained target is unchanged: exactly one
 // requirement (write only).
@@ -264,7 +348,7 @@ func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, ol
 		// read failure (too-large, or a race to symlink/absent since the classify) is
 		// returned as-is — it is not an optimistic-concurrency conflict, so it must not
 		// masquerade as a StaleFileError telling the model to "read again".
-		original, rerr := e.readForEdit(target.lexical)
+		original, rerr := readForPreview(target.lexical)
 		if rerr != nil {
 			return rerr
 		}
@@ -300,7 +384,7 @@ func (e *EditFile) commit(key canonicalObservationKey, target mutationTarget, ol
 //
 // EditFile's freshness mechanism differs from WriteFile's in a way that matters
 // here: EditFile ALREADY reads the current file fresh at commit time
-// (readForEdit), and the recorded observation hash is used ONLY as a comparator
+// (readForPreview), and the recorded observation hash is used ONLY as a comparator
 // against that fresh read — never as the source of the bytes being edited. So for
 // an uncontained target, this method simply SKIPS the
 // obs.Observed/obs.Present/obs.Hash comparison; everything else (the fresh read,
@@ -355,7 +439,7 @@ func (e *EditFile) commitUncontained(target mutationTarget, old, replacement str
 
 	// writeTargetRegular. Read the file ONCE, exactly as the contained path does; the
 	// only thing skipped for an uncontained target is the obs comparison below.
-	original, rerr := e.readForEdit(target.lexical)
+	original, rerr := readForPreview(target.lexical)
 	if rerr != nil {
 		return "", rerr
 	}
@@ -375,20 +459,18 @@ func (e *EditFile) commitUncontained(target mutationTarget, old, replacement str
 	return editPreview(target.display, original, updated), nil
 }
 
-// readForEdit opens path with a no-follow open (a final-component symlink or
+// readForPreview opens path with a no-follow open (a final-component symlink or
 // reparse point fails to open — see internal/nofollow), confirms a regular file
 // via the fd stat, and reads up to maxEditFileBytes. path is the LEXICAL joined
-// path (joinedUnderRoot); the caller has already proven the symlink-resolved
-// form is contained. Errors are typed writeFileError (non-secret reason, never
-// contents).
-func (e *EditFile) readForEdit(path string) (string, error) {
-	// #nosec G304 -- path is workspace.JoinedPath(root, input): the workspace root +
-	// the lexically-cleaned, contained input (containedPath already proved the
-	// symlink-resolved target is inside the workspace). The no-follow open rejects a
-	// FINAL-COMPONENT symlink/reparse point (consistent with ReadFile); it does NOT
-	// by itself close the broader parent-dir resolve→open TOCTOU window, which §3c
-	// (write-side threat model) explicitly accepts as out of scope for this local
-	// single-user tool.
+// path recorded in the prepared mutation target. Errors are typed
+// writeFileError (non-secret reason, never contents).
+func readForPreview(path string) (string, error) {
+	// #nosec G304 -- path is the validated lexical path captured in a prepared
+	// mutation target. The no-follow open rejects a FINAL-COMPONENT
+	// symlink/reparse point (consistent with ReadFile); it does NOT by itself close
+	// the broader parent-dir resolve→open TOCTOU window, which §3c (write-side
+	// threat model) explicitly accepts as out of scope for this local single-user
+	// tool.
 	f, err := nofollow.Open(path, os.O_RDONLY, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

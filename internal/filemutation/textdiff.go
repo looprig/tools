@@ -49,6 +49,11 @@ const diffContextLines = 3
 // budget.
 const maxToolResultDiffBytes = 8 << 10
 
+// maxReviewDiffBytes bounds the diff shown on a gate card and sent to a
+// classifier. It is deliberately well below the gate's own MaxToolEntryBytes so
+// byte-level truncation — which would cut a hunk mid-line — is never reached.
+const maxReviewDiffBytes = 16 << 10
+
 func lcsOps(before, after []string) []diffOp {
 	return lcsSourceOps(sourceLinesFromStrings(before), sourceLinesFromStrings(after))
 }
