@@ -10,8 +10,8 @@ tool (
 
 require (
 	github.com/looprig/core v0.6.0
-	github.com/looprig/harness v0.26.0
-	github.com/looprig/inference v0.11.0
+	github.com/looprig/harness v0.29.0
+	github.com/looprig/inference v0.12.0
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
 )
