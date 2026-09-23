@@ -93,7 +93,8 @@ type arguments struct {
 
 // PrepareCall decodes and validates the arguments once and freezes them. It
 // refuses: anything but exactly one JSON object; unknown or duplicated members;
-// a capture_id that is not a canonical lower-case UUID (the only form the
+// member names that differ from capture_id, offset and max_bytes in any way,
+// including case; a capture_id that is not a canonical lower-case UUID (the only form the
 // marker prints); an offset or max_bytes that is not a non-negative integer;
 // and max_bytes of zero. max_bytes above the page ceiling is clamped to it.
 //
@@ -131,7 +132,7 @@ func (t *Tool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON string) (too
 // decodeArguments strictly decodes one JSON object.
 func decodeArguments(argsJSON string) (arguments, error) {
 	raw := []byte(argsJSON)
-	if err := refuseDuplicateMembers(raw); err != nil {
+	if err := checkMemberNames(raw); err != nil {
 		return arguments{}, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -146,11 +147,16 @@ func decodeArguments(argsJSON string) (arguments, error) {
 	return args, nil
 }
 
-// refuseDuplicateMembers rejects a top-level object that names a member twice.
-// encoding/json would silently keep the last one, so the value the model meant
-// would be ambiguous. Anything that is not an object is left for the typed
-// decode to refuse.
-func refuseDuplicateMembers(raw []byte) error {
+// allowedMembers is the exact, case-sensitive set of argument names.
+var allowedMembers = map[string]bool{"capture_id": true, "offset": true, "max_bytes": true}
+
+// checkMemberNames enforces the argument names EXACTLY. encoding/json matches
+// member names case-insensitively, so without this {"Capture_ID": ...} would
+// be accepted, and {"capture_id": A, "CAPTURE_ID": B} would silently keep B.
+// Every top-level name must be one of allowedMembers, spelled exactly (after
+// JSON unescaping), and appear at most once. Anything that is not an object is
+// left for the typed decode to refuse.
+func checkMemberNames(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
 		return nil
@@ -164,6 +170,9 @@ func refuseDuplicateMembers(raw []byte) error {
 		name, ok := token.(string)
 		if !ok {
 			return nil
+		}
+		if !allowedMembers[name] {
+			return refuse("unknown argument %q; the arguments are capture_id, offset and max_bytes", name)
 		}
 		if seen[name] {
 			return refuse("argument %q is given more than once", name)

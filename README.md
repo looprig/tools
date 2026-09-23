@@ -68,7 +68,13 @@ Bash network deltas, Fetch, and WebSearch all emit the same `network` capability
 
 Bash implements Harness's streaming capture (`tool.CapturingInvokableTool`). While a command runs, its complete combined output streams to the capture sink, and only then does Bash apply its own 32 KiB head/tail preview. A supervised command streams its retained process spool the same way. When nothing was elided, the captured bytes equal the returned result byte for byte, so Harness retains no object for an ordinary small command.
 
-Every standard definition declares its capture safety (`tool.CaptureSafetyDeclarer`). Bash streams. ReadFile, Grep, ProcessOutput and ProcessInput are materialized and high-output. Every other tool is small by construction.
+Every standard definition declares its capture safety (`tool.CaptureSafetyDeclarer`):
+
+- Bash and BashDefinition stream only under direct `sh -c` execution. With an injected runner (`bash.WithRunner`, including a granted sandbox runner), `tool.CommandRunner` returns the whole output at once, so the result is resident before capture and the definition declares itself materialized and high-output.
+- ReadFile, Grep, ProcessOutput and ProcessInput are materialized and high-output.
+- Every other tool is small by construction.
+
+A timed-out or cancelled direct Bash command kills its whole process group. Once `sh` has exited, a descendant still holding the output pipe keeps the call open for at most two seconds.
 
 `ReadToolResultDefinition()` provides `read_tool_result`, which the model uses to page through a result that Harness retained in full:
 

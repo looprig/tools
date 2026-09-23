@@ -21,6 +21,7 @@ package bash
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strconv"
 	"sync"
@@ -178,3 +179,63 @@ func captureTerminalOutput(ctx context.Context, stream *captureStream, superviso
 	}
 	stream.finishWithTrailer(nil, notice+resultText(trailer))
 }
+
+// declaredCaptureSafety is what this tool's configuration honestly supports.
+// Without an injected runner, Bash runs `sh -c` itself and streams every byte,
+// so the complete result is never resident. With a runner (a confined sandbox
+// executor, or a granted runner), tool.CommandRunner returns the WHOLE output
+// as one []byte before Bash sees any of it. The capture is still complete, but
+// the result was resident first, bounded only by the runner, so Bash declares
+// it materialized.
+func (b *BashTool) declaredCaptureSafety() tool.DeclaredCaptureSafety {
+	if b.runner != nil {
+		return tool.DeclaredCaptureSafety{HighOutput: true}
+	}
+	return tool.DeclaredCaptureSafety{Streaming: true, HighOutput: true}
+}
+
+// DeclaredCaptureSafety reports the capture safety of the tools this factory
+// builds: streaming for direct execution, materialized when a runner is
+// configured. The options are not reapplied; the sealed configuration is read.
+func (f Factory) DeclaredCaptureSafety() tool.DeclaredCaptureSafety {
+	if f == nil {
+		return tool.DeclaredCaptureSafety{HighOutput: true}
+	}
+	return f("", nil, nil).declaredCaptureSafety()
+}
+
+// DeclaredCaptureSafety reports the capture safety of the tools this
+// supervised factory builds, exactly as Factory.DeclaredCaptureSafety does.
+// A supervised (background or yielded) call keeps its output in the process
+// spool, whose retained window is bounded by the supervisor's spool ceiling.
+// The synchronous path has the same runner-dependent behaviour as Bash.
+func (f SupervisedFactory) DeclaredCaptureSafety() tool.DeclaredCaptureSafety {
+	if f == nil {
+		return tool.DeclaredCaptureSafety{HighOutput: true}
+	}
+	built, err := f(tool.Bindings{
+		Workspace: &tool.WorkspaceBinding{},
+		Process:   &tool.ProcessBinding{Registry: unusedRegistry{}},
+	}, unusedAsyncRunner{})
+	if err != nil {
+		return tool.DeclaredCaptureSafety{HighOutput: true}
+	}
+	return built.declaredCaptureSafety()
+}
+
+// unusedRegistry and unusedAsyncRunner satisfy SupervisedFactory's non-nil
+// checks for a configuration probe. The probed tool is discarded unused, so
+// neither method is ever called.
+type unusedRegistry struct{}
+
+func (unusedRegistry) GetOrCreate(context.Context, string, func(string) (tool.SessionResource, error)) (tool.SessionResource, error) {
+	return nil, errUnusedProbe
+}
+
+type unusedAsyncRunner struct{}
+
+func (unusedAsyncRunner) PrepareProcess(context.Context, tool.ProcessRequest) (tool.PreparedProcess, error) {
+	return nil, errUnusedProbe
+}
+
+var errUnusedProbe = errors.New("bash: capture-safety probe is not runnable")

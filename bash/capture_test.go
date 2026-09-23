@@ -515,3 +515,101 @@ func TestSupervisedBashCapturedStreamsWhenTheInlineOutputIsNotVerbatim(t *testin
 		})
 	}
 }
+
+// TestTerminalOutputCompleteRequiresASuccessfulRead proves a failed terminal
+// ProcessOutput read (which decodes to the zero value) is never mistaken for a
+// complete inline output, so the capture streams the spool instead.
+func TestTerminalOutputCompleteRequiresASuccessfulRead(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		result terminalOutputResult
+		want   bool
+	}{
+		{name: "failed read", result: terminalOutputResult{}},
+		{name: "empty stream read", result: terminalOutputResult{read: true}, want: true},
+		{name: "whole stream", result: terminalOutputResult{read: true, NextCursor: 10, TotalBytes: 10}, want: true},
+		{name: "short read", result: terminalOutputResult{read: true, NextCursor: 5, TotalBytes: 10}},
+		{name: "gap", result: terminalOutputResult{read: true, Gap: true, NextCursor: 10, TotalBytes: 10}},
+		{name: "not from the start", result: terminalOutputResult{read: true, StartCursor: 2, NextCursor: 10, TotalBytes: 10}},
+		{name: "normalized", result: terminalOutputResult{read: true, Normalized: true, NextCursor: 10, TotalBytes: 10}},
+		{name: "binary", result: terminalOutputResult{read: true, Binary: true, NextCursor: 10, TotalBytes: 10}},
+	}
+	for _, test := range tests {
+		if got := test.result.complete(); got != test.want {
+			t.Errorf("%s: complete() = %t, want %t", test.name, got, test.want)
+		}
+	}
+}
+
+// cancelOnFirstWrite cancels a context the first time it is written to, so a
+// CopyOutput reading into it fails after its first chunk.
+type cancelOnFirstWrite struct {
+	recordingSink
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnFirstWrite) Write(p []byte) (int, error) {
+	c.cancel()
+	return c.recordingSink.Write(p)
+}
+
+// TestCaptureTerminalOutputKeepsAPartialCopyAndSaysSo proves a spool copy that
+// fails after its first chunk still keeps what was copied, and the trailer
+// says the capture stopped, rather than the partial stream being dropped or
+// presented as complete.
+func TestCaptureTerminalOutputKeepsAPartialCopyAndSaysSo(t *testing.T) {
+	t.Parallel()
+	stream := strings.Repeat("p", 100<<10)
+	proc := newFakeProcess(0)
+	proc.stdout = io.NopCloser(strings.NewReader(stream))
+	runner := &fakeAsyncRunner{prepared: &fakePreparedProcess{access: freshWorkspaceAccess(), process: proc}}
+	b, registry := newSupervisedTestTool(t, runner, &recordingLifetimeCoordinator{}, &syncWorkspaceObservations{})
+	out, _ := runSupervisedCaptured(t, b, `{"command":"produce","background":true}`, &recordingSink{})
+	registry.mu.Lock()
+	sr := registry.resource.(*process.SupervisorResource)
+	registry.mu.Unlock()
+	waitTerminal(t, sr.Supervisor, b.owner, process.Handle(out.ProcessID))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink := &cancelOnFirstWrite{cancel: cancel}
+	capture := &captureStream{sink: sink}
+	captureTerminalOutput(ctx, capture, sr.Supervisor, b.owner, process.Handle(out.ProcessID), terminalSupervisedResult("exited", nil, "", time.Time{}, time.Time{}, ""))
+
+	captured := sink.String()
+	const chunk = 32 << 10
+	if !strings.HasPrefix(captured, stream[:chunk]+"\n[process output: capture stopped after 32768 bytes]\n") {
+		t.Fatalf("captured %d bytes starting %q; want the first chunk then the stop notice", len(captured), captured[:min(len(captured), 64)])
+	}
+	if !strings.HasSuffix(captured, `{"status":"exited"}`) {
+		t.Fatalf("captured tail = %q, want the terminal trailer", captured[max(0, len(captured)-80):])
+	}
+
+	// A copy that cannot start at all writes nothing, so the caller's
+	// verbatim fallback applies.
+	empty := &recordingSink{}
+	captureTerminalOutput(context.Background(), &captureStream{sink: empty}, sr.Supervisor, process.Owner{}, process.Handle(out.ProcessID), tool.TextResult("x"))
+	if empty.String() != "" {
+		t.Fatalf("a refused copy captured %q, want nothing", empty.String())
+	}
+}
+
+// waitTerminal blocks until handle is terminal (and its termination writes are
+// done), so the test's TempDir cleanup never races the supervisor.
+func waitTerminal(t *testing.T, supervisor *process.Supervisor, owner process.Owner, handle process.Handle) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var generation uint64
+	for {
+		statuses, err := supervisor.Wait(ctx, owner, process.WaitAny, []process.WaitTarget{{Handle: handle, Generation: generation}})
+		if err != nil || len(statuses) == 0 {
+			t.Fatalf("waiting for %s to terminate: %v", handle, err)
+		}
+		if statuses[0].Terminal {
+			return
+		}
+		generation = statuses[0].Generation
+	}
+}

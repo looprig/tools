@@ -29,11 +29,10 @@ type DefinitionBuildError = definition.BuildError
 
 // Capture-safety declarations (tool.CaptureSafetyDeclarer) carried by every
 // standard definition. capture_contract_test.go holds the audit behind each
-// choice and fails when a new definition is added without one.
+// choice and fails when a new definition is added without one. Bash and
+// BashDefinition take theirs from the sealed Bash configuration: streaming
+// for direct execution, materialized when a runner is injected.
 var (
-	// streamingHighOutput: the tool can produce unbounded output and streams
-	// all of it to Harness's capture sink (tool.CapturingInvokableTool).
-	streamingHighOutput = tool.DeclaredCaptureSafety{Streaming: true, HighOutput: true}
 	// materializedHighOutput: the tool returns a fully built result that can
 	// be large; Harness's finite materialized maximum is what bounds it.
 	materializedHighOutput = tool.DeclaredCaptureSafety{HighOutput: true}
@@ -129,12 +128,16 @@ func EditFileDefinition(options ...editfile.Option) tool.Definition {
 
 func Bash(options ...bash.BashOption) tool.Definition {
 	factory, initErr := bash.NewFactory(options...)
+	safety := materializedHighOutput
+	if initErr == nil {
+		safety = factory.DeclaredCaptureSafety()
+	}
 	return definition.WithCaptureSafety(tool.NewDefinition("Bash", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if initErr != nil {
 			return nil, initErr
 		}
 		return []tool.InvokableTool{factory(bindings.Workspace.Root, bindings.Workspace.Coordinator, bindings.Workspace.Observations)}, nil
-	}), streamingHighOutput)
+	}), safety)
 }
 
 // AsyncProcessRunnerResolver resolves the concrete tool.AsyncProcessRunner a
@@ -159,6 +162,10 @@ type AsyncProcessRunnerResolver func(context.Context, uuid.UUID) (tool.AsyncProc
 // resolved once here, never reapplied per Build.
 func BashDefinition(resolver AsyncProcessRunnerResolver, options ...bash.BashOption) tool.Definition {
 	factory, initErr := bash.NewSupervisedFactory(options...)
+	safety := materializedHighOutput
+	if initErr == nil {
+		safety = factory.DeclaredCaptureSafety()
+	}
 	return definition.WithCaptureSafety(tool.NewDefinition("Bash", tool.RequiresWorkspace|tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if initErr != nil {
 			return nil, initErr
@@ -178,7 +185,7 @@ func BashDefinition(resolver AsyncProcessRunnerResolver, options ...bash.BashOpt
 			return nil, err
 		}
 		return []tool.InvokableTool{built}, nil
-	}), streamingHighOutput)
+	}), safety)
 }
 
 // ProcessOutputDefinition builds the read-only ProcessOutput tool bound to

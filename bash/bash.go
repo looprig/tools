@@ -64,6 +64,10 @@ const defaultBashTimeout = 30 * time.Second
 // retained-data ceiling.
 const maxBashOutputBytes = 32 * 1024 // 32 KiB
 
+// bashWaitDelay bounds how long a direct `sh -c` call stays open, once sh
+// has exited or been killed, for descendants still holding its output pipe.
+const bashWaitDelay = 2 * time.Second
+
 // bashShell and bashShellFlag are the interpreter and flag for the documented
 // `sh -c <command>` exception. `sh` is the POSIX shell present on the host.
 const (
@@ -461,6 +465,12 @@ func runShellCommand(ctx context.Context, dir, command string, stream *captureSt
 	// bounds the runtime so the process is killed on timeout.
 	cmd := exec.CommandContext(ctx, bashShell, bashShellFlag, command)
 	cmd.Dir = dir
+	// Cancellation kills sh's whole process group, and once sh has exited
+	// (or been killed) a descendant still holding the output pipe keeps the
+	// call open for at most bashWaitDelay. Without these a timed-out call
+	// lasted as long as its longest-lived descendant.
+	isolateProcessGroup(cmd)
+	cmd.WaitDelay = bashWaitDelay
 
 	var buf cappedBuffer
 	buf.limit = maxBashOutputBytes
@@ -485,6 +495,12 @@ func runShellCommand(ctx context.Context, dir, command string, stream *captureSt
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		return out, exitErr.ExitCode(), false, nil
+	}
+	// sh exited but a descendant it left running still held the output pipe
+	// past bashWaitDelay: the command's own outcome is sh's exit status, and
+	// the descendant's later output is not part of this call.
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil {
+		return out, cmd.ProcessState.ExitCode(), false, nil
 	}
 	// Anything else (sh not found, permission denied to exec) is a start error.
 	return out, 0, false, err

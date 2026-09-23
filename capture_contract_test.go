@@ -20,8 +20,16 @@ import (
 // that follows from them.
 type captureContractRow struct {
 	constructor string
-	definition  func(t *testing.T) (tool.Definition, tool.Bindings)
-	want        tool.DeclaredCaptureSafety
+	// variant distinguishes rows of one constructor whose declaration depends
+	// on its configuration (Bash with and without an injected runner).
+	variant    string
+	definition func(t *testing.T) (tool.Definition, tool.Bindings)
+	want       tool.DeclaredCaptureSafety
+	// capturingButMaterialized marks a configuration whose tools implement
+	// tool.CapturingInvokableTool yet honestly declare materialized, because
+	// the output is resident before it reaches the sink. That is
+	// conservative, never dishonest.
+	capturingButMaterialized bool
 	// bound documents the audit: the tool's own maximum materialized result
 	// and where it truncates. It is not asserted; it is the reason for want.
 	bound string
@@ -43,16 +51,21 @@ func captureContract() []captureContractRow {
 			return definition, blueprintBindingsWithProcess(&fakeProcessRegistry{dir: t.TempDir()})
 		}
 	}
+	asyncResolver := func(context.Context, uuid.UUID) (tool.AsyncProcessRunner, error) {
+		return &fakeAsyncProcessRunner{}, nil
+	}
 	streaming := tool.DeclaredCaptureSafety{Streaming: true, HighOutput: true}
 	materializedHigh := tool.DeclaredCaptureSafety{HighOutput: true}
 	small := tool.DeclaredCaptureSafety{}
 	return []captureContractRow{
-		{constructor: "Bash", definition: plain(Bash(bash.WithRunner(&definitionRunner{}))), want: streaming,
-			bound: "unbounded command output; streams every byte to the sink before its 32 KiB head/tail preview"},
-		{constructor: "BashDefinition", definition: withProcess(BashDefinition(func(context.Context, uuid.UUID) (tool.AsyncProcessRunner, error) {
-			return &fakeAsyncProcessRunner{}, nil
-		})), want: streaming,
-			bound: "synchronous path as Bash; supervised terminal output streams the retained spool (64 MiB default ceiling)"},
+		{constructor: "Bash", variant: "direct", definition: plain(Bash()), want: streaming,
+			bound: "unbounded command output; sh -c streams every byte to the sink before its 32 KiB head/tail preview"},
+		{constructor: "Bash", variant: "runner", definition: plain(Bash(bash.WithRunner(&definitionRunner{}))), want: materializedHigh, capturingButMaterialized: true,
+			bound: "tool.CommandRunner returns the whole output as one []byte (the sandbox executor buffers it unbounded) before the sink sees it"},
+		{constructor: "BashDefinition", variant: "direct", definition: withProcess(BashDefinition(asyncResolver)), want: streaming,
+			bound: "synchronous path as direct Bash; supervised output lives in the process spool (64 MiB default ceiling) and streams from it"},
+		{constructor: "BashDefinition", variant: "runner", definition: withProcess(BashDefinition(asyncResolver, bash.WithRunner(&definitionRunner{}))), want: materializedHigh, capturingButMaterialized: true,
+			bound: "synchronous path runs through the injected runner, which materializes the whole output"},
 		{constructor: "ProcessOutputDefinition", definition: withProcess(ProcessOutputDefinition()), want: materializedHigh,
 			bound: "materializes limit_bytes per process (model-chosen, up to the spool ceiling); paged by cursor"},
 		{constructor: "ProcessInputDefinition", definition: withProcess(ProcessInputDefinition()), want: materializedHigh,
@@ -93,7 +106,7 @@ func captureContract() []captureContractRow {
 func TestStandardDefinitionsDeclareCaptureSafety(t *testing.T) {
 	t.Parallel()
 	for _, row := range captureContract() {
-		t.Run(row.constructor, func(t *testing.T) {
+		t.Run(row.constructor+"/"+row.variant, func(t *testing.T) {
 			t.Parallel()
 			definition, bindings := row.definition(t)
 			declarer, ok := definition.(tool.CaptureSafetyDeclarer)
@@ -109,7 +122,7 @@ func TestStandardDefinitionsDeclareCaptureSafety(t *testing.T) {
 			}
 			for _, builtTool := range built {
 				_, capturing := builtTool.(tool.CapturingInvokableTool)
-				if capturing != row.want.Streaming {
+				if row.want.Streaming && !capturing || !row.want.Streaming && capturing && !row.capturingButMaterialized {
 					t.Fatalf("%s built %T: implements CapturingInvokableTool = %t, declared Streaming = %t", row.constructor, builtTool, capturing, row.want.Streaming)
 				}
 			}
@@ -132,7 +145,9 @@ func TestStandardAssemblyIsCaptureSafe(t *testing.T) {
 		t.Fatalf("standard assembly unsafe under a finite maximum: %v", descriptor.Unsafe())
 	}
 	unsafe := tool.ProjectCaptureSafety(definitions, 0).Unsafe()
-	want := []string{"Grep", "ProcessInput", "ProcessOutput", "ReadFile"}
+	// Bash appears because its runner rows materialize; the two Bash rows share
+	// one definition name and Harness merges them conservatively.
+	want := []string{"Bash", "Grep", "ProcessInput", "ProcessOutput", "ReadFile"}
 	if len(unsafe) != len(want) {
 		t.Fatalf("unsafe without a finite maximum = %v, want %v", unsafe, want)
 	}
@@ -204,4 +219,46 @@ func TestReadToolResultDefinition(t *testing.T) {
 	if _, err := definition.Build(context.Background(), blueprintBindings()); err == nil {
 		t.Fatal("Build() without a reader succeeded; want the harness binding refusal")
 	}
+}
+
+// TestBashCaptureSafetyFollowsTheRunnerConfiguration projects Bash alone with
+// no finite materialized maximum: direct execution is safe because it streams,
+// and every runner configuration (plain, granted) is unsafe because the runner
+// materializes the whole output first.
+func TestBashCaptureSafetyFollowsTheRunnerConfiguration(t *testing.T) {
+	t.Parallel()
+	resolver := func(context.Context, uuid.UUID) (tool.AsyncProcessRunner, error) {
+		return &fakeAsyncProcessRunner{}, nil
+	}
+	tests := []struct {
+		name       string
+		definition tool.Definition
+		safe       bool
+	}{
+		{name: "Bash direct", definition: Bash(), safe: true},
+		{name: "Bash with runner", definition: Bash(bash.WithRunner(&definitionRunner{}))},
+		{name: "Bash with granted runner", definition: Bash(bash.WithRunner(&definitionGrantedRunner{}))},
+		{name: "Bash with invalid option", definition: Bash(nil)},
+		{name: "BashDefinition direct", definition: BashDefinition(resolver), safe: true},
+		{name: "BashDefinition with runner", definition: BashDefinition(resolver, bash.WithRunner(&definitionRunner{}))},
+		{name: "BashDefinition with invalid option", definition: BashDefinition(resolver, nil)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			descriptor := tool.ProjectCaptureSafety([]tool.Definition{test.definition}, 0)
+			if descriptor.Safe() != test.safe {
+				t.Fatalf("Safe() = %t, want %t (rows %+v)", descriptor.Safe(), test.safe, descriptor.Definitions)
+			}
+			if !descriptor.Definitions[0].HighOutput {
+				t.Fatal("Bash must always declare high output")
+			}
+		})
+	}
+}
+
+type definitionGrantedRunner struct{ definitionRunner }
+
+func (*definitionGrantedRunner) RunCommandWithGrants(context.Context, string, string, []string) ([]byte, int, error) {
+	return nil, 0, nil
 }
