@@ -172,11 +172,23 @@ func (a *AskUser) PrepareCall(context.Context, uuid.UUID, string) (tool.Request,
 	return tool.Request{ToolName: askUserToolName}, nil, nil
 }
 
+// UserInputReplaySafe reports true: every path through InvokableRun up to and
+// including the requestUserInput call only parses argsJSON into askUserArgs
+// and validates it (parseAskUserArgs) — no filesystem, network, process, or
+// other effect outside the process happens before the question is asked. A
+// replayed run against a restored gate re-parses the same argsJSON and asks
+// the same question, exactly as tool.UserInputReplaySafe requires.
+func (a *AskUser) UserInputReplaySafe() bool {
+	return true
+}
+
 // compile-time assertions: AskUser is an InvokableTool, a CallPreparer (its
-// prepared request is deliberately EMPTY, so the gate never prompts), and
-// Auditable. It is deliberately NOT a WriteTarget.
+// prepared request is deliberately EMPTY, so the gate never prompts),
+// Auditable, and tool.UserInputReplaySafe (it has no effect before asking).
+// It is deliberately NOT a WriteTarget.
 var (
-	_ tool.InvokableTool = (*AskUser)(nil)
-	_ tool.CallPreparer  = (*AskUser)(nil)
-	_ tool.Auditable     = (*AskUser)(nil)
+	_ tool.InvokableTool       = (*AskUser)(nil)
+	_ tool.CallPreparer        = (*AskUser)(nil)
+	_ tool.Auditable           = (*AskUser)(nil)
+	_ tool.UserInputReplaySafe = (*AskUser)(nil)
 )

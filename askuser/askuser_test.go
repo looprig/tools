@@ -75,6 +75,22 @@ func TestAskUserCapabilities(t *testing.T) {
 	}
 }
 
+// TestAskUserUserInputReplaySafe asserts AskUser is discoverable via the
+// tool.UserInputReplaySafe capability assertion (the same way the harness
+// runner probes it) and reports true: AskUser has no effect before its
+// requestUserInput call, so a restored gate can safely replay the call.
+func TestAskUserUserInputReplaySafe(t *testing.T) {
+	t.Parallel()
+	var ti tool.InvokableTool = NewAskUser()
+	replaySafe, ok := ti.(tool.UserInputReplaySafe)
+	if !ok {
+		t.Fatal("AskUser should implement tool.UserInputReplaySafe")
+	}
+	if got := replaySafe.UserInputReplaySafe(); !got {
+		t.Errorf("UserInputReplaySafe() = %v, want true", got)
+	}
+}
+
 // TestAskUserInvokableRun drives InvokableRun through the requestUserInput SEAM
 // (a documented test seam: the AskUser struct holds an indirect func field
 // defaulting to loop.RequestUserInput in NewAskUser; tests override it to exercise
