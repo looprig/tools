@@ -76,16 +76,20 @@ func NewSupervisedFactory(options ...BashOption) (SupervisedFactory, error) {
 // legacy path). It never returns a Go error — every failure renders as a
 // supervisedErrorResult tool-result, matching InvokableRun's documented
 // contract.
-func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, art *bashArtifact, dir string) (*tool.ToolResult, error) {
+//
+// stream is the capture stream (nil when uncaptured). Only a terminal result
+// whose inline output did not carry the whole stream writes to it here; every
+// other result is captured verbatim by InvokableRunCaptured.
+func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, art *bashArtifact, dir string, stream *captureStream) *tool.ToolResult {
 	if workspace.IsNil(b.asyncRunner) {
-		return supervisedErrorResult(string(process.CodeLifetimeEnforcementUnavailable)), nil
+		return supervisedErrorResult(string(process.CodeLifetimeEnforcementUnavailable))
 	}
 	lifetimeCoord, ok := b.coord.(tool.WorkspaceLifetimeCoordinator)
 	if !ok || workspace.IsNil(lifetimeCoord) {
-		return supervisedErrorResult(string(process.CodeLifetimeEnforcementUnavailable)), nil
+		return supervisedErrorResult(string(process.CodeLifetimeEnforcementUnavailable))
 	}
 	if workspace.IsNil(b.registry) {
-		return supervisedErrorResult(string(process.CodeLifetimeEnforcementUnavailable)), nil
+		return supervisedErrorResult(string(process.CodeLifetimeEnforcementUnavailable))
 	}
 
 	// Step 1: PrepareProcess reserves enforcement resources WITHOUT
@@ -101,7 +105,7 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	}
 	prepared, err := b.asyncRunner.PrepareProcess(ctx, req)
 	if err != nil {
-		return supervisedErrorResult(classifyPrepareProcessError(err)), nil
+		return supervisedErrorResult(classifyPrepareProcessError(err))
 	}
 
 	// Step 2: the PREPARED, authoritative access (never any caller-declared
@@ -110,7 +114,7 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	permit, err := lifetimeCoord.AcquireLifetime(ctx, access)
 	if err != nil {
 		_ = prepared.Close()
-		return supervisedErrorResult(string(process.CodeLifetimeEnforcementUnavailable)), nil
+		return supervisedErrorResult(string(process.CodeLifetimeEnforcementUnavailable))
 	}
 
 	// Step 3: obtain the ONE shared, runner-free Supervisor session
@@ -120,13 +124,13 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 	if err != nil {
 		permit.Release()
 		_ = prepared.Close()
-		return supervisedErrorResult(string(process.CodeProcessSetupFailed)), nil
+		return supervisedErrorResult(string(process.CodeProcessSetupFailed))
 	}
 	sr, ok := resource.(*process.SupervisorResource)
 	if !ok || sr == nil || sr.Supervisor == nil {
 		permit.Release()
 		_ = prepared.Close()
-		return supervisedErrorResult(string(process.CodeProcessSetupFailed)), nil
+		return supervisedErrorResult(string(process.CodeProcessSetupFailed))
 	}
 
 	// Step 4: hand the prepared process to the runner-free Supervisor.Start
@@ -141,7 +145,7 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 
 	handle, err := sr.Supervisor.Start(ctx, b.owner, origin, prepared, lease, nil, nil, ceiling, yield)
 	if err != nil {
-		return supervisedErrorResult(classifyProcessError(err, process.CodeSpawnFailed)), nil
+		return supervisedErrorResult(classifyProcessError(err, process.CodeSpawnFailed))
 	}
 
 	// The process is now durably registered (Supervisor.Start persists its
@@ -165,7 +169,7 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 		// invocation's own request-scoped ctx ends when InvokableRun
 		// returns, hence the explicit #nosec below.
 		go b.watchAndInvalidate(sr.Supervisor, handle) // #nosec G118 -- watcher deliberately outlives the request ctx; see comment above
-		return liveSupervisedResult(string(handle), 0, "", startedAt), nil
+		return liveSupervisedResult(string(handle), 0, "", startedAt)
 	}
 
 	budget := time.Duration(art.yieldTimeMS) * time.Millisecond
@@ -177,12 +181,16 @@ func (b *BashTool) runSupervised(ctx context.Context, call tool.PreparedCall, ar
 		// LIVE result. Same deliberate context.Background() rationale as
 		// the explicit-background branch above.
 		go b.watchAndInvalidate(sr.Supervisor, handle) // #nosec G118 -- watcher deliberately outlives the request ctx; see comment above
-		return liveSupervisedResult(string(handle), 0, "", startedAt), nil
+		return liveSupervisedResult(string(handle), 0, "", startedAt)
 	}
 
 	status, exitCode, reason, finishedAt := readTerminalOutcome(sr, handle)
 	output := readTerminalOutput(ctx, sr, b.owner, handle)
-	return terminalSupervisedResult(status, exitCode, reason, startedAt, finishedAt, output), nil
+	if !output.complete() {
+		captureTerminalOutput(ctx, stream, sr.Supervisor, b.owner, handle,
+			terminalSupervisedResult(status, exitCode, reason, startedAt, finishedAt, ""))
+	}
+	return terminalSupervisedResult(status, exitCode, reason, startedAt, finishedAt, output.Output)
 }
 
 // waitForTerminal blocks, in a sequence of process.Supervisor.Wait(WaitAny)
@@ -308,12 +316,12 @@ func readTerminalOutcome(sr *process.SupervisorResource, handle process.Handle) 
 // all yield the empty string rather than failing runSupervised's already-
 // terminal outcome -- mirroring readTerminalOutcome's own
 // never-fail-the-outer-call discipline.
-func readTerminalOutput(ctx context.Context, sr *process.SupervisorResource, owner process.Owner, handle process.Handle) string {
+func readTerminalOutput(ctx context.Context, sr *process.SupervisorResource, owner process.Owner, handle process.Handle) terminalOutputResult {
 	out := process.NewProcessOutput(sr.Supervisor, owner)
 
 	argsJSON, err := json.Marshal(terminalOutputArgs{ProcessID: string(handle)})
 	if err != nil {
-		return ""
+		return terminalOutputResult{}
 	}
 
 	// PrepareCall ignores both its ctx and executionID parameters (see its
@@ -321,24 +329,25 @@ func readTerminalOutput(ctx context.Context, sr *process.SupervisorResource, own
 	// minted one here.
 	req, artifact, err := out.PrepareCall(ctx, uuid.UUID{}, string(argsJSON))
 	if err != nil {
-		return ""
+		return terminalOutputResult{}
 	}
 	runCtx := loop.WithPreparedCall(ctx, tool.PreparedCall{Request: req, Artifact: artifact})
 
 	result, err := out.InvokableRun(runCtx, string(argsJSON))
 	if err != nil || result == nil || len(result.Content) == 0 {
-		return ""
+		return terminalOutputResult{}
 	}
 	block, ok := result.Content[0].(*content.TextBlock)
 	if !ok {
-		return ""
+		return terminalOutputResult{}
 	}
 
 	var decoded terminalOutputResult
 	if err := json.Unmarshal([]byte(block.Text), &decoded); err != nil || decoded.Error != "" {
-		return ""
+		return terminalOutputResult{}
 	}
-	return decoded.Output
+	decoded.read = true
+	return decoded
 }
 
 // terminalOutputArgs is the minimal ProcessOutput argsJSON readTerminalOutput
@@ -348,15 +357,30 @@ type terminalOutputArgs struct {
 	ProcessID string `json:"process_id"`
 }
 
-// terminalOutputResult decodes only the two fields readTerminalOutput cares
-// about out of ProcessOutput's full per-process JSON shape (output_tool.go's
-// processOutputResult) -- every other field it renders (cursors, gap,
-// artifact, manifest metadata) is already sourced independently by
-// readTerminalOutcome/loadStartedAt from the same durable Manifest, so this
-// decode target intentionally stays narrow.
+// terminalOutputResult decodes the fields readTerminalOutput cares about out
+// of ProcessOutput's full per-process JSON shape (output_tool.go's
+// processOutputResult): the rendered output, and the cursor/normalization
+// facts that say whether that output is the WHOLE stream verbatim. Manifest
+// metadata is sourced independently by readTerminalOutcome/loadStartedAt.
 type terminalOutputResult struct {
-	Output string `json:"output"`
-	Error  string `json:"error"`
+	Output      string `json:"output"`
+	Error       string `json:"error"`
+	StartCursor int64  `json:"start_cursor"`
+	NextCursor  int64  `json:"next_cursor"`
+	TotalBytes  int64  `json:"total_bytes"`
+	Gap         bool   `json:"gap"`
+	Normalized  bool   `json:"normalized"`
+	Binary      bool   `json:"binary"`
+	read        bool
+}
+
+// complete reports whether Output is the process's entire combined stream,
+// byte for byte: read from cursor 0 with no retention gap, through the last
+// byte, and not rewritten by safe-text normalization. Only then is the
+// returned result the complete deterministic result, so a capture need not
+// stream the spool. A failed read is never complete.
+func (r terminalOutputResult) complete() bool {
+	return r.read && r.StartCursor == 0 && !r.Gap && r.NextCursor == r.TotalBytes && !r.Normalized && !r.Binary
 }
 
 // processDeadline maps the prepared, frozen supervision settings to

@@ -295,26 +295,34 @@ func resolveSpawnDir(root, workdir string) (string, error) {
 // normal result; a timeout or start failure is a tool-result error string. It
 // never returns a Go error.
 func (b *BashTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	return b.run(ctx, nil), nil
+}
+
+// run is the single execution path behind InvokableRun and
+// InvokableRunCaptured (capture.go). stream is nil on the uncaptured path;
+// when set, every byte the command produces is offered to it as it is
+// produced, before Bash's own inline cap applies to the returned result.
+func (b *BashTool) run(ctx context.Context, stream *captureStream) *tool.ToolResult {
 	if b.initErr != nil {
-		return tool.TextResult("error: Bash is unavailable: " + b.initErr.Error()), nil
+		return tool.TextResult("error: Bash is unavailable: " + b.initErr.Error())
 	}
 	call, ok := loop.PreparedCallFromContext(ctx)
 	if !ok {
-		return tool.TextResult("error: permission denied: Bash requires its prepared call artifact"), nil
+		return tool.TextResult("error: permission denied: Bash requires its prepared call artifact")
 	}
 	art, ok := call.Artifact.(*bashArtifact)
 	if !ok || art == nil {
-		return tool.TextResult("error: permission denied: Bash requires its prepared call artifact"), nil
+		return tool.TextResult("error: permission denied: Bash requires its prepared call artifact")
 	}
 
 	// Enforce the APPROVED spawn directory: a resolution changed between
 	// prepare and run (a symlink swap) refuses the run fail-closed.
 	dir, err := resolveSpawnDir(b.root, art.workdirRaw)
 	if err != nil {
-		return tool.TextResult("error: workdir is outside the workspace: " + art.workdirRaw), nil
+		return tool.TextResult("error: workdir is outside the workspace: " + art.workdirRaw)
 	}
 	if dir != art.dirAbs {
-		return tool.TextResult("error: workdir resolution changed since approval: " + art.workdirRaw), nil
+		return tool.TextResult("error: workdir resolution changed since approval: " + art.workdirRaw)
 	}
 
 	// A SUPERVISED call (background or yield_time_ms, frozen at preparation
@@ -323,7 +331,7 @@ func (b *BashTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	// supervised.go's runSupervised. Every other (legacy) call falls
 	// through to the unchanged synchronous `sh -c`/injected-runner path.
 	if art.supervised {
-		return b.runSupervised(ctx, call, art, dir)
+		return b.runSupervised(ctx, call, art, dir, stream)
 	}
 
 	// Take the EXCLUSIVE whole-workspace mutation permit for the run: Bash may change
@@ -334,7 +342,7 @@ func (b *BashTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 	// coordinator (bare path) yields a no-op permit.
 	permit, err := b.acquireWhole(ctx)
 	if err != nil {
-		return tool.TextResult("error: " + err.Error()), nil
+		return tool.TextResult("error: " + err.Error())
 	}
 	defer permit.Release()
 	// Whichever way the run ends (success, non-zero exit, timeout, or start error) the
@@ -368,23 +376,25 @@ func (b *BashTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult
 		// folds a timeout/cancel into err (it returns ctx.Err()); adapt its byte
 		// output + error into the (output, exitCode, timedOut, startErr) shape.
 		outBytes, ec, err := gr.RunCommandWithGrants(ctx2, dir, art.command, grants)
-		out, exitCode, timedOut, runErr = adaptRunnerResult(ctx2, outBytes, ec, err)
+		out, exitCode, timedOut, runErr = adaptRunnerResult(ctx2, stream.captureMaterialized(outBytes), ec, err)
 	} else if b.runner != nil {
 		// Confined path: same adaptation as the grants path, without the tokens.
 		outBytes, ec, err := b.runner.RunCommand(ctx2, dir, art.command)
-		out, exitCode, timedOut, runErr = adaptRunnerResult(ctx2, outBytes, ec, err)
+		out, exitCode, timedOut, runErr = adaptRunnerResult(ctx2, stream.captureMaterialized(outBytes), ec, err)
 	} else {
-		out, exitCode, timedOut, runErr = runShellCommand(ctx2, dir, art.command)
+		out, exitCode, timedOut, runErr = runShellCommand(ctx2, dir, art.command, stream)
 	}
+	// Each outcome's text is ALSO the captured stream's trailer, so a capture
+	// whose output was not elided is byte-identical to the returned result.
 	if timedOut {
-		return tool.TextResult("error: command timed out after " + timeout.String()), nil
+		return stream.finish(tool.TextResult("error: command timed out after " + timeout.String()))
 	}
 	if runErr != nil {
 		// sh could not be started (not an exit-code situation). Surface as a
 		// tool-result error, not a Go error.
-		return tool.TextResult("error: could not run command: " + runErr.Error()), nil
+		return stream.finish(tool.TextResult("error: could not run command: " + runErr.Error()))
 	}
-	return tool.TextResult(formatBashResult(out, exitCode)), nil
+	return stream.finishWithTrailer(tool.TextResult(formatBashResult(out, exitCode)), exitCodeLine(exitCode))
 }
 
 // acquireWhole takes the exclusive whole-workspace mutation permit for a command run.
@@ -444,7 +454,7 @@ func adaptRunnerResult(ctx context.Context, outBytes []byte, exitCode int, err e
 //   - timedOut is true when ctx's deadline fired (the process was killed);
 //   - startErr is non-nil only when sh could not be started (structural);
 //   - a non-zero exit code is returned WITHOUT a startErr (a normal result).
-func runShellCommand(ctx context.Context, dir, command string) (output string, exitCode int, timedOut bool, startErr error) {
+func runShellCommand(ctx context.Context, dir, command string, stream *captureStream) (output string, exitCode int, timedOut bool, startErr error) {
 	// #nosec G204 -- DELIBERATE, documented exception (see file header & CLAUDE.md):
 	// the Bash tool runs a single human-approved command via `sh -c`; the security
 	// boundary is the permission gate, not this argv shape. exec.CommandContext
@@ -454,8 +464,12 @@ func runShellCommand(ctx context.Context, dir, command string) (output string, e
 
 	var buf cappedBuffer
 	buf.limit = maxBashOutputBytes
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// ONE writer for both streams: os/exec then drains them through a single
+	// pipe and goroutine, so the combined order is the order sh wrote in.
+	// When capturing, the tee offers every byte to the stream BEFORE the cap.
+	combined := stream.tee(&buf)
+	cmd.Stdout = combined
+	cmd.Stderr = combined
 
 	err := cmd.Run()
 	out := buf.cappedString()
@@ -483,7 +497,12 @@ func formatBashResult(output string, exitCode int) string {
 	if body != "" && body[len(body)-1] != '\n' {
 		body += "\n"
 	}
-	return body + "[exit code: " + strconv.Itoa(exitCode) + "]"
+	return body + exitCodeLine(exitCode)
+}
+
+// exitCodeLine is the final line of every completed synchronous Bash result.
+func exitCodeLine(exitCode int) string {
+	return "[exit code: " + strconv.Itoa(exitCode) + "]"
 }
 
 // cappedBuffer is an io.Writer that retains a fixed head and rolling tail within
@@ -595,6 +614,7 @@ func appendRollingTail(tail, p []byte, limit int) []byte {
 // compile-time assertions: BashTool is an InvokableTool and Auditable. It is
 // NOT a WriteTarget (it is not a path-write tool).
 var (
-	_ tool.InvokableTool = (*BashTool)(nil)
-	_ tool.Auditable     = (*BashTool)(nil)
+	_ tool.InvokableTool          = (*BashTool)(nil)
+	_ tool.Auditable              = (*BashTool)(nil)
+	_ tool.CapturingInvokableTool = (*BashTool)(nil)
 )

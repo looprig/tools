@@ -64,6 +64,26 @@ tools.Bash(
 
 Bash network deltas, Fetch, and WebSearch all emit the same `network` capability kind with the same canonical target match encoding, so one saved workspace rule for a host and port serves all three tools. Fetch derives its single endpoint from the validated URL; WebSearch emits one requirement per endpoint its injected `SearchProvider` declares, and the provider fails closed on any secondary target outside that declaration.
 
+## Retained tool output
+
+Bash implements Harness's streaming capture (`tool.CapturingInvokableTool`). While a command runs, its complete combined output streams to the capture sink, and only then does Bash apply its own 32 KiB head/tail preview. A supervised command streams its retained process spool the same way. When nothing was elided, the captured bytes equal the returned result byte for byte, so Harness retains no object for an ordinary small command.
+
+Every standard definition declares its capture safety (`tool.CaptureSafetyDeclarer`). Bash streams. ReadFile, Grep, ProcessOutput and ProcessInput are materialized and high-output. Every other tool is small by construction.
+
+`ReadToolResultDefinition()` provides `read_tool_result`, which the model uses to page through a result that Harness retained in full:
+
+```go
+loop.WithTools(
+	tools.Bash(),
+	tools.ReadToolResultDefinition(),
+)
+```
+
+- The tool declares `tool.RequiresToolResultReader`, so Harness binds it to a reader scoped to the calling loop.
+- It accepts exactly `{capture_id, offset?, max_bytes?}`. The model can name a capture only by the id that a retention marker prints.
+- Unknown or foreign ids fail closed, and so do malformed arguments.
+- A rig must wire `rig.WithToolResultObjects` to register the tool. Without it, loop definition fails.
+
 ## Fail-closed properties
 
 - Invalid or unparseable arguments fail during preparation; nothing reaches the gate or the filesystem.

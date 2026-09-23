@@ -43,7 +43,16 @@ func readmeBash(confinedRunner tool.CommandRunner, familyEligible permission.Fam
 	)
 }
 
+// readmeRetainedOutput is the README's retained-output snippet.
+func readmeRetainedOutput() loop.Option {
+	return loop.WithTools(
+		tools.Bash(),
+		tools.ReadToolResultDefinition(),
+	)
+}
+
 // Reference the helpers so the compile checks survive unused-linting.
 var _ = readmeSelectTools
 var _ = readmeWorkspaceStore
 var _ = readmeBash
+var _ = readmeRetainedOutput

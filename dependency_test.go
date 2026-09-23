@@ -22,6 +22,7 @@ func TestToolPackageLayout(t *testing.T) {
 		"grep",
 		"permission",
 		"readfile",
+		"readtoolresult",
 		"skill",
 		"task",
 		"websearch",

@@ -10,8 +10,9 @@ tool (
 
 require (
 	github.com/looprig/core v0.7.0
-	github.com/looprig/harness v0.39.0
+	github.com/looprig/harness v0.40.0
 	github.com/looprig/inference v0.12.1
+	github.com/looprig/storage v0.6.0
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
 )
@@ -37,6 +38,7 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
+	github.com/looprig/sessionstore v0.9.0 // indirect
 	github.com/openai/openai-go/v3 v3.50.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/securego/gosec/v2 v2.28.0 // indirect

@@ -19,6 +19,7 @@ import (
 	"github.com/looprig/tools/internal/workspace"
 	"github.com/looprig/tools/process"
 	"github.com/looprig/tools/readfile"
+	"github.com/looprig/tools/readtoolresult"
 	"github.com/looprig/tools/task"
 	"github.com/looprig/tools/websearch"
 	"github.com/looprig/tools/writefile"
@@ -26,64 +27,78 @@ import (
 
 type DefinitionBuildError = definition.BuildError
 
+// Capture-safety declarations (tool.CaptureSafetyDeclarer) carried by every
+// standard definition. capture_contract_test.go holds the audit behind each
+// choice and fails when a new definition is added without one.
+var (
+	// streamingHighOutput: the tool can produce unbounded output and streams
+	// all of it to Harness's capture sink (tool.CapturingInvokableTool).
+	streamingHighOutput = tool.DeclaredCaptureSafety{Streaming: true, HighOutput: true}
+	// materializedHighOutput: the tool returns a fully built result that can
+	// be large; Harness's finite materialized maximum is what bounds it.
+	materializedHighOutput = tool.DeclaredCaptureSafety{HighOutput: true}
+	// smallOutput: the tool's result is small by construction.
+	smallOutput = tool.DeclaredCaptureSafety{}
+)
+
 func GlobDefinition(readGuard loop.ReadGuard, options ...glob.GlobOption) tool.Definition {
 	sealed := append([]glob.GlobOption(nil), options...)
-	return tool.NewDefinition("Glob", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("Glob", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if workspace.IsNil(readGuard) {
 			return nil, &DefinitionBuildError{Definition: "Glob", Dependency: "read_guard"}
 		}
 		return []tool.InvokableTool{glob.NewGlob(bindings.Workspace.Root, readGuard, sealed...)}, nil
-	})
+	}), smallOutput)
 }
 
 func GrepDefinition(readGuard loop.ReadGuard, options ...grep.GrepOption) tool.Definition {
 	sealed := append([]grep.GrepOption(nil), options...)
-	return tool.NewDefinition("Grep", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("Grep", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if workspace.IsNil(readGuard) {
 			return nil, &DefinitionBuildError{Definition: "Grep", Dependency: "read_guard"}
 		}
 		return []tool.InvokableTool{grep.NewGrep(bindings.Workspace.Root, readGuard, sealed...)}, nil
-	})
+	}), materializedHighOutput)
 }
 
 func TaskDefinitions() tool.Definition {
-	return tool.NewBundleDefinition("Tasks", []string{"TaskCreate", "TaskUpdate", "TaskGet", "TaskList"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewBundleDefinition("Tasks", []string{"TaskCreate", "TaskUpdate", "TaskGet", "TaskList"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 		return task.NewTools(), nil
-	})
+	}), smallOutput)
 }
 
 func AskUserDefinition() tool.Definition {
-	return tool.NewDefinition("AskUser", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("AskUser", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 		return []tool.InvokableTool{askuser.NewAskUser()}, nil
-	})
+	}), smallOutput)
 }
 
 func WebSearchDefinition(provider websearch.SearchProvider) tool.Definition {
-	return tool.NewDefinition("WebSearch", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("WebSearch", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 		if workspace.IsNil(provider) {
 			return nil, &DefinitionBuildError{Definition: "WebSearch", Dependency: "provider"}
 		}
 		return []tool.InvokableTool{websearch.NewWebSearch(provider)}, nil
-	})
+	}), smallOutput)
 }
 
 func FetchDefinition(client *http.Client) tool.Definition {
-	return tool.NewDefinition("Fetch", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("Fetch", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 		if workspace.IsNil(client) {
 			return nil, &DefinitionBuildError{Definition: "Fetch", Dependency: "client"}
 		}
 		return []tool.InvokableTool{fetch.NewFetch(client)}, nil
-	})
+	}), smallOutput)
 }
 
 func ReadFileDefinition(readGuard loop.ReadGuard, options ...readfile.ReadFileOption) tool.Definition {
 	sealed := append([]readfile.ReadFileOption(nil), options...)
-	return tool.NewDefinition("ReadFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("ReadFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if workspace.IsNil(readGuard) {
 			return nil, &DefinitionBuildError{Definition: "ReadFile", Dependency: "read_guard"}
 		}
 		return []tool.InvokableTool{readfile.NewReadFile(bindings.Workspace.Root, readGuard, loopObservations(bindings.Workspace.Observations), sealed...)}, nil
-	})
+	}), materializedHighOutput)
 }
 
 // WriteFileDefinition accepts writefile.Option values such as
@@ -93,10 +108,10 @@ func ReadFileDefinition(readGuard loop.ReadGuard, options ...readfile.ReadFileOp
 // PathMutation permit and lease-health check with no error.
 func WriteFileDefinition(options ...writefile.Option) tool.Definition {
 	sealed := append([]writefile.Option(nil), options...)
-	return tool.NewDefinition("WriteFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("WriteFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		opts := append([]writefile.Option{writefile.WithMutationCoordinator(bindings.Workspace.Coordinator)}, sealed...)
 		return []tool.InvokableTool{writefile.New(bindings.Workspace.Root, loopObservations(bindings.Workspace.Observations), opts...)}, nil
-	})
+	}), smallOutput)
 }
 
 // EditFileDefinition accepts editfile.Option values such as
@@ -106,20 +121,20 @@ func WriteFileDefinition(options ...writefile.Option) tool.Definition {
 // PathMutation permit and lease-health check with no error.
 func EditFileDefinition(options ...editfile.Option) tool.Definition {
 	sealed := append([]editfile.Option(nil), options...)
-	return tool.NewDefinition("EditFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("EditFile", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		opts := append([]editfile.Option{editfile.WithMutationCoordinator(bindings.Workspace.Coordinator)}, sealed...)
 		return []tool.InvokableTool{editfile.New(bindings.Workspace.Root, loopObservations(bindings.Workspace.Observations), opts...)}, nil
-	})
+	}), smallOutput)
 }
 
 func Bash(options ...bash.BashOption) tool.Definition {
 	factory, initErr := bash.NewFactory(options...)
-	return tool.NewDefinition("Bash", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("Bash", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if initErr != nil {
 			return nil, initErr
 		}
 		return []tool.InvokableTool{factory(bindings.Workspace.Root, bindings.Workspace.Coordinator, bindings.Workspace.Observations)}, nil
-	})
+	}), streamingHighOutput)
 }
 
 // AsyncProcessRunnerResolver resolves the concrete tool.AsyncProcessRunner a
@@ -144,7 +159,7 @@ type AsyncProcessRunnerResolver func(context.Context, uuid.UUID) (tool.AsyncProc
 // resolved once here, never reapplied per Build.
 func BashDefinition(resolver AsyncProcessRunnerResolver, options ...bash.BashOption) tool.Definition {
 	factory, initErr := bash.NewSupervisedFactory(options...)
-	return tool.NewDefinition("Bash", tool.RequiresWorkspace|tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("Bash", tool.RequiresWorkspace|tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if initErr != nil {
 			return nil, initErr
 		}
@@ -163,7 +178,7 @@ func BashDefinition(resolver AsyncProcessRunnerResolver, options ...bash.BashOpt
 			return nil, err
 		}
 		return []tool.InvokableTool{built}, nil
-	})
+	}), streamingHighOutput)
 }
 
 // ProcessOutputDefinition builds the read-only ProcessOutput tool bound to
@@ -173,42 +188,42 @@ func BashDefinition(resolver AsyncProcessRunnerResolver, options ...bash.BashOpt
 // same registry entry Bash and its two sibling definitions share, keyed by
 // process.SupervisorResourceKey alone.
 func ProcessOutputDefinition() tool.Definition {
-	return tool.NewDefinition("ProcessOutput", tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("ProcessOutput", tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		supervisor, err := resolveProcessSupervisor(ctx, bindings)
 		if err != nil {
 			return nil, err
 		}
 		owner := process.Owner{SessionID: bindings.SessionID, LoopID: bindings.LoopID}
 		return []tool.InvokableTool{process.NewProcessOutput(supervisor, owner)}, nil
-	})
+	}), materializedHighOutput)
 }
 
 // ProcessInputDefinition builds the mutating ProcessInput tool over the same
 // shared supervisor entry ProcessOutputDefinition resolves (process/
 // input_tool.go). Argument-free for the identical reason.
 func ProcessInputDefinition() tool.Definition {
-	return tool.NewDefinition("ProcessInput", tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("ProcessInput", tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		supervisor, err := resolveProcessSupervisor(ctx, bindings)
 		if err != nil {
 			return nil, err
 		}
 		owner := process.Owner{SessionID: bindings.SessionID, LoopID: bindings.LoopID}
 		return []tool.InvokableTool{process.NewProcessInput(supervisor, owner)}, nil
-	})
+	}), materializedHighOutput)
 }
 
 // ProcessStopDefinition builds the mutating ProcessStop tool over the same
 // shared supervisor entry (process/stop_tool.go). Argument-free for the
 // identical reason.
 func ProcessStopDefinition() tool.Definition {
-	return tool.NewDefinition("ProcessStop", tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return definition.WithCaptureSafety(tool.NewDefinition("ProcessStop", tool.RequiresProcessServices, func(ctx context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		supervisor, err := resolveProcessSupervisor(ctx, bindings)
 		if err != nil {
 			return nil, err
 		}
 		owner := process.Owner{SessionID: bindings.SessionID, LoopID: bindings.LoopID}
 		return []tool.InvokableTool{process.NewProcessStop(supervisor, owner)}, nil
-	})
+	}), smallOutput)
 }
 
 // resolveProcessSupervisor obtains this session's ONE shared, runner-free
@@ -239,6 +254,21 @@ func resolveProcessSupervisor(ctx context.Context, bindings tool.Bindings) (*pro
 		return nil, &DefinitionBuildError{Definition: "Process", Dependency: "process_registry"}
 	}
 	return sr.Supervisor, nil
+}
+
+// ReadToolResultDefinition builds read_tool_result (package readtoolresult),
+// the tool a model calls to page through a tool result Harness retained in
+// full when the model was shown only a preview. It declares
+// tool.RequiresToolResultReader, so Harness binds it the loop-scoped reader;
+// a rig without readable tool-result objects (rig.WithToolResultObjects)
+// refuses to define a loop that registers it.
+func ReadToolResultDefinition() tool.Definition {
+	return definition.WithCaptureSafety(tool.NewDefinition(loop.ReadToolResultToolName, tool.RequiresToolResultReader, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		if workspace.IsNil(bindings.ToolResults) {
+			return nil, &DefinitionBuildError{Definition: loop.ReadToolResultToolName, Dependency: "tool_results"}
+		}
+		return []tool.InvokableTool{readtoolresult.New(bindings.ToolResults)}, nil
+	}), smallOutput)
 }
 
 func loopObservations(shared tool.WorkspaceObservations) tool.WorkspaceObservations {
