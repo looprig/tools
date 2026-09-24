@@ -2,6 +2,12 @@
 
 `github.com/looprig/tools` provides optional standard tools for looprig Loops. The harness defines the contracts. This module provides implementations that consumers can select individually, plus the deliberate related-family `Tasks` bundle.
 
+```sh
+go get github.com/looprig/tools@latest
+```
+
+Pin it together with `harness` v0.40.0 or later: the retained-output support below depends on it.
+
 ```go
 loop.WithTools(
 	tools.ReadFileDefinition(readGuard),
@@ -16,12 +22,27 @@ loop.WithTools(
 the four operations must share one bounded, Loop-local task graph. Each
 definition build creates a fresh graph; parent and child Loops are isolated,
 while modes within one Loop share the graph. The Harness owns and injects the
-`Subagent` control tool for delegated Loops; consumers must not add it from this
-module.
+agent-tool bundle (`StartAgent`, `MessageAgent`, `ListAgents`, `StopAgent`) for
+delegation; consumers must not add delegation tools from this module.
 
 There is no bundled file-tool definition. A read-only Loop can receive ReadFile without also constructing WriteFile or EditFile. Consumers can mix these tools with their own definitions or use no standard tools at all.
 
-The module root is intentionally a small definition facade. Each concrete tool has a focused package, such as `readfile`, `writefile`, `grep`, `bash`, and `websearch`. The `task` package owns the four related task operations. The `permission` package is the shared workspace rule library, and shared containment and mutation mechanics remain private under `internal`.
+The module root is intentionally a small definition facade (`ReadFileDefinition`, `WriteFileDefinition`, `EditFileDefinition`, `GlobDefinition`, `GrepDefinition`, `Bash`, `BashDefinition`, `ProcessOutputDefinition`, `ProcessInputDefinition`, `ProcessStopDefinition`, `FetchDefinition`, `WebSearchDefinition`, `AskUserDefinition`, `TaskDefinitions`, `ReadToolResultDefinition`). Each concrete tool has a focused package:
+
+| Package | Purpose |
+|---|---|
+| `readfile`, `writefile`, `editfile` | Workspace-contained file read, write and edit. |
+| `glob`, `grep` | Workspace-contained filename and content search (Grep prefers ripgrep, with a stdlib fallback). |
+| `bash` | Single-command shell execution with a bounded timeout and capped combined output. |
+| `process` | Long-running command supervision (`BashDefinition` plus the `Process*` tools); see `docs/specs/long-running-command-supervision.md`. |
+| `fetch`, `websearch` | One bounded HTTP request via an injected `*http.Client`; web search over an injected `SearchProvider`. |
+| `askuser` | The AskUser tool. |
+| `skill` | On-demand reader of curated embedded (and optionally workspace) `SKILL.md` bodies. |
+| `task` | The four related task operations. |
+| `readtoolresult` | `read_tool_result`, which pages a retained tool result. |
+| `permission` | The shared workspace permission rule store. |
+
+Shared containment and mutation mechanics remain private under `internal`. Runnable examples live under `examples/` (`definitions`, `permissions`, `preparation`, `processes`, `skills`, `tasks`).
 
 All README snippets are compiled by `example_readme_test.go` at the module root.
 
@@ -74,7 +95,11 @@ Every standard definition declares its capture safety (`tool.CaptureSafetyDeclar
 - ReadFile, Grep, ProcessOutput and ProcessInput are materialized and high-output.
 - Every other tool is small by construction.
 
-A timed-out or cancelled direct Bash command kills its whole process group. Once `sh` has exited, a descendant still holding the output pipe keeps the call open for at most two seconds.
+Direct `sh -c` execution runs the command in its own process group:
+
+- A timed-out or cancelled command kills the whole group, including detached or `nohup`'d jobs. Only `setsid` escapes it.
+- Once `sh` has exited, a descendant still holding the output pipe keeps the call open for at most two seconds. A background job that writes after that loses its output.
+- A terminal Ctrl-C does not reach a running Bash command in a non-raw CLI; context cancellation still kills it.
 
 `ReadToolResultDefinition()` provides `read_tool_result`, which the model uses to page through a result that Harness retained in full:
 
@@ -90,6 +115,10 @@ loop.WithTools(
 - Unknown or foreign ids fail closed, and so do malformed arguments.
 - A rig must wire `rig.WithToolResultObjects` to register the tool. Without it, loop definition fails.
 
+Consumer obligations for retained output: wire `rig.WithToolResultObjects`, register `read_tool_result` only where capture is wired, and set a finite `ToolLimits.ResultBytes` (with it zero nothing is elided, so nothing is retained). Keep the capture ceiling (`ToolLimits.CaptureBytes`) at or below what the serving Factory will verify when reading objects back (64 MiB by default).
+
+Known limit: the `limit_bytes` argument of ProcessOutput and ProcessInput is not clamped.
+
 ## Fail-closed properties
 
 - Invalid or unparseable arguments fail during preparation; nothing reaches the gate or the filesystem.
@@ -98,11 +127,23 @@ loop.WithTools(
 - Unsegmentable or unprovably simple shell input never matches a family rule.
 - Definition builders reject nil (including typed-nil) dependencies at build time with a `DefinitionBuildError`.
 
-See the access-profile specification (`carbon/docs/specs/access-profiles.md`) for the cross-module design, and the historical [module specification](docs/specs/module.md) for the original extraction plan.
+See the access-profile specification (`docs/plans/access-profiles.md` in the `carbon` repository) for the cross-module design, and the historical [module specification](docs/specs/module.md) for the original extraction plan.
 
-Run the full local security suite with:
+## Where it sits
+
+Tier 4 in the Looprig graph. Direct Looprig dependencies: `core` and `harness`, plus test-only `inference` and `storage`. Consumed by `carbon` and `tests`.
+
+## Development
+
+Go 1.26.8 baseline. Verify standalone against the pinned dependencies, then run the checks:
 
 ```bash
-make secure
-go test -race ./...
+GOWORK=off go test ./...
+make test     # go test -race ./...
+make secure   # fmt-check, vet, staticcheck, gosec, go mod verify, govulncheck
+make check    # the CI surface: fmt-check, vet, staticcheck, gosec, govulncheck, test, build
 ```
+
+## License
+
+Apache License 2.0. See `LICENSE`.
