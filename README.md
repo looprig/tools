@@ -117,7 +117,7 @@ loop.WithTools(
 
 Consumer obligations for retained output: wire `rig.WithToolResultObjects`, register `read_tool_result` only where capture is wired, and set a finite `ToolLimits.ResultBytes` (with it zero nothing is elided, so nothing is retained). Keep the capture ceiling (`ToolLimits.CaptureBytes`) at or below what the serving Factory will verify when reading objects back (64 MiB by default).
 
-Known limit: the `limit_bytes` argument of ProcessOutput and ProcessInput is not clamped.
+ProcessOutput clamps `limit_bytes` to a 32 MiB call budget shared across selected `process_ids`; its serialized result is also capped at 32 MiB. ProcessInput has no `limit_bytes` argument and returns a fixed 32 KiB output snapshot.
 
 ## Fail-closed properties
 

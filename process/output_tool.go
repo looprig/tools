@@ -65,13 +65,15 @@ const processOutputToolName = "ProcessOutput"
 // than declaring a second one.
 const encodingSafeText = "safe_text"
 
+const maxProcessOutputResultBytes = 32 << 20
+
 const processOutputSchema = `{
   "type": "object",
   "properties": {
     "process_id": {"type": "string", "description": "The single process to inspect. Mutually exclusive with process_ids; exactly one of the two is required."},
     "process_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Multiple processes to inspect in one call, each opaque and distinct. Mutually exclusive with process_id; exactly one of the two is required."},
     "cursor": {"type": "integer", "minimum": 0, "description": "Byte offset into each process's combined output stream to read from (optional; default 0)."},
-    "limit_bytes": {"type": "integer", "minimum": 1, "description": "Maximum output bytes to read per process (optional; default 32768)."},
+    "limit_bytes": {"type": "integer", "minimum": 1, "maximum": 33554432, "description": "Maximum output bytes to read per process (optional; default 32768). Clamped to the 32 MiB total call budget across process_ids."},
     "encoding": {"type": "string", "enum": ["safe_text", "base64"], "description": "Output encoding (optional; default safe_text). base64 returns the same owner-authorized raw bytes without normalization."},
     "wait": {"type": "string", "enum": ["poll", "any", "all"], "description": "poll (default) returns immediately. any/all block until, respectively, at least one or every selected process has new output past cursor or becomes terminal."},
     "timeout_ms": {"type": "integer", "minimum": 0, "description": "Bounds an any/all wait, in milliseconds (optional; 0 or omitted waits with no additional bound beyond the call's own cancellation). Ignored for poll."}
@@ -194,11 +196,17 @@ func (t *ProcessOutputTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON
 	}
 
 	limitBytes := int(DefaultMaxInlineResultBytes)
+	if len(handles) > maxProcessOutputResultBytes {
+		return tool.Request{}, nil, prepareOutputFail("too many process_ids")
+	}
 	if a.LimitBytes != nil {
 		if *a.LimitBytes <= 0 {
 			return tool.Request{}, nil, prepareOutputFail("limit_bytes must be > 0")
 		}
 		limitBytes = *a.LimitBytes
+	}
+	if maxPerProcess := maxProcessOutputResultBytes / len(handles); limitBytes > maxPerProcess {
+		limitBytes = maxPerProcess
 	}
 
 	encoding := a.Encoding
@@ -552,6 +560,9 @@ func renderProcessOutputResults(results []processOutputResult, multi bool) *tool
 		if err != nil {
 			return renderProcessOutputCallError(string(CodeProcessSetupFailed))
 		}
+		if len(data) > maxProcessOutputResultBytes {
+			return renderProcessOutputCallError(string(CodeOutputQuotaExceeded))
+		}
 		return tool.TextResult(string(data))
 	}
 	data, err := json.Marshal(struct {
@@ -559,6 +570,9 @@ func renderProcessOutputResults(results []processOutputResult, multi bool) *tool
 	}{Results: results})
 	if err != nil {
 		return renderProcessOutputCallError(string(CodeProcessSetupFailed))
+	}
+	if len(data) > maxProcessOutputResultBytes {
+		return renderProcessOutputCallError(string(CodeOutputQuotaExceeded))
 	}
 	return tool.TextResult(string(data))
 }

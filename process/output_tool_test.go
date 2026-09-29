@@ -333,6 +333,57 @@ func TestProcessOutputPrepareCallMultiPreservesOrder(t *testing.T) {
 	}
 }
 
+func TestProcessOutputLimitBytesBudget(t *testing.T) {
+	t.Parallel()
+	tl := NewProcessOutput(newTestSupervisor(t, Config{}), testOwner(t))
+	h1, h2, h3 := testHandle(t, 1), testHandle(t, 2), testHandle(t, 3)
+	const max = 32 << 20
+	for _, tc := range []struct {
+		name, args string
+		want       int
+	}{
+		{"single above maximum", fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d}`, h1, max+1), max},
+		{"single at maximum", fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d}`, h1, max), max},
+		{"multi above maximum", fmt.Sprintf(`{"process_ids":[%q,%q,%q],"limit_bytes":%d}`, h1, h2, h3, max+1), max / 3},
+		{"multi at aggregate boundary", fmt.Sprintf(`{"process_ids":[%q,%q],"limit_bytes":%d}`, h1, h2, max/2), max / 2},
+		{"multi below aggregate boundary", fmt.Sprintf(`{"process_ids":[%q,%q],"limit_bytes":%d}`, h1, h2, 10), 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, prepared := prepareOutput(t, tl, tc.args)
+			if got := prepared.(*processOutputArtifact).limitBytes; got != tc.want {
+				t.Errorf("limitBytes = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProcessOutputLimitBytesSchemaMaximum(t *testing.T) {
+	t.Parallel()
+	tl := NewProcessOutput(newTestSupervisor(t, Config{}), testOwner(t))
+	info, err := tl.Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Maximum int `json:"maximum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(info.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if got := schema.Properties["limit_bytes"].Maximum; got != 32<<20 {
+		t.Errorf("schema limit_bytes maximum = %d, want %d", got, 32<<20)
+	}
+}
+
+func TestProcessOutputRenderedResultStaysWithinBudget(t *testing.T) {
+	result := renderProcessOutputResults([]processOutputResult{{Output: strings.Repeat("x", 32<<20)}}, false)
+	if got := len(textOf(t, result)); got > 32<<20 {
+		t.Errorf("rendered result bytes = %d, want at most %d", got, 32<<20)
+	}
+}
+
 // --- InvokableRun: poll, input-order preservation ---
 
 // TestProcessOutputPollReadsCurrentOutput proves a poll call (the default
