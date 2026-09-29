@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -338,15 +339,21 @@ func TestProcessOutputLimitBytesBudget(t *testing.T) {
 	tl := NewProcessOutput(newTestSupervisor(t, Config{}), testOwner(t))
 	h1, h2, h3 := testHandle(t, 1), testHandle(t, 2), testHandle(t, 3)
 	const max = 32 << 20
+	safe1 := processOutputReadBudget(encodingSafeText, 1)
+	b64One := processOutputReadBudget(ArtifactEncodingBase64, 1)
+	safe3 := processOutputReadBudget(encodingSafeText, 3)
+	b64Two := processOutputReadBudget(ArtifactEncodingBase64, 2)
 	for _, tc := range []struct {
 		name, args string
 		want       int
 	}{
-		{"single above maximum", fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d}`, h1, max+1), max},
-		{"single at maximum", fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d}`, h1, max), max},
-		{"multi above maximum", fmt.Sprintf(`{"process_ids":[%q,%q,%q],"limit_bytes":%d}`, h1, h2, h3, max+1), max / 3},
-		{"multi at aggregate boundary", fmt.Sprintf(`{"process_ids":[%q,%q],"limit_bytes":%d}`, h1, h2, max/2), max / 2},
-		{"multi below aggregate boundary", fmt.Sprintf(`{"process_ids":[%q,%q],"limit_bytes":%d}`, h1, h2, 10), 10},
+		{"single above maximum", fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d}`, h1, max+1), safe1},
+		{"single safe_text at maximum", fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d}`, h1, max), safe1},
+		{"single base64 at maximum", fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d,"encoding":"base64"}`, h1, max), b64One},
+		{"multi above maximum", fmt.Sprintf(`{"process_ids":[%q,%q,%q],"limit_bytes":%d}`, h1, h2, h3, max+1), safe3},
+		{"multi base64 at maximum", fmt.Sprintf(`{"process_ids":[%q,%q],"limit_bytes":%d,"encoding":"base64"}`, h1, h2, max), b64Two},
+		{"single at budget boundary", fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d}`, h1, safe1), safe1},
+		{"multi below budget", fmt.Sprintf(`{"process_ids":[%q,%q],"limit_bytes":%d}`, h1, h2, 10), 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, prepared := prepareOutput(t, tl, tc.args)
@@ -354,6 +361,172 @@ func TestProcessOutputLimitBytesBudget(t *testing.T) {
 				t.Errorf("limitBytes = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestProcessOutputReadBudgetFitsWorstCase proves the raw read budget is
+// derived from each encoding's worst-case serialized expansion: base64 is
+// exactly 4 bytes per 3 (padded), and a safe_text byte can become the
+// six-byte JSON escape \u003c. Every budget, plus the per-process and
+// call envelope allowances, must fit the serialized result cap.
+func TestProcessOutputReadBudgetFitsWorstCase(t *testing.T) {
+	t.Parallel()
+	for _, n := range []int{1, 2, 3, 7, 1000} {
+		for _, enc := range []string{encodingSafeText, ArtifactEncodingBase64} {
+			budget := processOutputReadBudget(enc, n)
+			if budget <= 0 {
+				t.Fatalf("processOutputReadBudget(%s, %d) = %d, want > 0", enc, n, budget)
+			}
+			perProcess := base64.StdEncoding.EncodedLen(budget)
+			if enc == encodingSafeText {
+				perProcess = budget * 6
+			}
+			total := processOutputCallEnvelopeBytes + n*(perProcess+processOutputEntryOverheadBytes)
+			if total > maxProcessOutputResultBytes {
+				t.Errorf("%s n=%d: worst-case serialized bytes = %d, want <= %d", enc, n, total, maxProcessOutputResultBytes)
+			}
+		}
+	}
+	if got := processOutputReadBudget(encodingSafeText, maxProcessOutputResultBytes/processOutputEntryOverheadBytes); got != 0 {
+		t.Errorf("budget with no room for output = %d, want 0", got)
+	}
+}
+
+// TestProcessOutputEntryOverheadCoversMetadata proves the fixed per-process
+// allowance covers every non-output field at its widest value, plus the
+// separator between array elements, and that the call envelope allowance
+// covers the multi-result wrapper.
+func TestProcessOutputEntryOverheadCoversMetadata(t *testing.T) {
+	t.Parallel()
+	minInt := math.MinInt
+	wide := processOutputResult{
+		ProcessID:   string(testHandle(t, 1)),
+		Status:      string(StateLostOnRestore),
+		Output:      "x",
+		StartCursor: -1 << 63,
+		NextCursor:  -1 << 63,
+		TotalBytes:  -1 << 63,
+		Gap:         true,
+		Normalized:  true,
+		Binary:      true,
+		Artifact:    &processOutputArtifactRef{ID: string(testHandle(t, 1)), Encoding: ArtifactEncodingBase64},
+		ExitCode:    &minInt,
+		Reason:      "lost-on-restore",
+		StartedAt:   time.Date(2026, 9, 29, 23, 59, 59, 999999999, time.FixedZone("x", -(12*3600+59*60))).Format(time.RFC3339Nano),
+		FinishedAt:  time.Date(2026, 9, 29, 23, 59, 59, 999999999, time.FixedZone("x", -(12*3600+59*60))).Format(time.RFC3339Nano),
+		Error:       string(CodeLifetimeEnforcementUnavailable),
+	}
+	data, err := json.Marshal(wide)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(data) - len(wide.Output) + len(","); got > processOutputEntryOverheadBytes {
+		t.Errorf("widest entry metadata = %d bytes, want <= %d", got, processOutputEntryOverheadBytes)
+	}
+	env, err := json.Marshal(struct {
+		Results []processOutputResult `json:"results"`
+	}{Results: []processOutputResult{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env) > processOutputCallEnvelopeBytes {
+		t.Errorf("call envelope = %d bytes, want <= %d", len(env), processOutputCallEnvelopeBytes)
+	}
+}
+
+// TestProcessOutputMaxLimitBase64ReturnsData proves a legal request at the
+// schema maximum with encoding base64 returns data within the 32 MiB
+// serialized cap rather than deterministically tripping the
+// post-serialization output_quota_exceeded backstop.
+func TestProcessOutputMaxLimitBase64ReturnsData(t *testing.T) {
+	t.Parallel()
+	sup := newTestSupervisor(t, Config{})
+	owner := testOwner(t)
+	h := testHandle(t, 1)
+	e := newOutputEntry(t, sup, owner, h, 0)
+	raw := make([]byte, 32<<20)
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	e.appendChunk(raw)
+
+	tl := NewProcessOutput(sup, owner)
+	text := runOutput(t, tl, fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d,"encoding":"base64"}`, h, 32<<20))
+	if len(text) > maxProcessOutputResultBytes {
+		t.Fatalf("serialized result = %d bytes, want <= %d", len(text), maxProcessOutputResultBytes)
+	}
+	got := decodeSingle(t, text)
+	if got.Error != "" {
+		t.Fatalf("Error = %q, want data", got.Error)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(got.Output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := processOutputReadBudget(ArtifactEncodingBase64, 1)
+	if len(decoded) != want || got.NextCursor != int64(want) {
+		t.Errorf("decoded %d bytes, next_cursor %d; want %d", len(decoded), got.NextCursor, want)
+	}
+	if string(decoded) != string(raw[:want]) {
+		t.Error("decoded bytes differ from the spool's first bytes")
+	}
+}
+
+// TestProcessOutputMaxLimitSafeTextWorstCaseReturnsData proves a legal
+// safe_text request at the schema maximum returns data within the cap even
+// when every byte takes JSON's widest escape ('<' -> \u003c, six bytes).
+func TestProcessOutputMaxLimitSafeTextWorstCaseReturnsData(t *testing.T) {
+	t.Parallel()
+	sup := newTestSupervisor(t, Config{})
+	owner := testOwner(t)
+	h := testHandle(t, 1)
+	e := newOutputEntry(t, sup, owner, h, 0)
+	e.appendChunk([]byte(strings.Repeat("<", 32<<20)))
+
+	tl := NewProcessOutput(sup, owner)
+	text := runOutput(t, tl, fmt.Sprintf(`{"process_id":%q,"limit_bytes":%d}`, h, 32<<20))
+	if len(text) > maxProcessOutputResultBytes {
+		t.Fatalf("serialized result = %d bytes, want <= %d", len(text), maxProcessOutputResultBytes)
+	}
+	got := decodeSingle(t, text)
+	if got.Error != "" {
+		t.Fatalf("Error = %q, want data", got.Error)
+	}
+	want := processOutputReadBudget(encodingSafeText, 1)
+	if len(got.Output) != want || got.NextCursor != int64(want) {
+		t.Errorf("output %d bytes, next_cursor %d; want %d", len(got.Output), got.NextCursor, want)
+	}
+	if strings.Trim(got.Output, "<") != "" {
+		t.Error("output is not the spool's '<' bytes")
+	}
+}
+
+// TestProcessOutputMultiMaxLimitBase64ReturnsData proves the per-process
+// budget shares the cap across process_ids with their envelopes.
+func TestProcessOutputMultiMaxLimitBase64ReturnsData(t *testing.T) {
+	t.Parallel()
+	sup := newTestSupervisor(t, Config{})
+	owner := testOwner(t)
+	h1, h2 := testHandle(t, 1), testHandle(t, 2)
+	for _, h := range []Handle{h1, h2} {
+		e := newOutputEntry(t, sup, owner, h, 0)
+		e.appendChunk(make([]byte, 16<<20))
+	}
+
+	tl := NewProcessOutput(sup, owner)
+	text := runOutput(t, tl, fmt.Sprintf(`{"process_ids":[%q,%q],"limit_bytes":%d,"encoding":"base64"}`, h1, h2, 32<<20))
+	if len(text) > maxProcessOutputResultBytes {
+		t.Fatalf("serialized result = %d bytes, want <= %d", len(text), maxProcessOutputResultBytes)
+	}
+	results := decodeMulti(t, text)
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2 (text %.80q)", len(results), text)
+	}
+	want := int64(processOutputReadBudget(ArtifactEncodingBase64, 2))
+	for i, r := range results {
+		if r.Error != "" || r.NextCursor != want {
+			t.Errorf("results[%d] error=%q next_cursor=%d, want data to %d", i, r.Error, r.NextCursor, want)
+		}
 	}
 }
 

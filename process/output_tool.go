@@ -65,7 +65,57 @@ const processOutputToolName = "ProcessOutput"
 // than declaring a second one.
 const encodingSafeText = "safe_text"
 
+// maxProcessOutputResultBytes caps one ProcessOutput call's SERIALIZED
+// result (the JSON text handed to the model), across every process_ids
+// entry. It is also the schema maximum for limit_bytes.
 const maxProcessOutputResultBytes = 32 << 20
+
+// processOutputCallEnvelopeBytes is the fixed allowance for the multi-result
+// wrapper {"results":[...]} (the single-object form has none).
+// processOutputEntryOverheadBytes is the fixed per-process allowance for
+// every field but output -- process_id, status, cursors, flags, artifact,
+// exit_code, reason, timestamps, error, the "output" key itself -- plus the
+// separator between array elements. Every one of those fields is a Handle,
+// a closed enum, an integer, or an RFC3339Nano timestamp, so its widest
+// encoding is a few hundred bytes (TestProcessOutputEntryOverheadCoversMetadata).
+const (
+	processOutputCallEnvelopeBytes  = 64
+	processOutputEntryOverheadBytes = 1024
+)
+
+// safeTextJSONExpansion is the worst-case serialized bytes per byte of
+// safe_text output. RenderSafeText caps the NORMALIZED text at the raw read
+// budget (its capBytes argument), so only JSON escaping of that text
+// expands it: encoding/json writes '<', '>' and '&' as the six-byte escapes
+// \u003c/\u003e/\u0026 (HTML escaping is on for json.Marshal); every
+// other escape is no wider per input byte (\t, \n, \r, \", \\ are two
+// bytes for one, U+2028/U+2029 six bytes for three; the normalizer strips
+// every other control and replaces invalid UTF-8, so no \ufffd or \u00XX
+// escape is ever produced).
+const safeTextJSONExpansion = 6
+
+// processOutputReadBudget returns the largest raw per-process read for a
+// call selecting processes processes whose serialized result is guaranteed
+// to fit maxProcessOutputResultBytes: the cap, less the call envelope and
+// each process's metadata allowance, shared evenly, then divided by the
+// encoding's worst-case expansion. base64 needs exactly 4*ceil(n/3) bytes
+// for n raw bytes, and its alphabet (A-Z a-z 0-9 + / =) is never escaped
+// by JSON, so floor(B/4)*3 raw bytes always fit B. It returns 0 when there
+// is no room for any output at all.
+func processOutputReadBudget(encoding string, processes int) int {
+	if processes < 1 {
+		return 0
+	}
+	available := maxProcessOutputResultBytes - processOutputCallEnvelopeBytes - processes*processOutputEntryOverheadBytes
+	if available <= 0 {
+		return 0
+	}
+	perProcess := available / processes
+	if encoding == ArtifactEncodingBase64 {
+		return perProcess / 4 * 3
+	}
+	return perProcess / safeTextJSONExpansion
+}
 
 const processOutputSchema = `{
   "type": "object",
@@ -73,7 +123,7 @@ const processOutputSchema = `{
     "process_id": {"type": "string", "description": "The single process to inspect. Mutually exclusive with process_ids; exactly one of the two is required."},
     "process_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Multiple processes to inspect in one call, each opaque and distinct. Mutually exclusive with process_id; exactly one of the two is required."},
     "cursor": {"type": "integer", "minimum": 0, "description": "Byte offset into each process's combined output stream to read from (optional; default 0)."},
-    "limit_bytes": {"type": "integer", "minimum": 1, "maximum": 33554432, "description": "Maximum output bytes to read per process (optional; default 32768). Clamped to the 32 MiB total call budget across process_ids."},
+    "limit_bytes": {"type": "integer", "minimum": 1, "maximum": 33554432, "description": "Maximum raw output bytes to read per process (optional; default 32768). The serialized result of one call is capped at 32 MiB, so this is clamped to what fits: about 5.3 MiB per call for safe_text and 24 MiB for base64, shared across process_ids. Page with next_cursor for more."},
     "encoding": {"type": "string", "enum": ["safe_text", "base64"], "description": "Output encoding (optional; default safe_text). base64 returns the same owner-authorized raw bytes without normalization."},
     "wait": {"type": "string", "enum": ["poll", "any", "all"], "description": "poll (default) returns immediately. any/all block until, respectively, at least one or every selected process has new output past cursor or becomes terminal."},
     "timeout_ms": {"type": "integer", "minimum": 0, "description": "Bounds an any/all wait, in milliseconds (optional; 0 or omitted waits with no additional bound beyond the call's own cancellation). Ignored for poll."}
@@ -195,26 +245,30 @@ func (t *ProcessOutputTool) PrepareCall(_ context.Context, _ uuid.UUID, argsJSON
 		cursor = *a.Cursor
 	}
 
-	limitBytes := int(DefaultMaxInlineResultBytes)
-	if len(handles) > maxProcessOutputResultBytes {
-		return tool.Request{}, nil, prepareOutputFail("too many process_ids")
-	}
-	if a.LimitBytes != nil {
-		if *a.LimitBytes <= 0 {
-			return tool.Request{}, nil, prepareOutputFail("limit_bytes must be > 0")
-		}
-		limitBytes = *a.LimitBytes
-	}
-	if maxPerProcess := maxProcessOutputResultBytes / len(handles); limitBytes > maxPerProcess {
-		limitBytes = maxPerProcess
-	}
-
 	encoding := a.Encoding
 	if encoding == "" {
 		encoding = encodingSafeText
 	}
 	if encoding != encodingSafeText && encoding != ArtifactEncodingBase64 {
 		return tool.Request{}, nil, prepareOutputFail("encoding must be safe_text or base64, got %q", a.Encoding)
+	}
+
+	limitBytes := int(DefaultMaxInlineResultBytes)
+	if a.LimitBytes != nil {
+		if *a.LimitBytes <= 0 {
+			return tool.Request{}, nil, prepareOutputFail("limit_bytes must be > 0")
+		}
+		limitBytes = *a.LimitBytes
+	}
+	// Clamp the raw read so the serialized result always fits: a request
+	// the schema admits must never deterministically trip the
+	// post-serialization backstop in renderProcessOutputResults.
+	maxPerProcess := processOutputReadBudget(encoding, len(handles))
+	if maxPerProcess < 1 {
+		return tool.Request{}, nil, prepareOutputFail("too many process_ids")
+	}
+	if limitBytes > maxPerProcess {
+		limitBytes = maxPerProcess
 	}
 
 	wait := WaitKind(a.Wait)
